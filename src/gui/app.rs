@@ -11,7 +11,7 @@ use crate::epoch_sweep::{self, EpochRow};
 use crate::metrics::Metrics;
 use crate::numeric_model::{validate_numeric, ModelKind, NumericConfig};
 use crate::sweep::{self, SweepAxes, SweepRow};
-use crate::tnum::{parse_categorical, Delimiter, PrepareSpec};
+use crate::tnum::{infer_prepare_spec_from_path, parse_categorical, Delimiter, PrepareSpec};
 use crate::train::{validate_train, LrSchedule, TextTrainConfig, TrainConfig};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
@@ -806,6 +806,38 @@ impl App {
         }
     }
 
+    fn apply_prepare_inference(&mut self) {
+        if self.prepare_form.input_path.is_empty() {
+            return;
+        }
+        match infer_prepare_spec_from_path(&self.prepare_form.input_path, Delimiter::Auto) {
+            Ok(inferred) => {
+                self.prepare_form.inputs = inferred.n_inputs;
+                self.prepare_form.outputs = inferred.n_outputs;
+                self.prepare_form.delimiter = match inferred.delimiter {
+                    Delimiter::Auto => 0,
+                    Delimiter::Comma => 1,
+                    Delimiter::Tab => 2,
+                    Delimiter::Space => 3,
+                };
+                self.prepare_form.has_header = inferred.has_header;
+                self.prepare_form.categorical = inferred
+                    .categorical
+                    .iter()
+                    .map(|(i, c)| format!("{i}:{c}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                self.status = format!(
+                    "prepare auto: {} вход -> {} выход",
+                    inferred.n_inputs, inferred.n_outputs
+                );
+            }
+            Err(e) => {
+                self.status = format!("prepare auto не сработал: {e}");
+            }
+        }
+    }
+
     fn ui_train(&mut self, ui: &mut egui::Ui) {
         ui.heading("Train (numeric)");
 
@@ -1365,8 +1397,15 @@ impl App {
         ui.heading("Prepare");
         ui.horizontal(|ui| {
             if ui.button("Вход…").clicked() {
-                if let Some(p) = rfd::FileDialog::new().pick_file() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter(
+                        "tables",
+                        &["csv", "tsv", "txt", "xlsx", "xlsm", "xlsb", "xls", "ods"],
+                    )
+                    .pick_file()
+                {
                     self.prepare_form.input_path = p.display().to_string();
+                    self.apply_prepare_inference();
                 }
             }
             ui.label(if self.prepare_form.input_path.is_empty() {

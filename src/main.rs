@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 //! CLI: обучение surrogate-модели на чёрном ящике / .tnum файле, либо char-LM.
 //!
 //! Использование:
@@ -27,7 +29,9 @@ use transformer::serialize::{load_numeric, save_numeric};
 use transformer::sweep as sweep_core;
 use transformer::tensor::Tensor;
 use transformer::textmodel::TextModel;
-use transformer::tnum::{parse_categorical, table_to_tnum, Delimiter, PrepareSpec};
+use transformer::tnum::{
+    infer_prepare_spec_from_path, parse_categorical, table_path_to_tnum, Delimiter, PrepareSpec,
+};
 use transformer::train::{
     evaluate_surrogate, predict_dataset, train_surrogate, train_text, validate_train, LrSchedule,
     TextTrainConfig, TrainConfig,
@@ -751,14 +755,6 @@ fn run_prepare(args: &[String]) {
     let output = f
         .pos(1)
         .unwrap_or_else(|| fail("укажите выходной .tnum: prepare <input> <out.tnum>"));
-    let n_inputs = f
-        .usize("inputs")
-        .unwrap_or_else(|e| fail(&e))
-        .unwrap_or_else(|| fail("--inputs обязателен"));
-    let n_outputs = f
-        .usize("outputs")
-        .unwrap_or_else(|e| fail(&e))
-        .unwrap_or_else(|| fail("--outputs обязателен"));
     let delimiter = match f.get("delimiter").unwrap_or("auto") {
         "auto" => Delimiter::Auto,
         "comma" => Delimiter::Comma,
@@ -768,20 +764,43 @@ fn run_prepare(args: &[String]) {
             "--delimiter: ожидалось auto|comma|tab|space, получено '{o}'"
         )),
     };
-    let categorical = parse_categorical(f.get("categorical").unwrap_or(""), n_inputs)
-        .unwrap_or_else(|e| fail(&e));
+    let inferred = match (
+        f.usize("inputs").unwrap_or_else(|e| fail(&e)),
+        f.usize("outputs").unwrap_or_else(|e| fail(&e)),
+        f.get("categorical"),
+    ) {
+        (Some(_), Some(_), Some(_)) => None,
+        _ => infer_prepare_spec_from_path(input, delimiter).ok(),
+    };
+    let n_inputs = f
+        .usize("inputs")
+        .unwrap_or_else(|e| fail(&e))
+        .or_else(|| inferred.as_ref().map(|i| i.n_inputs))
+        .unwrap_or_else(|| fail("--inputs обязателен (или нужен заголовок x.../y... для auto)"));
+    let n_outputs = f
+        .usize("outputs")
+        .unwrap_or_else(|e| fail(&e))
+        .or_else(|| inferred.as_ref().map(|i| i.n_outputs))
+        .unwrap_or_else(|| fail("--outputs обязателен (или нужен заголовок x.../y... для auto)"));
+    let categorical = if let Some(raw) = f.get("categorical") {
+        parse_categorical(raw, n_inputs).unwrap_or_else(|e| fail(&e))
+    } else {
+        inferred
+            .as_ref()
+            .map(|i| i.categorical.clone())
+            .unwrap_or_default()
+    };
+    let has_header = f.has("has-header") || inferred.as_ref().is_some_and(|i| i.has_header);
 
     let spec = PrepareSpec {
         n_inputs,
         n_outputs,
         delimiter,
-        has_header: f.has("has-header"),
+        has_header,
         categorical,
     };
 
-    let text =
-        std::fs::read_to_string(input).unwrap_or_else(|e| fail(&format!("чтение {input}: {e}")));
-    let tnum = table_to_tnum(&text, &spec).unwrap_or_else(|e| fail(&e));
+    let tnum = table_path_to_tnum(input, &spec).unwrap_or_else(|e| fail(&e));
     let rows = tnum.lines().count().saturating_sub(6); // 6 строк заголовка
     std::fs::write(output, &tnum).unwrap_or_else(|e| fail(&format!("запись {output}: {e}")));
     println!("Записано {output}: {rows} строк, {n_inputs} вход -> {n_outputs} выход");

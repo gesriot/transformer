@@ -8,10 +8,21 @@ mod worker;
 
 /// Поднимает нативное окно egui (блокирует поток до закрытия).
 pub fn run_gui() -> eframe::Result<()> {
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([980.0, 760.0])
+            .with_min_inner_size([760.0, 560.0])
+            .with_icon(app_icon()),
+        ..Default::default()
+    };
     eframe::run_native(
-        "transformer",
+        "Transformer",
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
     )
+}
+
+fn app_icon() -> eframe::egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../../macos/icon-runtime.png"))
+        .unwrap_or_default()
 }

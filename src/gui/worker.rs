@@ -18,7 +18,7 @@ use crate::serialize::{load_numeric_full, save_numeric};
 use crate::sweep::{self, SweepAxes};
 use crate::tensor::Tensor;
 use crate::textmodel::TextModel;
-use crate::tnum::{table_to_tnum, PrepareSpec};
+use crate::tnum::{table_path_to_tnum, PrepareSpec};
 use crate::train::{
     evaluate_surrogate, predict_dataset, train_surrogate_cb, train_text_cb, validate_train,
     TextTrainConfig, TrainConfig,
@@ -567,8 +567,7 @@ fn prepare_tnum(
     output: &str,
     spec: &PrepareSpec,
 ) -> Result<(usize, usize, usize), String> {
-    let text = std::fs::read_to_string(input).map_err(|e| format!("чтение {input}: {e}"))?;
-    let tnum = table_to_tnum(&text, spec)?;
+    let tnum = table_path_to_tnum(input, spec)?;
     let rows = tnum.lines().count().saturating_sub(6);
     std::fs::write(output, &tnum).map_err(|e| format!("запись {output}: {e}"))?;
     Ok((rows, spec.n_inputs, spec.n_outputs))

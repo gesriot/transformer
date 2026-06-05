@@ -5,7 +5,9 @@
 //! `data::read_numeric_tnum`. Числа пишутся в кратчайшем round-trip
 //! представлении f32 (не байт-в-байт с `.9g` Python, но f32-эквивалентно).
 
+use calamine::{open_workbook_auto, Data, Reader};
 use std::collections::HashMap;
+use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Delimiter {
@@ -21,6 +23,15 @@ pub struct PrepareSpec {
     pub delimiter: Delimiter,
     pub has_header: bool,
     /// (индекс входа, cardinality) для категориальных признаков.
+    pub categorical: Vec<(usize, usize)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct InferredPrepareSpec {
+    pub n_inputs: usize,
+    pub n_outputs: usize,
+    pub delimiter: Delimiter,
+    pub has_header: bool,
     pub categorical: Vec<(usize, usize)>,
 }
 
@@ -92,9 +103,218 @@ fn split_line(line: &str, delim: Option<char>) -> Vec<&str> {
     }
 }
 
+fn split_line_owned(line: &str, delim: Option<char>) -> Vec<String> {
+    split_line(line, delim)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn text_to_rows(input: &str, mode: Delimiter) -> Result<Vec<Vec<String>>, String> {
+    let lines = clean_lines(input);
+    if lines.is_empty() {
+        return Err("нет строк данных".to_string());
+    }
+    let delim = detect_delim(lines[0], mode);
+    Ok(lines
+        .into_iter()
+        .map(|line| split_line_owned(line, delim))
+        .collect())
+}
+
+fn cell_to_token(cell: &Data, row: usize, col: usize) -> Result<String, String> {
+    match cell {
+        Data::Empty => Ok(String::new()),
+        Data::String(s) => Ok(s.trim().to_string()),
+        Data::Float(v) => {
+            if v.is_finite() {
+                Ok(format!("{v}"))
+            } else {
+                Err(format!("строка {row}, колонка {col}: значение не конечно"))
+            }
+        }
+        Data::Int(v) => Ok(v.to_string()),
+        Data::Bool(v) => Ok(if *v { "1".to_string() } else { "0".to_string() }),
+        Data::DateTime(_) | Data::DateTimeIso(_) | Data::DurationIso(_) => Err(format!(
+            "строка {row}, колонка {col}: даты/время в .xlsx не поддерживаются как числовые данные"
+        )),
+        Data::Error(e) => Err(format!("строка {row}, колонка {col}: ошибка Excel {e}")),
+    }
+}
+
+fn xlsx_to_rows(path: &Path) -> Result<Vec<Vec<String>>, String> {
+    let mut workbook =
+        open_workbook_auto(path).map_err(|e| format!("чтение {}: {e}", path.display()))?;
+    let sheet = workbook
+        .sheet_names()
+        .first()
+        .cloned()
+        .ok_or_else(|| format!("{}: workbook без листов", path.display()))?;
+    let range = workbook
+        .worksheet_range(&sheet)
+        .map_err(|e| format!("чтение листа '{sheet}': {e}"))?;
+
+    let mut rows = Vec::new();
+    for (r, row) in range.rows().enumerate() {
+        let mut toks = row
+            .iter()
+            .enumerate()
+            .map(|(c, cell)| cell_to_token(cell, r, c))
+            .collect::<Result<Vec<_>, _>>()?;
+        while toks.last().is_some_and(|t| t.trim().is_empty()) {
+            toks.pop();
+        }
+        if toks.iter().any(|t| !t.trim().is_empty()) {
+            rows.push(toks);
+        }
+    }
+    if rows.is_empty() {
+        return Err(format!("{}: нет строк данных", path.display()));
+    }
+    Ok(rows)
+}
+
+fn rows_from_path(path: &Path, delimiter: Delimiter) -> Result<Vec<Vec<String>>, String> {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("xlsx") | Some("xlsm") | Some("xlsb") | Some("xls") | Some("ods") => {
+            xlsx_to_rows(path)
+        }
+        _ => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("чтение {}: {e}", path.display()))?;
+            text_to_rows(&text, delimiter)
+        }
+    }
+}
+
+fn is_finite_number(token: &str) -> bool {
+    token.parse::<f32>().map(|v| v.is_finite()).unwrap_or(false)
+}
+
+fn is_output_header(raw: &str) -> bool {
+    let lower = raw.trim().to_ascii_lowercase();
+    lower == "y"
+        || lower
+            .strip_prefix('y')
+            .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+        || lower.starts_with("out")
+}
+
+fn header_split(headers: &[String]) -> Option<(usize, usize)> {
+    let first_output = headers.iter().position(|h| is_output_header(h))?;
+    if first_output == 0 {
+        return None;
+    }
+    Some((first_output, headers.len().saturating_sub(first_output)))
+}
+
+fn infer_categorical(rows: &[Vec<String>], n_inputs: usize) -> Vec<(usize, usize)> {
+    let Some(headers) = rows.first() else {
+        return Vec::new();
+    };
+    let data = &rows[1..];
+    let mut out = Vec::new();
+    for i in 0..n_inputs {
+        let name = headers
+            .get(i)
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let name_suggests_category = name == "id"
+            || name.ends_with("_id")
+            || name.contains("material")
+            || name.contains("category")
+            || name.contains("class");
+        if !name_suggests_category {
+            continue;
+        }
+
+        let mut max_code = None::<usize>;
+        let mut valid = true;
+        for row in data {
+            let Some(tok) = row.get(i) else {
+                valid = false;
+                break;
+            };
+            let Ok(raw) = tok.parse::<f32>() else {
+                valid = false;
+                break;
+            };
+            let rounded = raw.round();
+            if !raw.is_finite() || (raw - rounded).abs() >= 1e-4 || rounded < 0.0 {
+                valid = false;
+                break;
+            }
+            max_code = Some(max_code.map_or(rounded as usize, |m| m.max(rounded as usize)));
+        }
+        if valid {
+            if let Some(max_code) = max_code {
+                out.push((i, max_code + 1));
+            }
+        }
+    }
+    out
+}
+
+fn infer_prepare_spec_from_rows(
+    rows: &[Vec<String>],
+    delimiter: Delimiter,
+) -> Result<InferredPrepareSpec, String> {
+    if rows.is_empty() {
+        return Err("нет строк данных".to_string());
+    }
+    let first = &rows[0];
+    if first.is_empty() {
+        return Err("первая строка пустая".to_string());
+    }
+    let has_header = first.iter().any(|t| !is_finite_number(t));
+    if !has_header {
+        return Err("не удалось вывести схему: нет заголовка с колонками x.../y...".to_string());
+    }
+    let (n_inputs, n_outputs) = header_split(first).ok_or_else(|| {
+        "не удалось вывести inputs/outputs: ожидаются входные колонки перед y0/y1/...".to_string()
+    })?;
+    Ok(InferredPrepareSpec {
+        n_inputs,
+        n_outputs,
+        delimiter,
+        has_header,
+        categorical: infer_categorical(rows, n_inputs),
+    })
+}
+
+pub fn infer_prepare_spec_from_text(
+    input: &str,
+    delimiter: Delimiter,
+) -> Result<InferredPrepareSpec, String> {
+    let rows = text_to_rows(input, delimiter)?;
+    infer_prepare_spec_from_rows(&rows, delimiter)
+}
+
+pub fn infer_prepare_spec_from_path(
+    path: impl AsRef<Path>,
+    delimiter: Delimiter,
+) -> Result<InferredPrepareSpec, String> {
+    let path = path.as_ref();
+    let rows = rows_from_path(path, delimiter)?;
+    infer_prepare_spec_from_rows(&rows, delimiter)
+}
+
 /// Конвертирует таблицу в строку формата `.tnum`. Валидирует число колонок,
 /// конечность значений и категориальные коды (целочисленность + диапазон).
 pub fn table_to_tnum(input: &str, spec: &PrepareSpec) -> Result<String, String> {
+    rows_to_tnum(text_to_rows(input, spec.delimiter)?, spec)
+}
+
+pub fn table_path_to_tnum(path: impl AsRef<Path>, spec: &PrepareSpec) -> Result<String, String> {
+    rows_to_tnum(rows_from_path(path.as_ref(), spec.delimiter)?, spec)
+}
+
+fn rows_to_tnum(mut lines: Vec<Vec<String>>, spec: &PrepareSpec) -> Result<String, String> {
     if spec.n_inputs == 0 || spec.n_outputs == 0 {
         return Err("inputs и outputs должны быть > 0".to_string());
     }
@@ -110,7 +330,6 @@ pub fn table_to_tnum(input: &str, spec: &PrepareSpec) -> Result<String, String> 
         }
     }
 
-    let mut lines = clean_lines(input);
     if lines.is_empty() {
         return Err("нет строк данных".to_string());
     }
@@ -121,22 +340,20 @@ pub fn table_to_tnum(input: &str, spec: &PrepareSpec) -> Result<String, String> 
         return Err("нет строк данных после заголовка".to_string());
     }
 
-    let delim = detect_delim(lines[0], spec.delimiter);
     let expected = spec.n_inputs + spec.n_outputs;
 
     let mut rows: Vec<Vec<f32>> = Vec::with_capacity(lines.len());
     for (r, line) in lines.iter().enumerate() {
-        let toks = split_line(line, delim);
-        if toks.len() != expected {
+        if line.len() != expected {
             return Err(format!(
                 "строка {r}: ожидалось {expected} колонок ({} вход + {} выход), получено {}",
                 spec.n_inputs,
                 spec.n_outputs,
-                toks.len()
+                line.len()
             ));
         }
         let mut row = Vec::with_capacity(expected);
-        for (c, t) in toks.iter().enumerate() {
+        for (c, t) in line.iter().enumerate() {
             let v: f32 = t
                 .parse()
                 .map_err(|_| format!("строка {r}, колонка {c}: не число: '{t}'"))?;
@@ -214,6 +431,27 @@ mod tests {
         assert!(out.contains("specs C C K:3\n"));
         assert!(out.contains("rows 2\n"));
         assert!(out.contains("0.5 -0.2 1 2\n")); // 1.0 пишется как "1", 2.0 как "2"
+    }
+
+    #[test]
+    fn infers_example_complex_style_schema() {
+        let csv = "x0,x1,x2,material_id,y0,y1\n0.5,-0.2,1.0,2,3.0,4.0\n1.5,0.3,2.0,0,5.0,6.0\n";
+        let inferred = infer_prepare_spec_from_text(csv, Delimiter::Auto).unwrap();
+        assert_eq!(inferred.n_inputs, 4);
+        assert_eq!(inferred.n_outputs, 2);
+        assert!(inferred.has_header);
+        assert_eq!(inferred.categorical, vec![(3, 3)]);
+
+        let spec = PrepareSpec {
+            n_inputs: inferred.n_inputs,
+            n_outputs: inferred.n_outputs,
+            delimiter: inferred.delimiter,
+            has_header: inferred.has_header,
+            categorical: inferred.categorical,
+        };
+        let out = table_to_tnum(csv, &spec).unwrap();
+        assert!(out.contains("specs C C C K:3\n"));
+        assert!(out.contains("rows 2\n"));
     }
 
     #[test]

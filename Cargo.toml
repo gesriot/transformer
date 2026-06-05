@@ -14,6 +14,7 @@ ndarray-rand = "0.15"
 rand = "0.8"
 rand_distr = "0.4"
 rayon = "1.10"
+calamine = { version = "0.35", default-features = false }
 
 # Только для GUI (фича `gui`).
 eframe = { version = "0.31", optional = true }
