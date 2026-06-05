@@ -6,7 +6,7 @@ use crate::data::OutOfRange;
 use crate::epoch_sweep::EpochRow;
 use crate::metrics::Metrics;
 use crate::numeric_model::NumericConfig;
-use crate::sweep::{SweepAxes, SweepRow};
+use crate::sweep::{SweepAxes, SweepObjective, SweepRow};
 use crate::tnum::PrepareSpec;
 use crate::train::{TextTrainConfig, TrainConfig};
 
@@ -46,6 +46,11 @@ pub enum Command {
     Sweep {
         blackbox: String,
         axes: SweepAxes,
+    },
+    OptimizeFile {
+        path: String,
+        axes: SweepAxes,
+        objective: SweepObjective,
     },
     TrainText {
         path: String,
@@ -117,6 +122,17 @@ pub enum Event {
         row: SweepRow,
     },
     SweepDone {
+        rows: Vec<SweepRow>,
+        cancelled: bool,
+    },
+    OptimizeStarted {
+        total_configs: usize,
+        total_runs: usize,
+    },
+    OptimizeRow {
+        row: SweepRow,
+    },
+    OptimizeDone {
         rows: Vec<SweepRow>,
         cancelled: bool,
     },

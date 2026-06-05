@@ -24,6 +24,7 @@ use transformer::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
 use transformer::epoch_sweep;
 use transformer::generate::generate;
 use transformer::init::set_init_seed;
+use transformer::metrics::{evaluate, evaluate_per_output};
 use transformer::numeric_model::{validate_numeric, ModelKind, NumericConfig, NumericModel};
 use transformer::serialize::{load_numeric, save_numeric};
 use transformer::sweep as sweep_core;
@@ -347,12 +348,28 @@ fn report_and_eval(
             println!("  эпоха {e:>3}: train loss (норм.) = {loss:.5}");
         }
     }
-    let m = evaluate_surrogate(model, test, in_norm, out_norm);
+    let pred = predict_dataset(model, test, in_norm, out_norm);
+    let m = evaluate(&pred, &test.outputs);
     println!("\nМетрики на test (в исходных единицах):");
     println!("  RMSE        = {:.5}", m.rmse);
     println!("  MAE         = {:.5}", m.mae);
     println!("  rel. error  = {:.2}%", m.rel_error * 100.0);
     println!("  R²          = {:.5}", m.r2);
+
+    let per = evaluate_per_output(&pred, &test.outputs);
+    if per.len() > 1 {
+        println!("\nПо выходам:");
+        println!("  out   RMSE        MAE       rel.err     R²");
+        for (j, pm) in per.iter().enumerate() {
+            println!(
+                "  y{j:<3} {:>9.5}  {:>9.5}  {:>7.2}%  {:>8.5}",
+                pm.rmse,
+                pm.mae,
+                pm.rel_error * 100.0,
+                pm.r2
+            );
+        }
+    }
 }
 
 fn run_numeric(args: &[String]) {
@@ -900,6 +917,7 @@ fn run_sweep(args: &[String]) {
         .unwrap_or(6);
 
     let axes = sweep_core::SweepAxes {
+        model_kinds: vec![ModelKind::Transformer],
         seeds,
         d_models,
         layers,
@@ -908,8 +926,11 @@ fn run_sweep(args: &[String]) {
         value_encoders: vencs.iter().map(|v| parse_venc(v)).collect(),
         fourier_scales: fscales,
         fourier_bands: bands,
+        mlp_widths: vec![128],
+        mlp_layers: vec![3],
         schedules: scheds.iter().map(|s| parse_sched(s)).collect(),
         epochs,
+        final_epochs: epochs,
         batch_size: batch,
     };
     let (total_configs, total_runs) = sweep_core::sweep_size(&axes).unwrap_or_else(|e| fail(&e));

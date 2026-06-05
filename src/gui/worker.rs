@@ -16,7 +16,7 @@ use crate::generate::generate;
 use crate::init::set_init_seed;
 use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
 use crate::serialize::{load_numeric_full, save_numeric};
-use crate::sweep::{self, SweepAxes};
+use crate::sweep::{self, SweepAxes, SweepObjective};
 use crate::tensor::Tensor;
 use crate::textmodel::TextModel;
 use crate::tnum::{table_path_to_tnum, PrepareSpec};
@@ -242,6 +242,17 @@ fn worker_loop(
                     }
                 }
             }
+            Command::OptimizeFile {
+                path,
+                axes,
+                objective,
+            } => match run_optimize_file(&path, &axes, objective, &evt_tx, &ctx, &cancel) {
+                Ok(()) => {}
+                Err(e) => {
+                    let _ = evt_tx.send(Event::Error(e));
+                    ctx.request_repaint();
+                }
+            },
             Command::TrainText {
                 path,
                 model_cfg,
@@ -467,6 +478,34 @@ fn run_sweep(
         ctx.request_repaint();
     })?;
     let _ = evt_tx.send(Event::SweepDone {
+        rows: result.rows,
+        cancelled: result.cancelled,
+    });
+    ctx.request_repaint();
+    Ok(())
+}
+
+fn run_optimize_file(
+    path: &str,
+    axes: &SweepAxes,
+    objective: SweepObjective,
+    evt_tx: &Sender<Event>,
+    ctx: &egui::Context,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let (data, specs) = read_numeric_tnum(path).map_err(|e| format!("чтение {path}: {e}"))?;
+    let (total_configs, total_runs) = sweep::sweep_size(axes)?;
+    let _ = evt_tx.send(Event::OptimizeStarted {
+        total_configs,
+        total_runs,
+    });
+    ctx.request_repaint();
+
+    let result = sweep::run_file_sweep(&data, &specs, axes, objective, cancel, |row| {
+        let _ = evt_tx.send(Event::OptimizeRow { row: row.clone() });
+        ctx.request_repaint();
+    })?;
+    let _ = evt_tx.send(Event::OptimizeDone {
         rows: result.rows,
         cancelled: result.cancelled,
     });

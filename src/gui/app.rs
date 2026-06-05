@@ -10,7 +10,7 @@ use crate::encoders::{ValueEncoderConfig, ValueEncoderKind};
 use crate::epoch_sweep::{self, EpochRow};
 use crate::metrics::Metrics;
 use crate::numeric_model::{validate_numeric, ModelKind, NumericConfig};
-use crate::sweep::{self, SweepAxes, SweepRow};
+use crate::sweep::{self, SweepAxes, SweepChoice, SweepObjective, SweepRow};
 use crate::tnum::{infer_prepare_spec_from_path, parse_categorical, Delimiter, PrepareSpec};
 use crate::train::{validate_train, LrSchedule, TextTrainConfig, TrainConfig};
 use eframe::egui;
@@ -21,6 +21,7 @@ enum Tab {
     Train,
     Predict,
     Diagnose,
+    Optimize,
     Sweep,
     Text,
     Prepare,
@@ -184,6 +185,7 @@ impl Default for SweepForm {
 impl SweepForm {
     fn build(&self) -> Result<(String, SweepAxes), String> {
         let axes = SweepAxes {
+            model_kinds: vec![ModelKind::Transformer],
             seeds: parse_csv_u64(&self.seeds, "seeds")?,
             d_models: parse_csv_usize(&self.d_models, "d-models")?,
             layers: parse_csv_usize(&self.layers, "layers-list")?,
@@ -192,12 +194,133 @@ impl SweepForm {
             value_encoders: parse_value_encoders(&self.value_encoders)?,
             fourier_scales: parse_csv_f32(&self.fourier_scales, "fourier-scales")?,
             fourier_bands: self.fourier_bands,
+            mlp_widths: vec![128],
+            mlp_layers: vec![3],
             schedules: parse_schedules(&self.schedulers)?,
             epochs: self.epochs,
+            final_epochs: self.epochs,
             batch_size: self.batch,
         };
         sweep::validate_axes(&axes)?;
         Ok((self.blackbox.clone(), axes))
+    }
+}
+
+struct OptimizeForm {
+    file_path: String,
+    preset: usize,    // 0 quick, 1 balanced, 2 deep
+    objective: usize, // 0 worst, 1 aggregate, 2 mean, 3 nrmse
+    include_mlp: bool,
+    include_transformer: bool,
+}
+
+impl Default for OptimizeForm {
+    fn default() -> Self {
+        Self {
+            file_path: String::new(),
+            preset: 0,
+            objective: 0,
+            include_mlp: true,
+            include_transformer: true,
+        }
+    }
+}
+
+impl OptimizeForm {
+    fn objective(&self) -> SweepObjective {
+        match self.objective {
+            1 => SweepObjective::AggregateR2,
+            2 => SweepObjective::MeanOutputR2,
+            3 => SweepObjective::Nrmse,
+            _ => SweepObjective::WorstOutputR2,
+        }
+    }
+
+    /// Оси сетки из пресета (без требования файла) — для оценки размера в UI.
+    fn axes(&self) -> Result<SweepAxes, String> {
+        let mut model_kinds = Vec::new();
+        if self.include_transformer {
+            model_kinds.push(ModelKind::Transformer);
+        }
+        if self.include_mlp {
+            model_kinds.push(ModelKind::Mlp);
+        }
+        if model_kinds.is_empty() {
+            return Err("выберите хотя бы MLP или transformer".to_string());
+        }
+
+        let axes = match self.preset {
+            1 => SweepAxes {
+                model_kinds,
+                seeds: vec![0],
+                d_models: vec![64, 96],
+                layers: vec![2, 3],
+                d_ffs: vec![128, 384],
+                lrs: vec![1e-3],
+                value_encoders: vec![ValueEncoderKind::Linear, ValueEncoderKind::Mlp],
+                fourier_scales: vec![2.0],
+                fourier_bands: 6,
+                mlp_widths: vec![128, 256],
+                mlp_layers: vec![3, 4],
+                schedules: vec![LrSchedule::WarmupCosine {
+                    warmup_frac: 0.1,
+                    min_lr_ratio: 0.1,
+                }],
+                epochs: 40,
+                final_epochs: 80,
+                batch_size: 64,
+            },
+            2 => SweepAxes {
+                model_kinds,
+                seeds: vec![0, 1],
+                d_models: vec![64, 96, 128],
+                layers: vec![2, 3],
+                d_ffs: vec![128, 256, 384],
+                lrs: vec![1e-3],
+                value_encoders: vec![ValueEncoderKind::Linear, ValueEncoderKind::Mlp],
+                fourier_scales: vec![2.0],
+                fourier_bands: 6,
+                mlp_widths: vec![128, 256, 512],
+                mlp_layers: vec![3, 4],
+                schedules: vec![LrSchedule::WarmupCosine {
+                    warmup_frac: 0.1,
+                    min_lr_ratio: 0.1,
+                }],
+                epochs: 40,
+                final_epochs: 80,
+                batch_size: 64,
+            },
+            _ => SweepAxes {
+                model_kinds,
+                seeds: vec![0],
+                d_models: vec![64],
+                layers: vec![2],
+                d_ffs: vec![128],
+                lrs: vec![1e-3],
+                value_encoders: vec![ValueEncoderKind::Linear, ValueEncoderKind::Mlp],
+                fourier_scales: vec![2.0],
+                fourier_bands: 6,
+                mlp_widths: vec![128, 256],
+                mlp_layers: vec![3],
+                schedules: vec![LrSchedule::WarmupCosine {
+                    warmup_frac: 0.1,
+                    min_lr_ratio: 0.1,
+                }],
+                epochs: 25,
+                final_epochs: 60,
+                batch_size: 64,
+            },
+        };
+        sweep::validate_axes(&axes)?;
+        Ok(axes)
+    }
+
+    fn build(&self) -> Result<(String, SweepAxes, SweepObjective), String> {
+        if self.file_path.is_empty() {
+            return Err("выберите .tnum файл".to_string());
+        }
+        let axes = self.axes()?;
+        Ok((self.file_path.clone(), axes, self.objective()))
     }
 }
 
@@ -550,6 +673,22 @@ fn parse_schedules(raw: &str) -> Result<Vec<LrSchedule>, String> {
         .collect()
 }
 
+fn objective_label(objective: SweepObjective) -> &'static str {
+    match objective {
+        SweepObjective::WorstOutputR2 => "worst-output R²",
+        SweepObjective::AggregateR2 => "aggregate R²",
+        SweepObjective::MeanOutputR2 => "mean-output R²",
+        SweepObjective::Nrmse => "aggregate nRMSE",
+    }
+}
+
+fn objective_display_score(objective: SweepObjective, row: &SweepRow) -> f32 {
+    match objective {
+        SweepObjective::Nrmse => row.nrmse_mean,
+        _ => objective.score(row),
+    }
+}
+
 pub struct App {
     worker: Worker,
     tab: Tab,
@@ -567,6 +706,12 @@ pub struct App {
     batch_predicting: bool,
     // Diagnose (UI-M6)
     diagnostics: Option<DiagnosticsResult>,
+    // Optimize (file-based sweep)
+    optimize_form: OptimizeForm,
+    optimizing: bool,
+    optimize_rows: Vec<SweepRow>,
+    optimize_total: Option<(usize, usize)>,
+    optimize_cancelled: bool,
     // Sweep (UI-M6)
     sweep_form: SweepForm,
     sweep_rows: Vec<SweepRow>,
@@ -606,6 +751,11 @@ impl App {
             extrapolation: Vec::new(),
             batch_predicting: false,
             diagnostics: None,
+            optimize_form: OptimizeForm::default(),
+            optimizing: false,
+            optimize_rows: Vec::new(),
+            optimize_total: None,
+            optimize_cancelled: false,
             sweep_form: SweepForm::default(),
             sweep_rows: Vec::new(),
             sweep_total: None,
@@ -633,6 +783,7 @@ impl App {
                 Event::Error(e) => {
                     self.training = false;
                     self.sweeping = false;
+                    self.optimizing = false;
                     self.text_training = false;
                     self.epoch_sweeping = false;
                     self.batch_predicting = false;
@@ -727,6 +878,38 @@ impl App {
                         "sweep завершён".to_string()
                     };
                 }
+                Event::OptimizeStarted {
+                    total_configs,
+                    total_runs,
+                } => {
+                    self.optimizing = true;
+                    self.optimize_rows.clear();
+                    self.optimize_total = Some((total_configs, total_runs));
+                    self.optimize_cancelled = false;
+                    self.status =
+                        format!("optimize: 0/{total_configs} конфигов ({total_runs} прогонов)");
+                }
+                Event::OptimizeRow { row } => {
+                    self.optimize_rows.push(row);
+                    self.sort_optimize_rows();
+                    if let Some((total_configs, _)) = self.optimize_total {
+                        self.status = format!(
+                            "optimize: {}/{total_configs} конфигов",
+                            self.optimize_rows.len()
+                        );
+                    }
+                }
+                Event::OptimizeDone { rows, cancelled } => {
+                    self.optimizing = false;
+                    self.optimize_rows = rows;
+                    self.sort_optimize_rows();
+                    self.optimize_cancelled = cancelled;
+                    self.status = if cancelled {
+                        "optimize отменён".to_string()
+                    } else {
+                        "optimize завершён".to_string()
+                    };
+                }
                 Event::TextStarted { total_steps } => {
                     self.text_training = true;
                     self.text_ready = false;
@@ -811,9 +994,60 @@ impl App {
     fn busy(&self) -> bool {
         self.training
             || self.sweeping
+            || self.optimizing
             || self.text_training
             || self.epoch_sweeping
             || self.batch_predicting
+    }
+
+    fn sort_optimize_rows(&mut self) {
+        let objective = self.optimize_form.objective();
+        self.optimize_rows.sort_by(|a, b| {
+            objective
+                .score(b)
+                .partial_cmp(&objective.score(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    fn apply_choice_to_train(&mut self, choice: &SweepChoice) {
+        self.form.use_file = true;
+        self.form.file_path = self.optimize_form.file_path.clone();
+        self.form.mlp = choice.kind == ModelKind::Mlp;
+        self.form.d_model = choice.d_model;
+        self.form.heads = choice.heads;
+        self.form.layers = choice.layers;
+        self.form.d_ff = choice.d_ff;
+        self.form.venc = match choice.value.kind {
+            ValueEncoderKind::Linear => 0,
+            ValueEncoderKind::Mlp => 1,
+            ValueEncoderKind::Fourier => 2,
+        };
+        self.form.fourier_bands = choice.value.fourier_bands;
+        self.form.fourier_scale = choice.value.fourier_scale;
+        self.form.mlp_width = choice.mlp_width;
+        self.form.mlp_layers = choice.mlp_layers;
+        self.form.lr = choice.lr;
+        self.form.batch = choice.batch_size;
+        // Двухфазность: Optimize ранжировал на search-эпохах, а Train делает
+        // финальное обучение на полном бюджете.
+        self.form.epochs = choice.final_epochs;
+        self.form.seed = choice.seed;
+        match choice.schedule {
+            LrSchedule::Constant => {
+                self.form.warmup_cosine = false;
+            }
+            LrSchedule::WarmupCosine {
+                warmup_frac,
+                min_lr_ratio,
+            } => {
+                self.form.warmup_cosine = true;
+                self.form.warmup = warmup_frac;
+                self.form.min_lr_ratio = min_lr_ratio;
+            }
+        }
+        self.tab = Tab::Train;
+        self.status = "лучший конфиг применён во вкладке Train".to_string();
     }
 
     fn save_model_dialog(&mut self) {
@@ -1195,6 +1429,165 @@ impl App {
         }
     }
 
+    fn ui_optimize(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Optimize");
+
+        ui.horizontal(|ui| {
+            if ui.button("Выбрать .tnum…").clicked() {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("tnum", &["tnum"])
+                    .pick_file()
+                {
+                    self.optimize_form.file_path = p.display().to_string();
+                }
+            }
+            ui.label(if self.optimize_form.file_path.is_empty() {
+                "(файл не выбран)"
+            } else {
+                &self.optimize_form.file_path
+            });
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("preset");
+            egui::ComboBox::from_id_salt("optimize_preset")
+                .selected_text(["Quick", "Balanced", "Deep"][self.optimize_form.preset])
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.optimize_form.preset, 0, "Quick");
+                    ui.selectable_value(&mut self.optimize_form.preset, 1, "Balanced");
+                    ui.selectable_value(&mut self.optimize_form.preset, 2, "Deep");
+                });
+            ui.label("objective");
+            egui::ComboBox::from_id_salt("optimize_objective")
+                .selected_text(objective_label(self.optimize_form.objective()))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.optimize_form.objective, 0, "worst-output R²");
+                    ui.selectable_value(&mut self.optimize_form.objective, 1, "aggregate R²");
+                    ui.selectable_value(&mut self.optimize_form.objective, 2, "mean-output R²");
+                    ui.selectable_value(&mut self.optimize_form.objective, 3, "aggregate nRMSE");
+                });
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.optimize_form.include_transformer, "transformer");
+            ui.checkbox(&mut self.optimize_form.include_mlp, "mlp");
+        });
+        ui.label(match self.optimize_form.preset {
+            1 => "Balanced: средняя сетка, поиск на 40 эпохах, один seed.",
+            2 => "Deep: широкая сетка, поиск на 40 эпохах, два seed (устойчивость выбора).",
+            _ => "Quick: короткий поиск на 25 эпохах — быстро понять MLP vs transformer.",
+        });
+        ui.label(
+            "Optimize только ищет конфиг. Финальное обучение делает Train \
+             после «Apply best» (на полном бюджете эпох).",
+        );
+        // Оценка размера до запуска — чтобы случайно не словить долгий прогон.
+        if let Ok((cfgs, runs)) = self
+            .optimize_form
+            .axes()
+            .and_then(|a| sweep::sweep_size(&a))
+        {
+            ui.label(format!(
+                "Оценка: {cfgs} конфигов, {runs} прогонов (на реальных данных трансформер ~минуту/прогон)"
+            ));
+        }
+        self.sort_optimize_rows();
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.busy(), egui::Button::new("Run optimize"))
+                .clicked()
+            {
+                match self.optimize_form.build() {
+                    Ok((path, axes, objective)) => {
+                        self.worker.reset_cancel();
+                        self.worker.send(Command::OptimizeFile {
+                            path,
+                            axes,
+                            objective,
+                        });
+                    }
+                    Err(e) => self.status = format!("Ошибка: {e}"),
+                }
+            }
+            if ui
+                .add_enabled(self.optimizing, egui::Button::new("Cancel"))
+                .clicked()
+            {
+                self.worker.request_cancel();
+                self.status = "отмена optimize…".to_string();
+            }
+            let best_choice = self.optimize_rows.first().map(|r| r.choice.clone());
+            if ui
+                .add_enabled(
+                    best_choice.is_some() && !self.optimizing,
+                    egui::Button::new("Apply best to Train"),
+                )
+                .clicked()
+            {
+                if let Some(choice) = best_choice {
+                    self.apply_choice_to_train(&choice);
+                }
+            }
+        });
+
+        if let Some((cfgs, runs)) = self.optimize_total {
+            ui.label(format!(
+                "Конфигов: {cfgs}; прогонов: {runs}; готово: {}",
+                self.optimize_rows.len()
+            ));
+        }
+        if self.optimize_cancelled {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 0),
+                "Optimize отменён; показаны завершённые конфиги.",
+            );
+        }
+
+        if !self.optimize_rows.is_empty() {
+            ui.separator();
+            let (search_epochs, final_epochs) = self
+                .optimize_rows
+                .first()
+                .map(|r| (r.choice.epochs, r.choice.final_epochs))
+                .unwrap_or((0, 0));
+            ui.label(format!(
+                "Ранжирование: {} (поиск на {search_epochs} эпох; Apply -> {final_epochs})",
+                objective_label(self.optimize_form.objective())
+            ));
+            egui::ScrollArea::vertical()
+                .max_height(360.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("optimize_rows")
+                        .num_columns(8)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.label("#");
+                            ui.label("score");
+                            ui.label("R²");
+                            ui.label("worst y");
+                            ui.label("mean y");
+                            ui.label("aggr nRMSE");
+                            ui.label("rel");
+                            ui.label("config");
+                            ui.end_row();
+                            let objective = self.optimize_form.objective();
+                            for (i, row) in self.optimize_rows.iter().enumerate() {
+                                let mark = if i == 0 { "*" } else { "" };
+                                ui.label(format!("{mark}{}", i + 1));
+                                ui.label(format!("{:.5}", objective_display_score(objective, row)));
+                                ui.label(format!("{:.5}", row.r2_mean));
+                                ui.label(format!("{:.5}", row.worst_output_r2_mean));
+                                ui.label(format!("{:.5}", row.mean_output_r2_mean));
+                                ui.label(format!("{:.5}", row.nrmse_mean));
+                                ui.label(format!("{:.1}%", row.rel_mean * 100.0));
+                                ui.label(&row.label);
+                                ui.end_row();
+                            }
+                        });
+                });
+        }
+    }
+
     fn ui_sweep(&mut self, ui: &mut egui::Ui) {
         ui.heading("Sweep");
 
@@ -1296,7 +1689,7 @@ impl App {
                             ui.label("#");
                             ui.label("R²");
                             ui.label("std");
-                            ui.label("nRMSE");
+                            ui.label("aggr nRMSE");
                             ui.label("rel");
                             ui.label("config");
                             ui.end_row();
@@ -1781,6 +2174,7 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tab, Tab::Train, "Train");
                 ui.selectable_value(&mut self.tab, Tab::Predict, "Predict");
                 ui.selectable_value(&mut self.tab, Tab::Diagnose, "Diagnose");
+                ui.selectable_value(&mut self.tab, Tab::Optimize, "Optimize");
                 ui.selectable_value(&mut self.tab, Tab::Sweep, "Sweep");
                 ui.selectable_value(&mut self.tab, Tab::Text, "Text");
                 ui.selectable_value(&mut self.tab, Tab::Prepare, "Prepare");
@@ -1802,6 +2196,7 @@ impl eframe::App for App {
                     Tab::Train => self.ui_train(ui),
                     Tab::Predict => self.ui_predict(ui),
                     Tab::Diagnose => self.ui_diagnose(ui),
+                    Tab::Optimize => self.ui_optimize(ui),
                     Tab::Sweep => self.ui_sweep(ui),
                     Tab::Text => self.ui_text(ui),
                     Tab::Prepare => self.ui_prepare(ui),
