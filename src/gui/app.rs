@@ -564,6 +564,7 @@ pub struct App {
     predict_inputs: Vec<f32>,
     predict_outputs: Option<Vec<f32>>,
     extrapolation: Vec<OutOfRange>,
+    batch_predicting: bool,
     // Diagnose (UI-M6)
     diagnostics: Option<DiagnosticsResult>,
     // Sweep (UI-M6)
@@ -603,6 +604,7 @@ impl App {
             predict_inputs: Vec::new(),
             predict_outputs: None,
             extrapolation: Vec::new(),
+            batch_predicting: false,
             diagnostics: None,
             sweep_form: SweepForm::default(),
             sweep_rows: Vec::new(),
@@ -633,6 +635,7 @@ impl App {
                     self.sweeping = false;
                     self.text_training = false;
                     self.epoch_sweeping = false;
+                    self.batch_predicting = false;
                     self.status = format!("Ошибка: {e}");
                 }
                 Event::TrainStarted { total_epochs } => {
@@ -672,6 +675,20 @@ impl App {
                 } => {
                     self.predict_outputs = Some(outputs);
                     self.extrapolation = extrapolation;
+                }
+                Event::PredictFileDone {
+                    output,
+                    rows,
+                    extrapolation_rows,
+                } => {
+                    self.batch_predicting = false;
+                    self.status = if extrapolation_rows == 0 {
+                        format!("Excel заполнен: {output} ({rows} строк)")
+                    } else {
+                        format!(
+                            "Excel заполнен: {output} ({rows} строк, {extrapolation_rows} вне train-диапазона)"
+                        )
+                    };
                 }
                 Event::Diagnostics { result } => {
                     self.diagnostics = Some(result);
@@ -792,7 +809,11 @@ impl App {
     }
 
     fn busy(&self) -> bool {
-        self.training || self.sweeping || self.text_training || self.epoch_sweeping
+        self.training
+            || self.sweeping
+            || self.text_training
+            || self.epoch_sweeping
+            || self.batch_predicting
     }
 
     fn save_model_dialog(&mut self) {
@@ -804,6 +825,33 @@ impl App {
                 .send(Command::SaveModel(p.display().to_string()));
             self.status = "сохранение модели…".to_string();
         }
+    }
+
+    fn batch_predict_dialog(&mut self) {
+        let Some(input) = rfd::FileDialog::new()
+            .add_filter("Excel", &["xlsx"])
+            .pick_file()
+        else {
+            return;
+        };
+        let default_name = input
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| format!("{s}_predicted.xlsx"))
+            .unwrap_or_else(|| "predicted.xlsx".to_string());
+        let Some(output) = rfd::FileDialog::new()
+            .add_filter("Excel", &["xlsx"])
+            .set_file_name(&default_name)
+            .save_file()
+        else {
+            return;
+        };
+        self.batch_predicting = true;
+        self.status = "заполнение Excel…".to_string();
+        self.worker.send(Command::PredictFile {
+            input: input.display().to_string(),
+            output: output.display().to_string(),
+        });
     }
 
     fn apply_prepare_inference(&mut self) {
@@ -1036,7 +1084,10 @@ impl App {
                             ui.end_row();
                         }
                     });
-                if ui.button("Predict").clicked() {
+                if ui
+                    .add_enabled(!self.busy(), egui::Button::new("Predict"))
+                    .clicked()
+                {
                     self.worker
                         .send(Command::Predict(self.predict_inputs.clone()));
                 }
@@ -1060,6 +1111,23 @@ impl App {
                             ),
                         );
                     }
+                }
+
+                ui.separator();
+                ui.label("Пакетный Predict из Excel");
+                ui.label(format!(
+                    "Ожидается первый лист с колонками x0..x{} и y0..y{}; y-колонки будут перезаписаны.",
+                    n_in.saturating_sub(1),
+                    n_out.saturating_sub(1)
+                ));
+                if ui
+                    .add_enabled(
+                        !self.busy() && self.model_info.is_some(),
+                        egui::Button::new("Заполнить Excel (.xlsx)…"),
+                    )
+                    .clicked()
+                {
+                    self.batch_predict_dialog();
                 }
             }
         }

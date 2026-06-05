@@ -1,3 +1,4 @@
+pub mod batch_predict;
 pub mod blackbox;
 pub mod config;
 pub mod core;

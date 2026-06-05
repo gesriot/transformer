@@ -38,6 +38,10 @@ pub enum Command {
     LoadModel(String),
     SaveModel(String),
     Predict(Vec<f32>),
+    PredictFile {
+        input: String,
+        output: String,
+    },
     Diagnose,
     Sweep {
         blackbox: String,
@@ -96,6 +100,11 @@ pub enum Event {
     PredictResult {
         outputs: Vec<f32>,
         extrapolation: Vec<OutOfRange>,
+    },
+    PredictFileDone {
+        output: String,
+        rows: usize,
+        extrapolation_rows: usize,
     },
     Diagnostics {
         result: DiagnosticsResult,

@@ -6,6 +6,7 @@
 //! для Predict; UI получает только числа/статусы.
 
 use super::messages::{Command, DataSource, DiagnosticsResult, Event};
+use crate::batch_predict::{read_prediction_xlsx, write_prediction_xlsx};
 use crate::blackbox;
 use crate::config::ModelConfig;
 use crate::data::{read_numeric_tnum, Normalizer, NumericDataset, OutOfRange, TextDataset};
@@ -196,6 +197,28 @@ fn worker_loop(
                             let _ = evt_tx.send(Event::PredictResult {
                                 outputs,
                                 extrapolation,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(Event::Error(e));
+                        }
+                    },
+                    None => {
+                        let _ = evt_tx.send(Event::Error(
+                            "нет модели: обучите или загрузите .bin".to_string(),
+                        ));
+                    }
+                }
+                ctx.request_repaint();
+            }
+            Command::PredictFile { input, output } => {
+                match &current {
+                    Some(l) => match do_predict_file(l, &input, &output) {
+                        Ok((rows, extrapolation_rows)) => {
+                            let _ = evt_tx.send(Event::PredictFileDone {
+                                output,
+                                rows,
+                                extrapolation_rows,
                             });
                         }
                         Err(e) => {
@@ -401,6 +424,28 @@ fn do_predict(l: &Loaded, values: &[f32]) -> Result<(Vec<f32>, Vec<OutOfRange>),
         .map_err(|_| "predict вернул неверную форму".to_string())?;
     let pred = l.out_norm.inverse_transform(&pred_norm);
     Ok((pred.row(0).to_vec(), extrapolation))
+}
+
+fn do_predict_file(l: &Loaded, input: &str, output: &str) -> Result<(usize, usize), String> {
+    let sheet = read_prediction_xlsx(input, l.n_inputs, l.n_outputs)?;
+    let input_rows = sheet.input_rows()?;
+    if input_rows.is_empty() {
+        return Err("Excel-файл не содержит строк с входами".to_string());
+    }
+
+    let mut predictions = Vec::with_capacity(input_rows.len());
+    let mut extrapolation_rows = 0;
+    for values in &input_rows {
+        let (pred, extrapolation) = do_predict(l, values)?;
+        if !extrapolation.is_empty() {
+            extrapolation_rows += 1;
+        }
+        predictions.push(pred);
+    }
+
+    let filled = sheet.fill_outputs(&predictions)?;
+    write_prediction_xlsx(output, &filled)?;
+    Ok((predictions.len(), extrapolation_rows))
 }
 
 fn run_sweep(
