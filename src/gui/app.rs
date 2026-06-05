@@ -1050,6 +1050,77 @@ impl App {
         self.status = "лучший конфиг применён во вкладке Train".to_string();
     }
 
+    /// Переносит лучший конфиг Optimize в Epoch-sweep, чтобы подобрать число
+    /// эпох. Конфиг тот же; эпохи Optimize не переносим — задаём список для
+    /// прохода.
+    fn apply_choice_to_epoch_sweep(&mut self, choice: &SweepChoice) {
+        self.epoch_form.file_path = self.optimize_form.file_path.clone();
+        self.epoch_form.mlp = choice.kind == ModelKind::Mlp;
+        self.epoch_form.d_model = choice.d_model;
+        self.epoch_form.heads = choice.heads;
+        self.epoch_form.layers = choice.layers;
+        self.epoch_form.d_ff = choice.d_ff;
+        self.epoch_form.venc = match choice.value.kind {
+            ValueEncoderKind::Linear => 0,
+            ValueEncoderKind::Mlp => 1,
+            ValueEncoderKind::Fourier => 2,
+        };
+        self.epoch_form.fourier_bands = choice.value.fourier_bands;
+        self.epoch_form.fourier_scale = choice.value.fourier_scale;
+        self.epoch_form.mlp_width = choice.mlp_width;
+        self.epoch_form.mlp_layers = choice.mlp_layers;
+        self.epoch_form.lr = choice.lr;
+        self.epoch_form.batch = choice.batch_size;
+        self.epoch_form.seed = choice.seed;
+        match choice.schedule {
+            LrSchedule::Constant => {
+                self.epoch_form.warmup_cosine = false;
+            }
+            LrSchedule::WarmupCosine {
+                warmup_frac,
+                min_lr_ratio,
+            } => {
+                self.epoch_form.warmup_cosine = true;
+                self.epoch_form.warmup = warmup_frac;
+                self.epoch_form.min_lr_ratio = min_lr_ratio;
+            }
+        }
+        self.epoch_form.epochs = "20,40,60,80,120".to_string();
+        self.epoch_rows.clear();
+        self.epoch_total = None;
+        self.epoch_recommendation = None;
+        self.epoch_cancelled = false;
+        self.tab = Tab::EpochSweep;
+        self.status = "конфиг перенесён в Epoch-sweep — запусти подбор эпох".to_string();
+    }
+
+    /// Переносит текущий конфиг Epoch-sweep и рекомендованное число эпох в
+    /// Train. Замыкает поток Optimize → Check epochs → Train.
+    fn apply_epoch_form_to_train(&mut self, epochs: usize) {
+        let f = &self.epoch_form;
+        self.form.use_file = true;
+        self.form.file_path = f.file_path.clone();
+        self.form.mlp = f.mlp;
+        self.form.d_model = f.d_model;
+        self.form.heads = f.heads;
+        self.form.layers = f.layers;
+        self.form.d_ff = f.d_ff;
+        self.form.venc = f.venc;
+        self.form.fourier_bands = f.fourier_bands;
+        self.form.fourier_scale = f.fourier_scale;
+        self.form.mlp_width = f.mlp_width;
+        self.form.mlp_layers = f.mlp_layers;
+        self.form.lr = f.lr;
+        self.form.batch = f.batch;
+        self.form.seed = f.seed;
+        self.form.warmup_cosine = f.warmup_cosine;
+        self.form.warmup = f.warmup;
+        self.form.min_lr_ratio = f.min_lr_ratio;
+        self.form.epochs = epochs;
+        self.tab = Tab::Train;
+        self.status = format!("конфиг и {epochs} эпох применены во вкладке Train");
+    }
+
     fn save_model_dialog(&mut self) {
         if let Some(p) = rfd::FileDialog::new()
             .add_filter("bin", &["bin"])
@@ -1517,15 +1588,22 @@ impl App {
                 self.status = "отмена optimize…".to_string();
             }
             let best_choice = self.optimize_rows.first().map(|r| r.choice.clone());
+            let has_best = best_choice.is_some() && !self.optimizing;
             if ui
-                .add_enabled(
-                    best_choice.is_some() && !self.optimizing,
-                    egui::Button::new("Apply best to Train"),
-                )
+                .add_enabled(has_best, egui::Button::new("Apply to Train"))
                 .clicked()
             {
-                if let Some(choice) = best_choice {
-                    self.apply_choice_to_train(&choice);
+                if let Some(choice) = &best_choice {
+                    self.apply_choice_to_train(choice);
+                }
+            }
+            if ui
+                .add_enabled(has_best, egui::Button::new("Check epochs"))
+                .on_hover_text("Перенести конфиг в Epoch-sweep и подобрать число эпох")
+                .clicked()
+            {
+                if let Some(choice) = &best_choice {
+                    self.apply_choice_to_epoch_sweep(choice);
                 }
             }
         });
@@ -2100,6 +2178,19 @@ impl App {
                         Ok(()) => self.status = format!("CSV: {}", p.display()),
                         Err(e) => self.status = format!("Ошибка: запись CSV: {e}"),
                     }
+                }
+            }
+            let recommended = self.epoch_recommendation.as_ref().map(|(e, _)| *e);
+            if ui
+                .add_enabled(
+                    recommended.is_some() && !self.epoch_sweeping,
+                    egui::Button::new("Apply recommended to Train"),
+                )
+                .on_hover_text("Перенести конфиг и рекомендованное число эпох в Train")
+                .clicked()
+            {
+                if let Some(epochs) = recommended {
+                    self.apply_epoch_form_to_train(epochs);
                 }
             }
         });
