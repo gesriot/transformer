@@ -1,0 +1,29 @@
+pub mod blackbox;
+pub mod config;
+pub mod core;
+pub mod data;
+pub mod diagnostics;
+pub mod encoders;
+pub mod epoch_sweep;
+pub mod generate;
+#[cfg(feature = "gui")]
+pub mod gui;
+pub mod heads;
+pub mod init;
+pub mod loss;
+pub mod metrics;
+pub mod mlp;
+pub mod nn;
+pub mod numeric_model;
+pub mod ops;
+pub mod optim;
+pub mod serialize;
+pub mod surrogate;
+pub mod sweep;
+pub mod tensor;
+pub mod textmodel;
+pub mod tnum;
+pub mod train;
+
+#[cfg(test)]
+pub(crate) mod gradcheck;
