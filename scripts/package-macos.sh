@@ -46,6 +46,7 @@ BUNDLE_ID="${BUNDLE_ID:-com.transformer.surrogate}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BINARY_PATH="${BINARY_PATH:-$ROOT_DIR/target/release/$BINARY_NAME}"
+PACKAGE_VERSION="$(awk -F '"' '/^version = / { print $2; exit }' "$ROOT_DIR/Cargo.toml")"
 MACOS_DIR="$ROOT_DIR/macos"
 ICON_PNG="${ICON_PNG:-$MACOS_DIR/icon.png}"
 ICON_ROUNDED_PNG="${ICON_ROUNDED_PNG:-$MACOS_DIR/icon-rounded.png}"
@@ -59,6 +60,11 @@ DMG_PATH="$DIST_DIR/$APP_NAME.dmg"
 
 if [[ ! -f "$ICON_PNG" ]]; then
   echo "error: source icon not found: $ICON_PNG" >&2
+  exit 1
+fi
+
+if [[ -z "$PACKAGE_VERSION" ]]; then
+  echo "error: package version not found in Cargo.toml" >&2
   exit 1
 fi
 
@@ -197,9 +203,9 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>$PACKAGE_VERSION</string>
 	<key>CFBundleVersion</key>
-	<string>0.1.0</string>
+	<string>$PACKAGE_VERSION</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>11.0</string>
 	<key>NSHighResolutionCapable</key>

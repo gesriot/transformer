@@ -25,9 +25,12 @@ use transformer::epoch_sweep;
 use transformer::generate::generate;
 use transformer::init::set_init_seed;
 use transformer::metrics::{evaluate, evaluate_per_output};
-use transformer::numeric_model::{validate_numeric, ModelKind, NumericConfig, NumericModel};
-use transformer::serialize::{load_numeric, save_numeric};
+use transformer::numeric_model::{
+    validate_numeric, KanConfig, ModelKind, NumericConfig, NumericModel,
+};
+use transformer::serialize::{calibration_sample, load_numeric, save_numeric};
 use transformer::sweep as sweep_core;
+use transformer::symbolic;
 use transformer::tensor::Tensor;
 use transformer::textmodel::TextModel;
 use transformer::tnum::{
@@ -61,6 +64,12 @@ const NUMERIC_FLAGS: &[&str] = &[
     "fourier-scale",
     "mlp-width",
     "mlp-layers",
+    "kan-width",
+    "kan-layers",
+    "kan-grid",
+    "kan-l1",
+    "kan-prune",
+    "kan-finetune-epochs",
     "lr",
     "batch-size",
     "seed",
@@ -70,7 +79,7 @@ const NUMERIC_FLAGS: &[&str] = &[
 ];
 
 /// Булевы флаги (без значения).
-const NUMERIC_BOOL_FLAGS: &[&str] = &["diagnose"];
+const NUMERIC_BOOL_FLAGS: &[&str] = &["diagnose", "kan-symbolic", "kan-compact"];
 
 /// Флаги подкоманды prepare (таблица -> .tnum).
 const PREPARE_FLAGS: &[&str] = &["inputs", "outputs", "delimiter", "categorical"];
@@ -78,6 +87,7 @@ const PREPARE_BOOL_FLAGS: &[&str] = &["has-header"];
 
 /// Флаги подкоманды sweep (оси — CSV-списки).
 const SWEEP_FLAGS: &[&str] = &[
+    "model-kinds",
     "seeds",
     "d-models",
     "layers-list",
@@ -87,6 +97,11 @@ const SWEEP_FLAGS: &[&str] = &[
     "fourier-scales",
     "fourier-bands",
     "schedulers",
+    "mlp-widths",
+    "mlp-layers-list",
+    "kan-widths",
+    "kan-layers-list",
+    "kan-grids",
     "epochs",
     "batch-size",
 ];
@@ -207,9 +222,10 @@ fn numeric_config_from(f: &Flags) -> Result<NumericConfig, String> {
     let kind = match f.get("model-kind").unwrap_or("transformer") {
         "transformer" => ModelKind::Transformer,
         "mlp" => ModelKind::Mlp,
+        "kan" => ModelKind::Kan,
         other => {
             return Err(format!(
-                "--model-kind: ожидалось transformer|mlp, получено '{other}'"
+                "--model-kind: ожидалось transformer|mlp|kan, получено '{other}'"
             ))
         }
     };
@@ -233,9 +249,190 @@ fn numeric_config_from(f: &Flags) -> Result<NumericConfig, String> {
         },
         mlp_width: f.usize("mlp-width")?.unwrap_or(128),
         mlp_layers: f.usize("mlp-layers")?.unwrap_or(3),
+        kan: {
+            let d = KanConfig::default();
+            KanConfig {
+                width: f.usize("kan-width")?.unwrap_or(d.width),
+                layers: f.usize("kan-layers")?.unwrap_or(d.layers),
+                grid: f.usize("kan-grid")?.unwrap_or(d.grid),
+            }
+        },
     };
     validate_numeric(&nc)?;
     Ok(nc)
+}
+
+/// Разрежение KAN: activation-L1 при обучении и/или hard-prune + fine-tune.
+struct KanSparsity {
+    l1: f32,
+    prune: Option<f32>,
+    finetune_epochs: usize,
+}
+
+/// Разбор `--kan-l1 / --kan-prune / --kan-finetune-epochs`. `None` — флаги не
+/// заданы; заданные при не-KAN модели — ошибка (не молчаливое игнорирование).
+fn kan_sparsity_from(f: &Flags, nc: &NumericConfig) -> Result<Option<KanSparsity>, String> {
+    let l1 = f.f32("kan-l1")?;
+    let prune = f.f32("kan-prune")?;
+    let finetune = f.usize("kan-finetune-epochs")?;
+    if l1.is_none() && prune.is_none() && finetune.is_none() {
+        return Ok(None);
+    }
+    if nc.kind != ModelKind::Kan {
+        return Err(
+            "--kan-l1/--kan-prune/--kan-finetune-epochs применимы только к --model-kind kan"
+                .to_string(),
+        );
+    }
+    let l1 = l1.unwrap_or(0.0);
+    if !l1.is_finite() || l1 < 0.0 {
+        return Err("--kan-l1 должен быть конечным и >= 0".to_string());
+    }
+    if let Some(p) = prune {
+        if !p.is_finite() || !(0.0..1.0).contains(&p) {
+            return Err("--kan-prune (отн. порог важности) должен быть в [0, 1)".to_string());
+        }
+    }
+    if finetune.is_some() && prune.is_none() {
+        return Err("--kan-finetune-epochs имеет смысл только вместе с --kan-prune".to_string());
+    }
+    Ok(Some(KanSparsity {
+        l1,
+        prune,
+        finetune_epochs: finetune.unwrap_or(10).max(1),
+    }))
+}
+
+/// Включает activation-L1 на построенной модели (до обучения).
+fn apply_kan_l1(model: &NumericModel, sparsity: &Option<KanSparsity>) {
+    if let Some(s) = sparsity {
+        if s.l1 > 0.0 {
+            model
+                .as_kan()
+                .expect("kan_sparsity_from гарантирует kind=Kan")
+                .set_l1_lambda(s.l1);
+            println!("KAN activation-L1: λ={}", s.l1);
+        }
+    }
+}
+
+/// Прунинг + fine-tune обученной KAN: важность p95 |φ| на train, hard-prune
+/// ниже относительного порога, дообучение с λ=0 и сравнение R² по фазам.
+#[allow(clippy::too_many_arguments)]
+fn run_kan_prune(
+    model: &NumericModel,
+    train: &NumericDataset,
+    test: &NumericDataset,
+    in_norm: &Normalizer,
+    out_norm: &Normalizer,
+    tcfg: &TrainConfig,
+    threshold: f32,
+    finetune_epochs: usize,
+) {
+    let kan = model.as_kan().expect("прунинг вызывается только для KAN");
+    let before = evaluate_surrogate(model, test, in_norm, out_norm);
+
+    let calibration = in_norm.transform(&train.inputs);
+    let report = kan.prune_edges(threshold, &calibration);
+    println!("\nKAN prune (важность = p95 |φ| на train, порог {threshold} от максимума слоя):");
+    for (l, (a, t)) in report.per_layer.iter().enumerate() {
+        println!("  слой {l}: {a}/{t} активных рёбер");
+    }
+    let after_prune = evaluate_surrogate(model, test, in_norm, out_norm);
+
+    kan.set_l1_lambda(0.0);
+    let ft_cfg = TrainConfig {
+        epochs: finetune_epochs,
+        ..tcfg.clone()
+    };
+    train_surrogate(model, train, in_norm, out_norm, &ft_cfg);
+    let after_ft = evaluate_surrogate(model, test, in_norm, out_norm);
+
+    let (active, total) = report.totals();
+    println!(
+        "R² на test: до прунинга {:.5} -> после {:.5} -> после fine-tune ({finetune_epochs} эпох, λ=0) {:.5}",
+        before.r2, after_prune.r2, after_ft.r2
+    );
+    println!("Активных рёбер: {active}/{total} (параметры не сжимаются — это следующий шаг)");
+}
+
+/// `--kan-symbolic` при не-KAN модели — ошибка, не молчаливое игнорирование.
+fn validate_kan_symbolic(f: &Flags, nc: &NumericConfig) -> Result<(), String> {
+    for flag in ["kan-symbolic", "kan-compact"] {
+        if f.has(flag) && nc.kind != ModelKind::Kan {
+            return Err(format!("--{flag} применим только к --model-kind kan"));
+        }
+    }
+    Ok(())
+}
+
+/// Структурное сжатие KAN: физически удаляет мёртвые скрытые узлы (после
+/// hard-prune) с реальным уменьшением числа параметров и проверяет, что
+/// функция сети не изменилась (R² на test до/после).
+fn run_kan_compact(
+    model: &mut NumericModel,
+    test: &NumericDataset,
+    in_norm: &Normalizer,
+    out_norm: &Normalizer,
+) {
+    let before = evaluate_surrogate(model, test, in_norm, out_norm);
+    let report = model
+        .as_kan_mut()
+        .expect("структурное сжатие вызывается только для KAN")
+        .compact();
+    let after = evaluate_surrogate(model, test, in_norm, out_norm);
+    println!(
+        "\nСтруктурное сжатие: скрытых узлов {} -> {}, параметров {} -> {}",
+        report.nodes_before, report.nodes_after, report.params_before, report.params_after
+    );
+    println!(
+        "R² на test: {:.5} -> {:.5} (удаление точное — совпадение ожидаемо)",
+        before.r2, after.r2
+    );
+}
+
+/// Symbolic extraction обученной KAN: фит рёбер примитивами по train-активациям,
+/// послойные формулы и верность формул на test.
+fn run_kan_symbolic(
+    model: &NumericModel,
+    train: &NumericDataset,
+    test: &NumericDataset,
+    in_norm: &Normalizer,
+    out_norm: &Normalizer,
+) {
+    let kan = model
+        .as_kan()
+        .expect("symbolic extraction вызывается только для KAN");
+    let calibration = in_norm.transform(&train.inputs);
+    // Свёртка z-score в коэффициенты: формулы и предсказания — в исходных
+    // единицах данных, промежуточные узлы h остаются безразмерными.
+    let sym = symbolic::symbolize(kan, &calibration, 256).denormalize(in_norm, out_norm);
+
+    println!("\n=== SYMBOLIC EXTRACTION (входы и выходы в исходных единицах данных) ===");
+    print!("{}", sym.formulas());
+
+    let (min_r2, mean_r2) = sym.edge_r2_stats();
+    println!("Подгонка рёбер примитивами: min R² = {min_r2:.4}, среднее R² = {mean_r2:.4}");
+    let weak = sym.weak_edges(0.99);
+    if !weak.is_empty() {
+        println!("Слабо подогнанные рёбра (R² < 0.99) – формула там приближённая:");
+        for w in weak {
+            println!(
+                "  слой {}, вход {} -> выход {}: {} (R²={:.4})",
+                w.layer, w.input, w.output, w.name, w.r2
+            );
+        }
+    }
+
+    let pred = sym.predict(&test.inputs);
+    let m = evaluate(&pred, &test.outputs);
+    let kan_m = evaluate_surrogate(model, test, in_norm, out_norm);
+    println!(
+        "Формулы как модель на test: R² = {:.5} (KAN: {:.5}), rel = {:.2}%",
+        m.r2,
+        kan_m.r2,
+        m.rel_error * 100.0
+    );
 }
 
 /// Число эпох: флаг `--epochs`, иначе позиционный аргумент (legacy), иначе 40.
@@ -281,7 +478,9 @@ fn print_usage() {
     eprintln!("  transformer gui             явный запуск GUI");
     eprintln!("  transformer numeric <blackbox> [--epochs N] [--model out.bin] [флаги]");
     eprintln!("  transformer numeric-file <file.tnum> [--epochs N] [--model out.bin] [флаги]");
-    eprintln!("  transformer sweep <blackbox> [--d-models 32,64 --layers-list 2,3 ...]");
+    eprintln!("  transformer sweep <blackbox> [--model-kinds transformer,mlp,kan]");
+    eprintln!("                    [--d-models 32,64 --layers-list 2,3 --mlp-widths 128]");
+    eprintln!("                    [--kan-widths 16,32 --kan-layers-list 2 --kan-grids 8,16]");
     eprintln!("  transformer epoch-sweep <data.tnum> [--epochs 1,2,5,10,20,40] [конфиг-флаги]");
     eprintln!(
         "  transformer prepare <input> <out.tnum> --inputs N --outputs M [--has-header] [--categorical 9:4]"
@@ -289,6 +488,11 @@ fn print_usage() {
     eprintln!("  transformer text <file.txt> [steps]");
     eprintln!("  transformer predict <model.bin> <v1> <v2> ...");
     eprintln!("  флаги: --d-model --heads --layers --d-ff --lr --batch-size --seed");
+    eprintln!("         --model-kind transformer|mlp|kan --mlp-width --mlp-layers");
+    eprintln!("         --kan-width --kan-layers --kan-grid");
+    eprintln!("         --kan-l1 <λ> --kan-prune <отн. порог> --kan-finetune-epochs <N>");
+    eprintln!("         --kan-symbolic (извлечь формулы из обученной KAN)");
+    eprintln!("         --kan-compact (физически удалить мёртвые узлы после прунинга)");
 }
 
 fn print_config(nc: &NumericConfig, tcfg: &TrainConfig) {
@@ -314,6 +518,10 @@ fn print_config(nc: &NumericConfig, tcfg: &TrainConfig) {
             "Модель: mlp (width={} layers={})",
             nc.mlp_width, nc.mlp_layers
         ),
+        ModelKind::Kan => println!(
+            "Модель: kan (width={} layers={} grid={})",
+            nc.kan.width, nc.kan.layers, nc.kan.grid
+        ),
     }
     let sched = match tcfg.schedule {
         LrSchedule::Constant => "constant".to_string(),
@@ -336,6 +544,8 @@ fn report_and_eval(
     out_norm: &Normalizer,
     tcfg: &TrainConfig,
 ) {
+    let n_params: usize = model.parameters().iter().map(|p| p.data().len()).sum();
+    println!("Параметров: {n_params}");
     println!(
         "Обучение: {} эпох, {} train / {} test...",
         tcfg.epochs,
@@ -404,10 +614,25 @@ fn run_numeric(args: &[String]) {
     let out_norm = Normalizer::fit(&train.outputs, &Normalizer::all_continuous(bb.n_outputs));
 
     print_config(&nc, &tcfg);
+    let sparsity = kan_sparsity_from(&f, &nc).unwrap_or_else(|e| fail(&e));
+    validate_kan_symbolic(&f, &nc).unwrap_or_else(|e| fail(&e));
 
     set_init_seed(tcfg.seed); // воспроизводимая инициализация
-    let model = nc.build(&in_specs, bb.n_outputs);
+    let mut model = nc.build(&in_specs, bb.n_outputs);
+    apply_kan_l1(&model, &sparsity);
     report_and_eval(&model, &train, &test, &in_norm, &out_norm, &tcfg);
+    if let Some(threshold) = sparsity.as_ref().and_then(|s| s.prune) {
+        let ft = sparsity.as_ref().map_or(10, |s| s.finetune_epochs);
+        run_kan_prune(
+            &model, &train, &test, &in_norm, &out_norm, &tcfg, threshold, ft,
+        );
+    }
+    if f.has("kan-compact") {
+        run_kan_compact(&mut model, &test, &in_norm, &out_norm);
+    }
+    if f.has("kan-symbolic") {
+        run_kan_symbolic(&model, &train, &test, &in_norm, &out_norm);
+    }
 
     if let Some(path) = save_path {
         save_and_verify(
@@ -418,6 +643,7 @@ fn run_numeric(args: &[String]) {
             &model,
             &in_norm,
             &out_norm,
+            &train,
             &test,
         );
     }
@@ -473,14 +699,29 @@ fn run_numeric_file(args: &[String]) {
     let out_norm = Normalizer::fit(&train.outputs, &Normalizer::all_continuous(n_outputs));
 
     print_config(&nc, &tcfg);
+    let sparsity = kan_sparsity_from(&f, &nc).unwrap_or_else(|e| fail(&e));
+    validate_kan_symbolic(&f, &nc).unwrap_or_else(|e| fail(&e));
 
     set_init_seed(tcfg.seed); // воспроизводимая инициализация
-    let model = nc.build(&in_specs, n_outputs);
+    let mut model = nc.build(&in_specs, n_outputs);
+    apply_kan_l1(&model, &sparsity);
     report_and_eval(&model, &train, &test, &in_norm, &out_norm, &tcfg);
+    if let Some(threshold) = sparsity.as_ref().and_then(|s| s.prune) {
+        let ft = sparsity.as_ref().map_or(10, |s| s.finetune_epochs);
+        run_kan_prune(
+            &model, &train, &test, &in_norm, &out_norm, &tcfg, threshold, ft,
+        );
+    }
+    if f.has("kan-compact") {
+        run_kan_compact(&mut model, &test, &in_norm, &out_norm);
+    }
+    if f.has("kan-symbolic") {
+        run_kan_symbolic(&model, &train, &test, &in_norm, &out_norm);
+    }
 
     if let Some(path) = save_path {
         save_and_verify(
-            path, &nc, &in_specs, n_outputs, &model, &in_norm, &out_norm, &test,
+            path, &nc, &in_specs, n_outputs, &model, &in_norm, &out_norm, &train, &test,
         );
     }
 
@@ -500,10 +741,23 @@ fn save_and_verify(
     model: &NumericModel,
     in_norm: &Normalizer,
     out_norm: &Normalizer,
+    train: &NumericDataset,
     test: &NumericDataset,
 ) {
-    save_numeric(path, nc, specs, num_outputs, model, in_norm, out_norm)
-        .expect("сохранение модели");
+    // Калибровка (выборка сырых train-строк) едет в checkpoint: symbolic
+    // extraction остаётся доступной после загрузки .bin.
+    let calibration = calibration_sample(&train.inputs, 256);
+    save_numeric(
+        path,
+        nc,
+        specs,
+        num_outputs,
+        model,
+        in_norm,
+        out_norm,
+        Some(&calibration),
+    )
+    .expect("сохранение модели");
     let (loaded, in2, out2) = load_numeric(path).expect("загрузка модели");
     let m2 = evaluate_surrogate(&loaded, test, &in2, &out2);
     println!(
@@ -654,6 +908,17 @@ fn run_epoch_sweep_cmd(args: &[String]) {
     let mut allowed = NUMERIC_FLAGS.to_vec();
     allowed.extend_from_slice(&["out-dir", "target-r2", "min-r2-gain", "plateau-min-r2"]);
     let f = Flags::parse(&args[2..], &allowed, NUMERIC_BOOL_FLAGS).unwrap_or_else(|e| fail(&e));
+    for k in [
+        "kan-l1",
+        "kan-prune",
+        "kan-finetune-epochs",
+        "kan-symbolic",
+        "kan-compact",
+    ] {
+        if f.has(k) {
+            fail(&format!("--{k} не поддерживается в epoch-sweep"));
+        }
+    }
 
     let path = f
         .pos(0)
@@ -916,8 +1181,22 @@ fn run_sweep(args: &[String]) {
         .unwrap_or_else(|e| fail(&e))
         .unwrap_or(6);
 
+    let model_kinds: Vec<ModelKind> = f
+        .get("model-kinds")
+        .unwrap_or("transformer")
+        .split(',')
+        .map(|s| match s.trim() {
+            "transformer" => ModelKind::Transformer,
+            "mlp" => ModelKind::Mlp,
+            "kan" => ModelKind::Kan,
+            other => fail(&format!(
+                "--model-kinds: ожидалось transformer|mlp|kan, получено '{other}'"
+            )),
+        })
+        .collect();
+
     let axes = sweep_core::SweepAxes {
-        model_kinds: vec![ModelKind::Transformer],
+        model_kinds,
         seeds,
         d_models,
         layers,
@@ -926,8 +1205,11 @@ fn run_sweep(args: &[String]) {
         value_encoders: vencs.iter().map(|v| parse_venc(v)).collect(),
         fourier_scales: fscales,
         fourier_bands: bands,
-        mlp_widths: vec![128],
-        mlp_layers: vec![3],
+        mlp_widths: csv_usize(&f, "mlp-widths", "128"),
+        mlp_layers: csv_usize(&f, "mlp-layers-list", "3"),
+        kan_widths: csv_usize(&f, "kan-widths", "16"),
+        kan_layers: csv_usize(&f, "kan-layers-list", "2"),
+        kan_grids: csv_usize(&f, "kan-grids", "8"),
         schedules: scheds.iter().map(|s| parse_sched(s)).collect(),
         epochs,
         final_epochs: epochs,

@@ -28,6 +28,36 @@ pub struct DiagnosticsResult {
     pub sensitivity: Option<(f32, f32)>,
 }
 
+/// Метаданные KAN, безопасные для передачи из worker в UI. Сами тензоры и
+/// модель остаются в worker-потоке; UI получает только размеры и выборки.
+pub struct KanModelInfo {
+    pub layer_dims: Vec<(usize, usize)>,
+    pub domain: (f32, f32),
+    /// Символьный фит требует исходные train-активации. Они есть только у
+    /// модели, обученной в текущей сессии, а не у загруженного checkpoint-а.
+    pub symbolic_available: bool,
+}
+
+/// Слабое символьное ребро, передаваемое в UI без тензоров.
+pub struct KanWeakEdge {
+    pub layer: usize,
+    pub input: usize,
+    pub output: usize,
+    pub primitive: String,
+    pub r2: f32,
+}
+
+/// Готовый результат symbolic extraction в исходных единицах данных.
+pub struct KanSymbolicInfo {
+    pub formulas: String,
+    pub min_edge_r2: f32,
+    pub mean_edge_r2: f32,
+    /// Метрики формул на test: `None` у модели из checkpoint-а (нет test-набора).
+    pub formula_metrics: Option<Metrics>,
+    pub kan_r2: Option<f32>,
+    pub weak_edges: Vec<KanWeakEdge>,
+}
+
 /// Команды UI -> worker.
 pub enum Command {
     TrainNumeric {
@@ -42,6 +72,13 @@ pub enum Command {
         input: String,
         output: String,
     },
+    SampleKanEdge {
+        layer: usize,
+        input: usize,
+        output: usize,
+        samples: usize,
+    },
+    ExtractKanSymbolic,
     Diagnose,
     Sweep {
         blackbox: String,
@@ -87,6 +124,7 @@ pub enum Event {
     Error(String),
     TrainStarted {
         total_epochs: usize,
+        parameter_count: usize,
     },
     Epoch {
         epoch: usize,
@@ -101,6 +139,8 @@ pub enum Event {
         n_inputs: usize,
         n_outputs: usize,
         source: String,
+        parameter_count: usize,
+        kan: Option<KanModelInfo>,
     },
     PredictResult {
         outputs: Vec<f32>,
@@ -110,6 +150,15 @@ pub enum Event {
         output: String,
         rows: usize,
         extrapolation_rows: usize,
+    },
+    KanEdgeCurve {
+        layer: usize,
+        input: usize,
+        output: usize,
+        points: Vec<(f32, f32)>,
+    },
+    KanSymbolic {
+        result: KanSymbolicInfo,
     },
     Diagnostics {
         result: DiagnosticsResult,

@@ -1,11 +1,11 @@
 use crate::tensor::Tensor;
-use ndarray::{Array, ArrayD, IxDyn};
-use ndarray_rand::rand_distr::Uniform;
-use ndarray_rand::RandomExt;
+use ndarray::ArrayD;
 
+/// Через `init::rand_uniform`: тест с изломом (relu, abs) может вызвать
+/// `set_init_seed` и стать детерминированным — конечная разность у излома
+/// иначе флакает при неудачной энтропии.
 pub(crate) fn rand_tensor(shape: &[usize]) -> Tensor {
-    let a = Array::random(IxDyn(shape), Uniform::new(-0.7, 0.7));
-    Tensor::new(a)
+    Tensor::new(crate::init::rand_uniform(shape, -0.7, 0.7))
 }
 
 pub(crate) fn grad_check<F: Fn(&[Tensor]) -> Tensor>(inputs: &[Tensor], f: F) {

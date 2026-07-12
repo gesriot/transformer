@@ -5,7 +5,9 @@
 //! Обученная/загруженная модель (Rc !Send) живёт ЗДЕСЬ (`current`) и используется
 //! для Predict; UI получает только числа/статусы.
 
-use super::messages::{Command, DataSource, DiagnosticsResult, Event};
+use super::messages::{
+    Command, DataSource, DiagnosticsResult, Event, KanModelInfo, KanSymbolicInfo, KanWeakEdge,
+};
 use crate::batch_predict::{read_prediction_xlsx, write_prediction_xlsx};
 use crate::blackbox;
 use crate::config::ModelConfig;
@@ -14,9 +16,11 @@ use crate::encoders::FeatureSpec;
 use crate::epoch_sweep::{self, EpochRow};
 use crate::generate::generate;
 use crate::init::set_init_seed;
+use crate::metrics::evaluate;
 use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
-use crate::serialize::{load_numeric_full, save_numeric};
+use crate::serialize::{calibration_sample, load_numeric_full, save_numeric};
 use crate::sweep::{self, SweepAxes, SweepObjective};
+use crate::symbolic;
 use crate::tensor::Tensor;
 use crate::textmodel::TextModel;
 use crate::tnum::{table_path_to_tnum, PrepareSpec};
@@ -90,6 +94,9 @@ struct Loaded {
     n_outputs: usize,
     /// Данные обучения для диагностики (`None` для загруженной `.bin`).
     diag: Option<DiagData>,
+    /// Калибровочная выборка сырых train-входов: у загруженного checkpoint-а
+    /// берётся из секции `calibration`, у обученной модели — из train.
+    calibration: Option<Array2<f32>>,
 }
 
 /// Данные сессии обучения, нужные для диагностики.
@@ -128,6 +135,11 @@ fn worker_loop(
                             n_inputs: loaded.n_inputs,
                             n_outputs: loaded.n_outputs,
                             source: source_desc(&source),
+                            parameter_count: loaded.model.parameter_count(),
+                            kan: kan_model_info(
+                                &loaded.model,
+                                loaded.diag.is_some() || loaded.calibration.is_some(),
+                            ),
                         });
                         current = Some(loaded);
                         ctx.request_repaint();
@@ -146,6 +158,11 @@ fn worker_loop(
                             n_inputs: loaded.n_inputs,
                             n_outputs: loaded.n_outputs,
                             source: format!("файл: {path}"),
+                            parameter_count: loaded.model.parameter_count(),
+                            kan: kan_model_info(
+                                &loaded.model,
+                                loaded.diag.is_some() || loaded.calibration.is_some(),
+                            ),
                         });
                         current = Some(loaded);
                         let _ = evt_tx.send(Event::Status("модель загружена".to_string()));
@@ -229,6 +246,53 @@ fn worker_loop(
                         let _ = evt_tx.send(Event::Error(
                             "нет модели: обучите или загрузите .bin".to_string(),
                         ));
+                    }
+                }
+                ctx.request_repaint();
+            }
+            Command::SampleKanEdge {
+                layer,
+                input,
+                output,
+                samples,
+            } => {
+                match &current {
+                    Some(loaded) => {
+                        match sample_kan_edge(&loaded.model, layer, input, output, samples) {
+                            Ok(points) => {
+                                let _ = evt_tx.send(Event::KanEdgeCurve {
+                                    layer,
+                                    input,
+                                    output,
+                                    points,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = evt_tx.send(Event::Error(e));
+                            }
+                        }
+                    }
+                    None => {
+                        let _ = evt_tx.send(Event::Error(
+                            "нет модели: обучите или загрузите KAN".to_string(),
+                        ));
+                    }
+                }
+                ctx.request_repaint();
+            }
+            Command::ExtractKanSymbolic => {
+                match &current {
+                    Some(loaded) => match extract_kan_symbolic(loaded) {
+                        Ok(result) => {
+                            let _ = evt_tx.send(Event::KanSymbolic { result });
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(Event::Error(e));
+                        }
+                    },
+                    None => {
+                        let _ = evt_tx
+                            .send(Event::Error("нет модели: сначала обучите KAN".to_string()));
                     }
                 }
                 ctx.request_repaint();
@@ -352,6 +416,104 @@ fn source_desc(s: &DataSource) -> String {
     }
 }
 
+fn kan_model_info(model: &NumericModel, symbolic_available: bool) -> Option<KanModelInfo> {
+    model.as_kan().map(|kan| KanModelInfo {
+        layer_dims: kan.layer_dims(),
+        domain: kan.domain(),
+        symbolic_available,
+    })
+}
+
+/// Вычисляет выборку одной функции ребра в worker-потоке. Это не даёт
+/// `Rc`-тензорам пересечь границу потока и защищает GUI от неверных индексов.
+fn sample_kan_edge(
+    model: &NumericModel,
+    layer: usize,
+    input: usize,
+    output: usize,
+    samples: usize,
+) -> Result<Vec<(f32, f32)>, String> {
+    let kan = model
+        .as_kan()
+        .ok_or_else(|| "графики функций доступны только для KAN".to_string())?;
+    if samples < 2 {
+        return Err("для графика нужно минимум 2 точки".to_string());
+    }
+    let (n_inputs, n_outputs) = *kan
+        .layer_dims()
+        .get(layer)
+        .ok_or_else(|| format!("KAN: нет слоя {layer}"))?;
+    if input >= n_inputs {
+        return Err(format!("KAN: в слое {layer} нет входа {input}"));
+    }
+    if output >= n_outputs {
+        return Err(format!("KAN: в слое {layer} нет выхода {output}"));
+    }
+
+    let (min, max) = kan.domain();
+    let step = (max - min) / (samples - 1) as f32;
+    let xs: Vec<f32> = (0..samples).map(|i| min + i as f32 * step).collect();
+    let ys = kan.edge_curve(layer, input, output, &xs);
+    Ok(xs.into_iter().zip(ys).collect())
+}
+
+/// Извлекает формулы по реальным train-активациям и возвращает только
+/// serializable данные для UI. Checkpoint без train-набора не подходит:
+/// равномерная подмена калибровки исказила бы глубокие рёбра.
+fn extract_kan_symbolic(loaded: &Loaded) -> Result<KanSymbolicInfo, String> {
+    let kan = loaded
+        .model
+        .as_kan()
+        .ok_or_else(|| "символьные формулы доступны только для KAN".to_string())?;
+    // Реальные активации: train текущей сессии либо калибровка из checkpoint-а.
+    let raw_inputs: &Array2<f32> = match (&loaded.diag, &loaded.calibration) {
+        (Some(diag), _) => &diag.train.inputs,
+        (None, Some(calib)) => calib,
+        (None, None) => {
+            return Err(
+                "формулы недоступны: checkpoint без секции calibration и без train-данных"
+                    .to_string(),
+            )
+        }
+    };
+    let calibration = loaded.in_norm.transform(raw_inputs);
+    let symbolic =
+        symbolic::symbolize(kan, &calibration, 256).denormalize(&loaded.in_norm, &loaded.out_norm);
+    let (min_edge_r2, mean_edge_r2) = symbolic.edge_r2_stats();
+    let weak_edges = symbolic
+        .weak_edges(0.99)
+        .into_iter()
+        .map(|edge| KanWeakEdge {
+            layer: edge.layer,
+            input: edge.input,
+            output: edge.output,
+            primitive: edge.name.to_string(),
+            r2: edge.r2,
+        })
+        .collect();
+    // Test-метрики есть только у модели, обученной в этой сессии.
+    let (formula_metrics, kan_r2) = match &loaded.diag {
+        Some(diag) => (
+            Some(evaluate(
+                &symbolic.predict(&diag.test.inputs),
+                &diag.test.outputs,
+            )),
+            Some(
+                evaluate_surrogate(&loaded.model, &diag.test, &loaded.in_norm, &loaded.out_norm).r2,
+            ),
+        ),
+        None => (None, None),
+    };
+    Ok(KanSymbolicInfo {
+        formulas: symbolic.formulas(),
+        min_edge_r2,
+        mean_edge_r2,
+        formula_metrics,
+        kan_r2,
+        weak_edges,
+    })
+}
+
 fn load_model(path: &str) -> Result<Loaded, String> {
     let checkpoint = load_numeric_full(path).map_err(|e| format!("загрузка {path}: {e}"))?;
     let n_inputs = checkpoint.in_norm.n_features();
@@ -364,6 +526,7 @@ fn load_model(path: &str) -> Result<Loaded, String> {
         n_inputs,
         n_outputs: checkpoint.num_outputs,
         diag: None, // у загруженной .bin нет данных обучения
+        calibration: checkpoint.calibration,
     })
 }
 
@@ -376,6 +539,7 @@ fn save_model(loaded: &Loaded, path: &str) -> Result<(), String> {
         &loaded.model,
         &loaded.in_norm,
         &loaded.out_norm,
+        loaded.calibration.as_ref(),
     )
     .map_err(|e| format!("сохранение {path}: {e}"))
 }
@@ -761,6 +925,7 @@ fn train_numeric(
 
     let _ = evt_tx.send(Event::TrainStarted {
         total_epochs: tcfg.epochs,
+        parameter_count: model.parameter_count(),
     });
     ctx.request_repaint();
 
@@ -791,6 +956,7 @@ fn train_numeric(
         metrics: Some(metrics),
     });
     ctx.request_repaint();
+    let calibration = Some(calibration_sample(&train.inputs, 256));
     Ok(Some(Loaded {
         model,
         nc: nc.clone(),
@@ -806,5 +972,89 @@ fn train_numeric(
             train,
             test,
         }),
+        calibration,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blackbox;
+    use crate::config::ModelConfig;
+    use crate::encoders::ValueEncoderConfig;
+    use crate::numeric_model::{KanConfig, ModelKind};
+
+    #[test]
+    fn samples_kan_edge_for_gui() {
+        let config = NumericConfig {
+            kind: ModelKind::Kan,
+            transformer: ModelConfig::default(),
+            value: ValueEncoderConfig::default(),
+            mlp_width: 16,
+            mlp_layers: 1,
+            kan: KanConfig {
+                width: 4,
+                layers: 2,
+                grid: 5,
+            },
+        };
+        let model = config.build(&[FeatureSpec::Continuous; 3], 2);
+        let points = sample_kan_edge(&model, 0, 1, 3, 7).unwrap();
+
+        assert_eq!(points.len(), 7);
+        assert_eq!(points[0].0, -3.0);
+        assert_eq!(points[6].0, 3.0);
+        assert!(points.iter().all(|(x, y)| x.is_finite() && y.is_finite()));
+        assert!(sample_kan_edge(&model, 0, 3, 0, 7).is_err());
+    }
+
+    #[test]
+    fn extracts_symbolic_formulas_in_raw_units_for_gui() {
+        let config = NumericConfig {
+            kind: ModelKind::Kan,
+            transformer: ModelConfig::default(),
+            value: ValueEncoderConfig::default(),
+            mlp_width: 16,
+            mlp_layers: 1,
+            kan: KanConfig {
+                width: 4,
+                layers: 1,
+                grid: 5,
+            },
+        };
+        let data = blackbox::sum().generate(64, 0);
+        let (train, test) = data.split(0.8, 1);
+        let in_specs = vec![FeatureSpec::Continuous; train.inputs.ncols()];
+        let in_norm = Normalizer::fit(&train.inputs, &in_specs);
+        let out_norm = Normalizer::fit(
+            &train.outputs,
+            &Normalizer::all_continuous(train.outputs.ncols()),
+        );
+        let loaded = Loaded {
+            model: config.build(&in_specs, train.outputs.ncols()),
+            nc: config.clone(),
+            in_specs: in_specs.clone(),
+            in_norm,
+            out_norm,
+            n_inputs: train.inputs.ncols(),
+            n_outputs: train.outputs.ncols(),
+            diag: Some(DiagData {
+                nc: config,
+                source: DataSource::Blackbox("sum".to_string()),
+                in_specs,
+                train,
+                test,
+            }),
+            calibration: None,
+        };
+
+        let result = extract_kan_symbolic(&loaded).expect("должны извлечься формулы");
+        assert!(result.formulas.starts_with("y0 = "));
+        let metrics = result
+            .formula_metrics
+            .expect("после обучения test-метрики есть");
+        assert!(metrics.r2.is_finite());
+        assert!(result.kan_r2.expect("R² KAN есть").is_finite());
+        assert!(result.weak_edges.iter().all(|edge| edge.r2 < 0.99));
+    }
 }

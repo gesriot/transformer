@@ -10,7 +10,7 @@ use crate::data::{Normalizer, NumericDataset};
 use crate::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
 use crate::init::set_init_seed;
 use crate::metrics::{evaluate, evaluate_per_output};
-use crate::numeric_model::{validate_numeric, ModelKind, NumericConfig};
+use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
 use crate::train::{predict_dataset, train_surrogate_cb, validate_train, LrSchedule, TrainConfig};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -27,6 +27,9 @@ pub struct SweepAxes {
     pub fourier_bands: usize,
     pub mlp_widths: Vec<usize>,
     pub mlp_layers: Vec<usize>,
+    pub kan_widths: Vec<usize>,
+    pub kan_layers: Vec<usize>,
+    pub kan_grids: Vec<usize>,
     pub schedules: Vec<LrSchedule>,
     /// Эпохи search-фазы (обучение каждого кандидата при ранжировании).
     pub epochs: usize,
@@ -49,6 +52,9 @@ impl Default for SweepAxes {
             fourier_bands: 6,
             mlp_widths: vec![128],
             mlp_layers: vec![3],
+            kan_widths: vec![16],
+            kan_layers: vec![2],
+            kan_grids: vec![8],
             schedules: vec![LrSchedule::Constant],
             epochs: 30,
             final_epochs: 30,
@@ -79,6 +85,7 @@ pub struct SweepChoice {
     pub value: ValueEncoderConfig,
     pub mlp_width: usize,
     pub mlp_layers: usize,
+    pub kan: KanConfig,
     pub lr: f32,
     pub schedule: LrSchedule,
     /// Эпохи, на которых кандидат обучался в search-фазе.
@@ -224,7 +231,40 @@ pub fn validate_axes(axes: &SweepAxes) -> Result<(), String> {
             return Err("mlp_layers должен быть >= 1".to_string());
         }
     }
+    if axes.kan_widths.is_empty() {
+        return Err("kan-widths: пустой список".to_string());
+    }
+    if axes.kan_layers.is_empty() {
+        return Err("kan-layers-list: пустой список".to_string());
+    }
+    if axes.kan_grids.is_empty() {
+        return Err("kan-grids: пустой список".to_string());
+    }
+    for &width in &axes.kan_widths {
+        if width == 0 {
+            return Err("kan_width должен быть > 0".to_string());
+        }
+    }
+    for &layers in &axes.kan_layers {
+        if layers == 0 {
+            return Err("kan_layers должен быть >= 1".to_string());
+        }
+    }
+    for &grid in &axes.kan_grids {
+        if grid < 2 {
+            return Err("kan_grid должен быть >= 2".to_string());
+        }
+    }
     Ok(())
+}
+
+/// KAN-конфиг из первых значений осей (для choices не-KAN кандидатов).
+fn default_kan(axes: &SweepAxes) -> KanConfig {
+    KanConfig {
+        width: axes.kan_widths[0],
+        layers: axes.kan_layers[0],
+        grid: axes.kan_grids[0],
+    }
 }
 
 fn build_candidates(axes: &SweepAxes) -> Result<Vec<Candidate>, String> {
@@ -261,6 +301,7 @@ fn build_candidates(axes: &SweepAxes) -> Result<Vec<Candidate>, String> {
                                         },
                                         mlp_width: axes.mlp_widths[0],
                                         mlp_layers: axes.mlp_layers[0],
+                                        kan: default_kan(axes),
                                     };
                                     validate_numeric(&nc)?;
                                     validate_train(lr, axes.batch_size)?;
@@ -291,6 +332,7 @@ fn build_candidates(axes: &SweepAxes) -> Result<Vec<Candidate>, String> {
                                             },
                                             mlp_width: axes.mlp_widths[0],
                                             mlp_layers: axes.mlp_layers[0],
+                                            kan: default_kan(axes),
                                             lr,
                                             schedule,
                                             epochs: axes.epochs,
@@ -330,6 +372,7 @@ fn build_candidates(axes: &SweepAxes) -> Result<Vec<Candidate>, String> {
                             },
                             mlp_width: width,
                             mlp_layers: layers,
+                            kan: default_kan(axes),
                         };
                         validate_numeric(&nc)?;
                         validate_train(lr, axes.batch_size)?;
@@ -355,6 +398,7 @@ fn build_candidates(axes: &SweepAxes) -> Result<Vec<Candidate>, String> {
                                 },
                                 mlp_width: width,
                                 mlp_layers: layers,
+                                kan: default_kan(axes),
                                 lr,
                                 schedule,
                                 epochs: axes.epochs,
@@ -363,6 +407,76 @@ fn build_candidates(axes: &SweepAxes) -> Result<Vec<Candidate>, String> {
                                 seed: axes.seeds[0],
                             },
                         });
+                    }
+                }
+            }
+        }
+    }
+    if axes.model_kinds.contains(&ModelKind::Kan) {
+        let transformer = ModelConfig {
+            d_model: axes.d_models[0],
+            n_heads: pick_heads(axes.d_models[0]),
+            n_enc_layers: axes.layers[0],
+            n_dec_layers: axes.layers[0],
+            d_ff: axes.d_ffs[0],
+            ln_eps: 1e-5,
+        };
+        for &width in &axes.kan_widths {
+            for &layers in &axes.kan_layers {
+                for &grid in &axes.kan_grids {
+                    for &lr in &axes.lrs {
+                        for &schedule in &axes.schedules {
+                            let kan = KanConfig {
+                                width,
+                                layers,
+                                grid,
+                            };
+                            let nc = NumericConfig {
+                                kind: ModelKind::Kan,
+                                transformer: transformer.clone(),
+                                value: ValueEncoderConfig {
+                                    kind: ValueEncoderKind::Linear,
+                                    fourier_bands: axes.fourier_bands,
+                                    fourier_scale: axes.fourier_scales[0],
+                                },
+                                mlp_width: axes.mlp_widths[0],
+                                mlp_layers: axes.mlp_layers[0],
+                                kan,
+                            };
+                            validate_numeric(&nc)?;
+                            validate_train(lr, axes.batch_size)?;
+                            let label = format!(
+                                "kan width={width} L={layers} grid={grid} lr={lr} s={}",
+                                schedule_label(schedule)
+                            );
+                            configs.push(Candidate {
+                                label,
+                                nc,
+                                schedule,
+                                lr,
+                                choice: SweepChoice {
+                                    kind: ModelKind::Kan,
+                                    d_model: transformer.d_model,
+                                    heads: transformer.n_heads,
+                                    layers: transformer.n_enc_layers,
+                                    d_ff: transformer.d_ff,
+                                    value: ValueEncoderConfig {
+                                        kind: ValueEncoderKind::Linear,
+                                        fourier_bands: axes.fourier_bands,
+                                        fourier_scale: axes.fourier_scales[0],
+                                    },
+                                    mlp_width: axes.mlp_widths[0],
+                                    mlp_layers: axes.mlp_layers[0],
+                                    kan,
+                                    lr,
+                                    schedule,
+                                    epochs: axes.epochs,
+                                    final_epochs: axes.final_epochs,
+                                    batch_size: axes.batch_size,
+                                    seed: axes.seeds[0],
+                                },
+                            });
+                        }
                     }
                 }
             }
@@ -679,12 +793,12 @@ mod tests {
     }
 
     #[test]
-    fn file_sweep_runs_mlp_and_transformer() {
+    fn file_sweep_runs_all_model_kinds() {
         let bb = blackbox::by_name("sum").unwrap();
         let data = bb.generate(96, 0);
         let specs = vec![FeatureSpec::Continuous; bb.n_inputs()];
         let axes = SweepAxes {
-            model_kinds: vec![ModelKind::Transformer, ModelKind::Mlp],
+            model_kinds: vec![ModelKind::Transformer, ModelKind::Mlp, ModelKind::Kan],
             epochs: 1,
             batch_size: 32,
             d_models: vec![16],
@@ -694,6 +808,9 @@ mod tests {
             value_encoders: vec![ValueEncoderKind::Linear],
             mlp_widths: vec![16],
             mlp_layers: vec![1],
+            kan_widths: vec![8],
+            kan_layers: vec![2],
+            kan_grids: vec![5],
             ..SweepAxes::default()
         };
         let cancel = AtomicBool::new(false);
@@ -706,8 +823,15 @@ mod tests {
             |_| {},
         )
         .unwrap();
-        assert_eq!(result.total_configs, 2);
-        assert_eq!(result.rows.len(), 2);
-        assert!(result.rows[0].worst_output_r2_mean.is_finite());
+        assert_eq!(result.total_configs, 3);
+        assert_eq!(result.rows.len(), 3);
+        assert!(result.rows.iter().all(|r| r.r2_mean.is_finite()));
+        let kan_row = result
+            .rows
+            .iter()
+            .find(|r| r.choice.kind == ModelKind::Kan)
+            .expect("kan-кандидат должен попасть в результаты");
+        assert_eq!(kan_row.choice.kan.width, 8);
+        assert_eq!(kan_row.choice.kan.grid, 5);
     }
 }

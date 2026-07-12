@@ -252,6 +252,7 @@ mod tests {
             value: crate::encoders::ValueEncoderConfig::default(),
             mlp_width: 32,
             mlp_layers: 2,
+            kan: Default::default(),
         };
         let subset = blackbox::sum().generate(32, 0);
         let specs = vec![FeatureSpec::Continuous; 2];

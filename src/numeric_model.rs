@@ -1,4 +1,4 @@
-//! Единый интерфейс численных моделей (roadmap шаг 3): трансформер или MLP.
+//! Единый интерфейс численных моделей: transformer, MLP или KAN.
 //!
 //! Один numeric-pipeline (данные/нормализация/обучение/метрики) работает с
 //! `NumericModel` через общие `predict`/`loss`/`parameters`; архитектура
@@ -6,6 +6,7 @@
 
 use crate::config::ModelConfig;
 use crate::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
+use crate::kan::KanNet;
 use crate::mlp::MlpBaseline;
 use crate::surrogate::SurrogateModel;
 use crate::tensor::Tensor;
@@ -44,12 +45,25 @@ pub fn validate_numeric(nc: &NumericConfig) -> Result<(), String> {
         if nc.mlp_layers < 1 {
             return Err("mlp_layers должен быть >= 1".to_string());
         }
-        if !matches!(nc.value.kind, ValueEncoderKind::Linear) {
-            return Err(
-                "value-encoder применим только к transformer (MLP берёт значения напрямую)"
-                    .to_string(),
-            );
+    }
+    if matches!(nc.kind, ModelKind::Kan) {
+        if nc.kan.width == 0 {
+            return Err("kan_width должен быть > 0".to_string());
         }
+        if nc.kan.layers < 1 {
+            return Err("kan_layers должен быть >= 1".to_string());
+        }
+        if nc.kan.grid < 2 {
+            return Err("kan_grid должен быть >= 2".to_string());
+        }
+    }
+    if !matches!(nc.kind, ModelKind::Transformer)
+        && !matches!(nc.value.kind, ValueEncoderKind::Linear)
+    {
+        return Err(
+            "value-encoder применим только к transformer (MLP/KAN берут значения напрямую)"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -58,6 +72,26 @@ pub fn validate_numeric(nc: &NumericConfig) -> Result<(), String> {
 pub enum ModelKind {
     Transformer,
     Mlp,
+    Kan,
+}
+
+/// Параметры KAN: ширина скрытых слоёв, число слоёв и размер сплайн-сетки
+/// (число интервалов на [-3, 3]; базисных функций на ребро — grid + 3).
+#[derive(Clone, Copy, Debug)]
+pub struct KanConfig {
+    pub width: usize,
+    pub layers: usize,
+    pub grid: usize,
+}
+
+impl Default for KanConfig {
+    fn default() -> Self {
+        Self {
+            width: 16,
+            layers: 2,
+            grid: 8,
+        }
+    }
 }
 
 /// Конфиг численной модели: общий выбор архитектуры + параметры обеих.
@@ -68,6 +102,7 @@ pub struct NumericConfig {
     pub value: ValueEncoderConfig,
     pub mlp_width: usize,
     pub mlp_layers: usize,
+    pub kan: KanConfig,
 }
 
 impl NumericConfig {
@@ -88,6 +123,13 @@ impl NumericConfig {
                 self.mlp_layers,
                 n_outputs,
             )),
+            ModelKind::Kan => NumericModel::Kan(KanNet::new(
+                specs.len(),
+                self.kan.width,
+                self.kan.layers,
+                self.kan.grid,
+                n_outputs,
+            )),
         }
     }
 }
@@ -95,6 +137,7 @@ impl NumericConfig {
 pub enum NumericModel {
     Transformer(Box<SurrogateModel>),
     Mlp(MlpBaseline),
+    Kan(KanNet),
 }
 
 impl NumericModel {
@@ -102,6 +145,7 @@ impl NumericModel {
         match self {
             NumericModel::Transformer(m) => m.predict(values),
             NumericModel::Mlp(m) => m.predict(values),
+            NumericModel::Kan(m) => m.predict(values),
         }
     }
 
@@ -109,6 +153,7 @@ impl NumericModel {
         match self {
             NumericModel::Transformer(m) => m.loss(values, targets),
             NumericModel::Mlp(m) => m.loss(values, targets),
+            NumericModel::Kan(m) => m.loss(values, targets),
         }
     }
 
@@ -116,6 +161,57 @@ impl NumericModel {
         match self {
             NumericModel::Transformer(m) => m.parameters(),
             NumericModel::Mlp(m) => m.parameters(),
+            NumericModel::Kan(m) => m.parameters(),
         }
+    }
+
+    /// Число обучаемых скалярных параметров модели.
+    pub fn parameter_count(&self) -> usize {
+        self.parameters().iter().map(|p| p.data().len()).sum()
+    }
+
+    /// Доступ к KAN-специфичному API (кривые функций рёбер) — `None` для
+    /// остальных архитектур.
+    pub fn as_kan(&self) -> Option<&KanNet> {
+        match self {
+            NumericModel::Kan(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Изменяемый доступ к KAN (структурное сжатие меняет топологию слоёв).
+    pub fn as_kan_mut(&mut self) -> Option<&mut KanNet> {
+        match self {
+            NumericModel::Kan(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Непараметрическое состояние KAN (hard-prune masks) для checkpoint-а.
+    pub(crate) fn kan_masks(&self) -> Option<Vec<Tensor>> {
+        self.as_kan().map(KanNet::masks)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kan_parameter_count_matches_formula() {
+        let cfg = NumericConfig {
+            kind: ModelKind::Kan,
+            transformer: ModelConfig::default(),
+            value: ValueEncoderConfig::default(),
+            mlp_width: 128,
+            mlp_layers: 3,
+            kan: KanConfig {
+                width: 16,
+                layers: 2,
+                grid: 8,
+            },
+        };
+        let model = cfg.build(&[FeatureSpec::Continuous; 3], 3);
+        assert_eq!(model.parameter_count(), 1_171);
     }
 }

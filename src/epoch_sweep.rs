@@ -207,6 +207,7 @@ mod tests {
             value: crate::encoders::ValueEncoderConfig::default(),
             mlp_width: 16,
             mlp_layers: 2,
+            kan: Default::default(),
         };
         let base = TrainConfig {
             epochs: 0,

@@ -295,13 +295,11 @@ fn to_2d(a: &ArrayD<f32>) -> Array2<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array;
-    use ndarray_rand::rand_distr::Uniform;
-    use ndarray_rand::RandomExt;
 
+    /// Через `init::rand_uniform`: тест с изломом (relu) сидируется через
+    /// `set_init_seed` — иначе конечная разность у нуля изредка флакает.
     fn rand_tensor(shape: &[usize]) -> Tensor {
-        let a = Array::random(IxDyn(shape), Uniform::new(-1.0, 1.0));
-        Tensor::new(a)
+        Tensor::new(crate::init::rand_uniform(shape, -1.0, 1.0))
     }
 
     /// Численная проверка: для скалярного выхода f(inputs) сравнивает
@@ -365,6 +363,9 @@ mod tests {
 
     #[test]
     fn check_relu_chain() {
+        // Детерминированные веса: конечная разность ломается, если выход
+        // matmul попадает в ±eps от излома ReLU.
+        crate::init::set_init_seed(5);
         let a = rand_tensor(&[4, 6]);
         let w = rand_tensor(&[6, 3]);
         grad_check(&[a, w], |t| t[0].matmul(&t[1]).relu().mean());

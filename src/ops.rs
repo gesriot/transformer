@@ -58,6 +58,26 @@ impl Tensor {
         Tensor::from_op(out, vec![self.clone()], backward)
     }
 
+    /// Поэлементный модуль (для L1-регуляризации). Субградиент в нуле = 0.
+    pub fn abs(&self) -> Tensor {
+        let a = self.data();
+        let out = a.mapv(f32::abs);
+        let sign = a.mapv(|x| {
+            if x > 0.0 {
+                1.0
+            } else if x < 0.0 {
+                -1.0
+            } else {
+                0.0
+            }
+        });
+        let lhs = self.clone();
+        let backward: BackwardFn = Box::new(move |g: &ArrayD<f32>| {
+            lhs.add_grad(&(g * &sign));
+        });
+        Tensor::from_op(out, vec![self.clone()], backward)
+    }
+
     /// Поэлементный синус (для Fourier-фич). d/dx sin = cos.
     pub fn sin(&self) -> Tensor {
         let a = self.data();
@@ -442,8 +462,20 @@ mod tests {
     #[test]
     fn check_sin_cos() {
         let x = rand_tensor(&[3, 4]);
-        grad_check(&[x.clone()], |t| t[0].sin().mean());
+        grad_check(std::slice::from_ref(&x), |t| t[0].sin().mean());
         grad_check(&[x], |t| t[0].cos().mean());
+    }
+
+    /// abs: градиент проверяем вдали от нуля (в нуле излом, субградиент 0).
+    #[test]
+    fn check_abs() {
+        let vals = ndarray::Array::from_shape_vec(
+            ndarray::IxDyn(&[2, 3]),
+            vec![0.7, -1.3, 2.1, -0.4, 0.9, -2.6],
+        )
+        .unwrap();
+        let x = Tensor::new(vals);
+        grad_check(std::slice::from_ref(&x), |t| t[0].abs().mean());
     }
 
     #[test]
