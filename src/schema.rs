@@ -304,12 +304,28 @@ impl ModelSchema {
 
     /// Схема без имён: `x0…xN → y0…yM`, все колонки числовые.
     ///
-    /// Нужна для данных, у которых имён нет и не было — встроенные чёрные
-    /// ящики и старые файлы/checkpoint-ы. Отдельная от `new` точка входа, чтобы
-    /// синтетические имена появлялись только там, где это осознанное решение.
+    /// Нужна для встроенных чёрных ящиков и других заведомо числовых данных.
+    /// Для старых TRNUM1/checkpoint-ов нужен [`Self::synthetic_from_specs`]:
+    /// они могут хранить категориальные `K:n`, даже если не хранят их подписи.
     pub fn synthetic(n_inputs: usize, n_outputs: usize) -> Result<Self, String> {
-        let inputs = (0..n_inputs)
-            .map(|i| Column::numeric(format!("x{i}"), ColumnRole::Input))
+        Self::synthetic_from_specs(&vec![FeatureSpec::Continuous; n_inputs], n_outputs)
+    }
+
+    /// Fallback-схема для старого формата, где есть типы и cardinality, но нет
+    /// имён и подписей уровней. Для категорий подписями становятся известные коды
+    /// `"0"..."n-1"`: это единственная информация, которую старый артефакт может восстановить.
+    pub fn synthetic_from_specs(specs: &[FeatureSpec], n_outputs: usize) -> Result<Self, String> {
+        let inputs = specs
+            .iter()
+            .enumerate()
+            .map(|(i, spec)| match *spec {
+                FeatureSpec::Continuous => Column::numeric(format!("x{i}"), ColumnRole::Input),
+                FeatureSpec::Categorical { cardinality } => Column::categorical(
+                    format!("x{i}"),
+                    ColumnRole::Input,
+                    (0..cardinality).map(|code| code.to_string()).collect(),
+                ),
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let outputs = (0..n_outputs)
             .map(|j| Column::numeric(format!("y{j}"), ColumnRole::Output))
@@ -387,6 +403,25 @@ mod tests {
         assert_eq!(s.feature_specs(), vec![FeatureSpec::Continuous; 3]);
         assert!(ModelSchema::synthetic(0, 1).is_err());
         assert!(ModelSchema::synthetic(1, 0).is_err());
+    }
+
+    #[test]
+    fn legacy_specs_keep_categorical_inputs() {
+        let specs = vec![
+            FeatureSpec::Continuous,
+            FeatureSpec::Categorical { cardinality: 3 },
+        ];
+        let schema = ModelSchema::synthetic_from_specs(&specs, 1).unwrap();
+
+        assert_eq!(schema.input_names(), vec!["x0", "x1"]);
+        assert_eq!(schema.output_names(), vec!["y0"]);
+        assert_eq!(schema.feature_specs(), specs);
+        assert_eq!(schema.inputs()[1].category_level(2).unwrap(), "2");
+        assert!(ModelSchema::synthetic_from_specs(
+            &[FeatureSpec::Categorical { cardinality: 0 }],
+            1
+        )
+        .is_err());
     }
 
     #[test]
