@@ -279,6 +279,12 @@ impl NumericInputEncoder {
         p
     }
 
+    /// Спецификации, с которыми построен кодировщик. Нужны сериализатору,
+    /// чтобы checkpoint не мог подписать модель несовместимой схемой.
+    pub(crate) fn specs(&self) -> &[FeatureSpec] {
+        &self.specs
+    }
+
     /// Параметры кодировщика значений (для проверок, что путь значения учится).
     pub fn value_parameters(&self) -> Vec<Tensor> {
         self.value_enc.parameters()

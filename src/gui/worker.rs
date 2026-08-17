@@ -18,6 +18,7 @@ use crate::generate::generate;
 use crate::init::set_init_seed;
 use crate::metrics::evaluate;
 use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
+use crate::schema::ModelSchema;
 use crate::serialize::{calibration_sample, load_numeric_full, save_numeric};
 use crate::split::{SplitPlan, DEFAULT_DATA_SEED};
 use crate::sweep::{self, SweepAxes, SweepObjective};
@@ -88,7 +89,9 @@ impl Drop for Worker {
 struct Loaded {
     model: NumericModel,
     nc: NumericConfig,
-    in_specs: Vec<FeatureSpec>,
+    /// Схема данных модели: имена, единицы, уровни категорий. `feature_specs`
+    /// выводятся из неё, поэтому отдельного списка спецификаций здесь нет.
+    schema: ModelSchema,
     in_norm: Normalizer,
     out_norm: Normalizer,
     n_inputs: usize,
@@ -520,15 +523,16 @@ fn extract_kan_symbolic(loaded: &Loaded) -> Result<KanSymbolicInfo, String> {
 
 fn load_model(path: &str) -> Result<Loaded, String> {
     let checkpoint = load_numeric_full(path).map_err(|e| format!("загрузка {path}: {e}"))?;
-    let n_inputs = checkpoint.in_norm.n_features();
+    let n_inputs = checkpoint.schema.n_inputs();
+    let n_outputs = checkpoint.schema.n_outputs();
     Ok(Loaded {
         model: checkpoint.model,
         nc: checkpoint.config,
-        in_specs: checkpoint.specs,
+        schema: checkpoint.schema,
         in_norm: checkpoint.in_norm,
         out_norm: checkpoint.out_norm,
         n_inputs,
-        n_outputs: checkpoint.num_outputs,
+        n_outputs,
         diag: None, // у загруженной .bin нет данных обучения
         calibration: checkpoint.calibration,
     })
@@ -538,8 +542,7 @@ fn save_model(loaded: &Loaded, path: &str) -> Result<(), String> {
     save_numeric(
         path,
         &loaded.nc,
-        &loaded.in_specs,
-        loaded.n_outputs,
+        &loaded.schema,
         &loaded.model,
         &loaded.in_norm,
         &loaded.out_norm,
@@ -905,21 +908,21 @@ fn train_numeric(
     validate_numeric(nc)?;
     validate_train(tcfg.lr, tcfg.batch_size)?;
 
-    let (data, in_specs) = match source {
+    let (data, schema) = match source {
         DataSource::Blackbox(name) => {
             let bb = blackbox::by_name(name)
                 .ok_or_else(|| format!("неизвестный чёрный ящик: {name}"))?;
-            let specs = vec![FeatureSpec::Continuous; bb.n_inputs()];
             // Seed обучения не должен менять саму выборку.
-            (bb.generate(2000, DEFAULT_DATA_SEED), specs)
+            (
+                bb.generate(2000, DEFAULT_DATA_SEED),
+                ModelSchema::synthetic(bb.n_inputs(), bb.n_outputs)?,
+            )
         }
         DataSource::File(path) => {
-            let (data, schema) =
-                read_numeric_tnum(path).map_err(|e| format!("чтение {path}: {e}"))?;
-            let specs = schema.feature_specs();
-            (data, specs)
+            read_numeric_tnum(path).map_err(|e| format!("чтение {path}: {e}"))?
         }
     };
+    let in_specs = schema.feature_specs();
     let n_inputs = data.inputs.ncols();
     let n_out = data.outputs.ncols();
     // Test откладывается и в GUI не открывается: единственный финальный замер
@@ -969,7 +972,7 @@ fn train_numeric(
     Ok(Some(Loaded {
         model,
         nc: nc.clone(),
-        in_specs: in_specs.clone(),
+        schema,
         in_norm,
         out_norm,
         n_inputs,
@@ -1039,7 +1042,7 @@ mod tests {
         let loaded = Loaded {
             model: config.build(&in_specs, train.outputs.ncols()),
             nc: config.clone(),
-            in_specs: in_specs.clone(),
+            schema: ModelSchema::synthetic(train.inputs.ncols(), train.outputs.ncols()).unwrap(),
             in_norm,
             out_norm,
             n_inputs: train.inputs.ncols(),

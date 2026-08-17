@@ -13,6 +13,7 @@ use crate::config::ModelConfig;
 use crate::data::{Normalizer, Vocab};
 use crate::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
 use crate::numeric_model::{KanConfig, ModelKind, NumericConfig, NumericModel};
+use crate::schema::{Column, ColumnRole, ColumnType, ModelSchema};
 use crate::tensor::Tensor;
 use crate::textmodel::TextModel;
 use ndarray::{Array2, ArrayD, Ix2, IxDyn};
@@ -49,6 +50,7 @@ const SURROGATE_SECTIONS: &[&str] = &[
     "config",
     "meta",
     "feature_specs",
+    "schema",
     "params",
     "kan_masks",
     "kan_dims",
@@ -64,8 +66,9 @@ pub struct NumericCheckpoint {
     pub in_norm: Normalizer,
     pub out_norm: Normalizer,
     pub config: NumericConfig,
-    pub specs: Vec<FeatureSpec>,
-    pub num_outputs: usize,
+    /// Схема данных. У старых checkpoint-ов достраивается синтетически из
+    /// сохранённых `feature_specs`, поэтому поле есть всегда.
+    pub schema: ModelSchema,
     /// Выборка СЫРЫХ train-входов — калибровка для symbolic extraction
     /// после загрузки. `None` у старых checkpoint-ов.
     pub calibration: Option<Array2<f32>>,
@@ -272,12 +275,24 @@ fn build_params(params: &[Tensor]) -> io::Result<Vec<u8>> {
 }
 fn load_params(bytes: &[u8], params: &[Tensor]) -> io::Result<()> {
     let mut cur = bytes;
-    let n = r_u64(&mut cur)? as usize;
+    let n = usize::try_from(r_u64(&mut cur)?)
+        .map_err(|_| invalid("число параметров не помещается в usize"))?;
     if n != params.len() {
         return Err(invalid("число параметров не совпадает с архитектурой"));
     }
-    for p in params {
-        p.set_data(r_tensor(&mut cur)?);
+    for (i, p) in params.iter().enumerate() {
+        let loaded = r_tensor(&mut cur)?;
+        if p.shape() != loaded.shape() {
+            return Err(invalid(format!(
+                "параметр {i}: форма {:?} не совпадает с ожидаемой {:?}",
+                loaded.shape(),
+                p.shape()
+            )));
+        }
+        p.set_data(loaded);
+    }
+    if !cur.is_empty() {
+        return Err(invalid("лишние байты в секции параметров"));
     }
     Ok(())
 }
@@ -300,18 +315,135 @@ fn build_specs(specs: &[FeatureSpec]) -> Vec<u8> {
 }
 fn read_specs(bytes: &[u8]) -> io::Result<Vec<FeatureSpec>> {
     let mut r = bytes;
-    let n = r_u64(&mut r)? as usize;
+    let n = usize::try_from(r_u64(&mut r)?)
+        .map_err(|_| invalid("число спецификаций не помещается в usize"))?;
+    // Даже continuous занимает четыре байта. Проверяем внешний count до
+    // Vec::with_capacity, иначе испорченная дублирующая секция обходила бы
+    // защиту новой schema.
+    if n > r.len() / 4 {
+        return Err(invalid(
+            "число спецификаций не согласовано с размером секции",
+        ));
+    }
     let mut specs = Vec::with_capacity(n);
     for _ in 0..n {
         specs.push(match r_u32(&mut r)? {
             0 => FeatureSpec::Continuous,
-            1 => FeatureSpec::Categorical {
-                cardinality: r_u64(&mut r)? as usize,
-            },
+            1 => {
+                let cardinality = usize::try_from(r_u64(&mut r)?)
+                    .map_err(|_| invalid("cardinality не помещается в usize"))?;
+                if cardinality == 0 {
+                    return Err(invalid("cardinality должна быть > 0"));
+                }
+                FeatureSpec::Categorical { cardinality }
+            }
             _ => return Err(invalid("неизвестный тип признака")),
         });
     }
+    if !r.is_empty() {
+        return Err(invalid("лишние байты в секции feature_specs"));
+    }
     Ok(specs)
+}
+
+/// Строка в секции: длина + UTF-8. Длина проверяется по остатку среза ДО
+/// выделения памяти, иначе испорченный файл заказал бы гигабайты.
+fn w_string(buf: &mut Vec<u8>, s: &str) {
+    buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+    buf.extend_from_slice(s.as_bytes());
+}
+
+fn r_string(r: &mut &[u8], what: &str) -> io::Result<String> {
+    let len = usize::try_from(r_u64(r)?)
+        .map_err(|_| invalid(format!("{what}: длина не помещается в usize")))?;
+    if len > r.len() {
+        return Err(invalid(format!(
+            "{what}: длина {len} больше остатка секции"
+        )));
+    }
+    let (head, tail) = r.split_at(len);
+    *r = tail;
+    String::from_utf8(head.to_vec()).map_err(|_| invalid(format!("{what}: не UTF-8")))
+}
+
+/// Секция `schema`: имена, единицы и подписи уровней. Пишется ДОПОЛНИТЕЛЬНО к
+/// `feature_specs`, а не вместо неё, — тогда версия формата не меняется и
+/// старый бинарь читает новый checkpoint, просто игнорируя незнакомую секцию.
+fn build_schema(schema: &ModelSchema) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(&(schema.n_inputs() as u64).to_le_bytes());
+    p.extend_from_slice(&(schema.n_outputs() as u64).to_le_bytes());
+    for column in schema.inputs().iter().chain(schema.outputs().iter()) {
+        w_string(&mut p, column.name());
+        w_string(&mut p, column.unit().unwrap_or(""));
+        match column.ty() {
+            ColumnType::Numeric => p.extend_from_slice(&0u32.to_le_bytes()),
+            ColumnType::Categorical { levels } => {
+                p.extend_from_slice(&1u32.to_le_bytes());
+                p.extend_from_slice(&(levels.len() as u64).to_le_bytes());
+                for level in levels {
+                    w_string(&mut p, level);
+                }
+            }
+        }
+    }
+    p
+}
+
+fn read_schema(bytes: &[u8]) -> io::Result<ModelSchema> {
+    let mut r = bytes;
+    let n_inputs = usize::try_from(r_u64(&mut r)?)
+        .map_err(|_| invalid("schema: число входов не помещается в usize"))?;
+    let n_outputs = usize::try_from(r_u64(&mut r)?)
+        .map_err(|_| invalid("schema: число выходов не помещается в usize"))?;
+    let n_columns = n_inputs
+        .checked_add(n_outputs)
+        .ok_or_else(|| invalid("schema: суммарное число колонок не помещается в usize"))?;
+    // Каждая колонка занимает минимум 20 байт (две длины строк + тип), поэтому
+    // заведомо невозможные размеры отсекаются до аллокаций.
+    if n_columns > r.len() / 20 {
+        return Err(invalid(
+            "schema: число колонок не согласовано с размером секции",
+        ));
+    }
+
+    let mut columns = Vec::with_capacity(n_columns);
+    for i in 0..n_columns {
+        let role = if i < n_inputs {
+            ColumnRole::Input
+        } else {
+            ColumnRole::Output
+        };
+        let name = r_string(&mut r, "schema: имя колонки")?;
+        let unit = r_string(&mut r, "schema: единица измерения")?;
+        let column = match r_u32(&mut r)? {
+            0 => Column::numeric(name, role),
+            1 => {
+                let count = usize::try_from(r_u64(&mut r)?)
+                    .map_err(|_| invalid("schema: число уровней не помещается в usize"))?;
+                if count > r.len() / 8 {
+                    return Err(invalid("schema: число уровней больше остатка секции"));
+                }
+                let levels = (0..count)
+                    .map(|_| r_string(&mut r, "schema: подпись уровня"))
+                    .collect::<io::Result<Vec<_>>>()?;
+                Column::categorical(name, role, levels)
+            }
+            _ => return Err(invalid("schema: неизвестный тип колонки")),
+        }
+        .map_err(invalid)?;
+        columns.push(if unit.is_empty() {
+            column
+        } else {
+            column.with_unit(unit)
+        });
+    }
+    if !r.is_empty() {
+        return Err(invalid("schema: лишние байты в секции"));
+    }
+
+    let outputs = columns.split_off(n_inputs);
+    ModelSchema::new(columns, outputs).map_err(invalid)
 }
 
 fn build_norm(n: &Normalizer) -> Vec<u8> {
@@ -327,18 +459,24 @@ fn build_norm(n: &Normalizer) -> Vec<u8> {
 }
 fn read_norm(bytes: &[u8]) -> io::Result<Normalizer> {
     let mut r = bytes;
-    let read_vec = |r: &mut &[u8]| -> io::Result<Vec<f32>> {
-        let len = r_u64(r)? as usize;
+    let read_vec = |r: &mut &[u8], what: &str| -> io::Result<Vec<f32>> {
+        let len = usize::try_from(r_u64(r)?)
+            .map_err(|_| invalid(format!("{what}: длина не помещается в usize")))?;
+        if len > r.len() / std::mem::size_of::<f32>() {
+            return Err(invalid(format!(
+                "{what}: длина не согласована с размером секции"
+            )));
+        }
         let mut v = Vec::with_capacity(len);
         for _ in 0..len {
             v.push(r_f32(r)?);
         }
         Ok(v)
     };
-    let mean = read_vec(&mut r)?;
-    let std = read_vec(&mut r)?;
-    let min = read_vec(&mut r)?;
-    let max = read_vec(&mut r)?;
+    let mean = read_vec(&mut r, "normalizer mean")?;
+    let std = read_vec(&mut r, "normalizer std")?;
+    let min = read_vec(&mut r, "normalizer min")?;
+    let max = read_vec(&mut r, "normalizer max")?;
     let specs = read_specs(r)?;
     Ok(Normalizer {
         mean,
@@ -497,26 +635,108 @@ fn write_file(path: &str, kind: u32, sections: &[(&str, Vec<u8>)]) -> io::Result
     w.flush()
 }
 
+fn validate_normalizer(
+    normalizer: &Normalizer,
+    expected_specs: &[FeatureSpec],
+    name: &str,
+) -> io::Result<()> {
+    let n = expected_specs.len();
+    if normalizer.mean.len() != n
+        || normalizer.std.len() != n
+        || normalizer.min.len() != n
+        || normalizer.max.len() != n
+    {
+        return Err(invalid(format!(
+            "{name}: размер статистик не совпадает со схемой ({n} колонок)"
+        )));
+    }
+    if normalizer.specs != expected_specs {
+        return Err(invalid(format!(
+            "{name}: типы колонок не совпадают со схемой"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_output_normalizer(normalizer: &Normalizer, expected_outputs: usize) -> io::Result<()> {
+    if normalizer.mean.len() != expected_outputs
+        || normalizer.std.len() != expected_outputs
+        || normalizer.min.len() != expected_outputs
+        || normalizer.max.len() != expected_outputs
+        || normalizer.specs.len() != expected_outputs
+    {
+        return Err(invalid(format!(
+            "out_norm: размер статистик не совпадает со схемой ({expected_outputs} колонок)"
+        )));
+    }
+    if normalizer
+        .specs
+        .iter()
+        .any(|spec| !matches!(spec, FeatureSpec::Continuous))
+    {
+        return Err(invalid("out_norm: выходы регрессии должны быть числовыми"));
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_components(
+    nc: &NumericConfig,
+    schema: &ModelSchema,
+    model: &NumericModel,
+    in_norm: &Normalizer,
+    out_norm: &Normalizer,
+) -> io::Result<Vec<FeatureSpec>> {
+    if model.kind() != nc.kind {
+        return Err(invalid("тип модели не совпадает с NumericConfig"));
+    }
+    let expected_dims = (schema.n_inputs(), schema.n_outputs());
+    if model.interface_dims() != expected_dims {
+        return Err(invalid(format!(
+            "интерфейс модели {:?} не совпадает со схемой {:?}",
+            model.interface_dims(),
+            expected_dims
+        )));
+    }
+
+    let specs = schema.feature_specs();
+    if let NumericModel::Transformer(transformer) = model {
+        if transformer.input_specs() != specs {
+            return Err(invalid(
+                "типы входов transformer-модели не совпадают со схемой",
+            ));
+        }
+    }
+    validate_normalizer(in_norm, &specs, "in_norm")?;
+    validate_output_normalizer(out_norm, schema.n_outputs())?;
+    Ok(specs)
+}
+
 // --- публичный API ---
 
 /// Сохраняет численную модель (transformer, MLP или KAN): конфиг с `model_kind`,
-/// спецификация признаков, число выходов, параметры и нормализаторы — каждая
-/// часть отдельной секцией.
-#[allow(clippy::too_many_arguments)]
+/// схема данных, параметры и нормализаторы — каждая часть отдельной секцией.
+///
+/// Схема заменила пару «спецификации + число выходов» в сигнатуре: и то и
+/// другое из неё выводится, а рассогласовать их больше нельзя.
 pub fn save_numeric(
     path: &str,
     nc: &NumericConfig,
-    specs: &[FeatureSpec],
-    num_outputs: usize,
+    schema: &ModelSchema,
     model: &NumericModel,
     in_norm: &Normalizer,
     out_norm: &Normalizer,
     calibration: Option<&Array2<f32>>,
 ) -> io::Result<()> {
+    let specs = validate_checkpoint_components(nc, schema, model, in_norm, out_norm)?;
+    let num_outputs = schema.n_outputs();
+    let specs = specs.as_slice();
     let mut sections = vec![
         ("config", build_numeric_config(nc)),
         ("meta", build_meta_surrogate(num_outputs)),
         ("feature_specs", build_specs(specs)),
+        // Имена/единицы/уровни едут отдельной секцией: старый бинарь её
+        // пропустит и прочитает checkpoint как раньше.
+        ("schema", build_schema(schema)),
         ("params", build_params(&model.parameters())?),
         ("in_norm", build_norm(in_norm)),
         ("out_norm", build_norm(out_norm)),
@@ -570,9 +790,38 @@ pub fn load_numeric_full(path: &str) -> io::Result<NumericCheckpoint> {
     let secs = read_sections(&mut r, SURROGATE_SECTIONS)?;
 
     let nc = read_numeric_config(section(&secs, "config")?)?;
-    let num_outputs = field_u64(&parse_tlv(section(&secs, "meta")?)?, TAG_NUM_OUTPUTS)
-        .ok_or_else(|| invalid("meta: нет num_outputs"))? as usize;
+    let num_outputs = usize::try_from(
+        field_u64(&parse_tlv(section(&secs, "meta")?)?, TAG_NUM_OUTPUTS)
+            .ok_or_else(|| invalid("meta: нет num_outputs"))?,
+    )
+    .map_err(|_| invalid("meta: num_outputs не помещается в usize"))?;
     let specs = read_specs(section(&secs, "feature_specs")?)?;
+    let in_norm = read_norm(section(&secs, "in_norm")?)?;
+    let out_norm = read_norm(section(&secs, "out_norm")?)?;
+    validate_normalizer(&in_norm, &specs, "in_norm")?;
+    // Эта проверка идёт до synthetic fallback и тем самым ограничивает
+    // num_outputs реальным размером уже прочитанной секции нормализатора.
+    validate_output_normalizer(&out_norm, num_outputs)?;
+
+    // Схема: из секции у новых файлов, синтетическая — у старых. Категориальные
+    // типы при этом сохраняются, подписями становятся сами коды.
+    let schema = match secs.get("schema") {
+        Some(bytes) => {
+            let schema = read_schema(bytes)?;
+            // Две секции описывают одно и то же; расхождение означает битый
+            // файл, а не повод выбрать одну из версий.
+            if schema.feature_specs() != specs {
+                return Err(invalid(
+                    "schema и feature_specs описывают разные типы входов",
+                ));
+            }
+            schema
+        }
+        None => ModelSchema::synthetic_from_specs(&specs, num_outputs).map_err(invalid)?,
+    };
+    schema
+        .check_dims(specs.len(), num_outputs)
+        .map_err(invalid)?;
 
     // Структурно сжатая KAN имеет неоднородные слои: их размеры лежат в
     // секции kan_dims; без неё (legacy) строим по конфигу.
@@ -593,8 +842,6 @@ pub fn load_numeric_full(path: &str) -> io::Result<NumericCheckpoint> {
             .ok_or_else(|| invalid("kan_masks есть у не-KAN checkpoint-а"))?;
         load_params(bytes, &masks)?;
     }
-    let in_norm = read_norm(section(&secs, "in_norm")?)?;
-    let out_norm = read_norm(section(&secs, "out_norm")?)?;
     let calibration = if nc.kind == ModelKind::Kan {
         match secs.get("calibration") {
             Some(bytes) => {
@@ -618,8 +865,7 @@ pub fn load_numeric_full(path: &str) -> io::Result<NumericCheckpoint> {
         in_norm,
         out_norm,
         config: nc,
-        specs,
-        num_outputs,
+        schema,
         calibration,
     })
 }
@@ -697,6 +943,7 @@ mod tests {
     fn round_trip_for(kind: ModelKind, name: &str) {
         let nc = numeric_cfg(kind);
         let specs = vec![FeatureSpec::Continuous, FeatureSpec::Continuous];
+        let schema = ModelSchema::synthetic_from_specs(&specs, 1).unwrap();
         let model = nc.build(&specs, 1);
 
         let data = blackbox::sum().generate(8, 0);
@@ -711,7 +958,7 @@ mod tests {
         let before = model.predict(&x).data();
 
         let path = tmp_path(name);
-        save_numeric(&path, &nc, &specs, 1, &model, &in_norm, &out_norm, None).unwrap();
+        save_numeric(&path, &nc, &schema, &model, &in_norm, &out_norm, None).unwrap();
         let (loaded, _in2, _out2) = load_numeric(&path).unwrap();
         let after = loaded.predict(&x).data();
         let full = load_numeric_full(&path).unwrap();
@@ -721,8 +968,9 @@ mod tests {
             "{kind:?}: предсказания после загрузки разошлись"
         );
         assert_eq!(full.config.kind, kind);
-        assert_eq!(full.specs, specs);
-        assert_eq!(full.num_outputs, 1);
+        assert_eq!(full.schema, schema);
+        assert_eq!(full.schema.feature_specs(), specs);
+        assert_eq!(full.schema.n_outputs(), 1);
         assert_eq!(full.in_norm.n_features(), 2);
         assert_eq!(full.out_norm.n_features(), 1);
         std::fs::remove_file(&path).ok();
@@ -779,8 +1027,7 @@ mod tests {
         save_numeric(
             &path,
             &nc,
-            &specs,
-            1,
+            &ModelSchema::synthetic_from_specs(&specs, 1).unwrap(),
             &model,
             &in_norm,
             &out_norm,
@@ -789,6 +1036,243 @@ mod tests {
         .unwrap();
         assert!(load_numeric_full(&path).unwrap().calibration.is_none());
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Схема с именами, единицами и уровнями переживает round-trip, а секция
+    /// `feature_specs` остаётся на месте для старых читателей.
+    #[test]
+    fn schema_round_trip_keeps_names_units_and_levels() {
+        let nc = numeric_cfg(ModelKind::Mlp);
+        let schema = ModelSchema::new(
+            vec![
+                Column::numeric("температура", ColumnRole::Input)
+                    .unwrap()
+                    .with_unit("°C"),
+                Column::categorical(
+                    "материал",
+                    ColumnRole::Input,
+                    vec!["песок".into(), "глина".into(), "торф".into()],
+                )
+                .unwrap(),
+            ],
+            vec![Column::numeric("влажность", ColumnRole::Output)
+                .unwrap()
+                .with_unit("%")],
+        )
+        .unwrap();
+        let specs = schema.feature_specs();
+        let model = nc.build(&specs, 1);
+        let data = blackbox::sum().generate(8, 0);
+        let in_norm = Normalizer::fit(&data.inputs, &specs);
+        let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
+
+        let path = tmp_path("surr_schema.bin");
+        save_numeric(&path, &nc, &schema, &model, &in_norm, &out_norm, None).unwrap();
+
+        // Симуляция старого reader-а: в списке известных секций schema нет,
+        // но все прежние обязательные секции остаются читаемыми.
+        let mut legacy_reader = BufReader::new(File::open(&path).unwrap());
+        r_header(&mut legacy_reader, KIND_SURROGATE).unwrap();
+        let legacy_sections = read_sections(
+            &mut legacy_reader,
+            &[
+                "config",
+                "meta",
+                "feature_specs",
+                "params",
+                "in_norm",
+                "out_norm",
+            ],
+        )
+        .unwrap();
+        assert!(!legacy_sections.contains_key("schema"));
+        assert_eq!(
+            read_specs(section(&legacy_sections, "feature_specs").unwrap()).unwrap(),
+            specs
+        );
+
+        let checkpoint = load_numeric_full(&path).unwrap();
+        assert_eq!(checkpoint.schema, schema);
+        assert_eq!(checkpoint.schema.inputs()[0].unit(), Some("°C"));
+        assert_eq!(
+            checkpoint.schema.inputs()[1].category_level(2).unwrap(),
+            "торф"
+        );
+        assert_eq!(checkpoint.schema.n_outputs(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Checkpoint без секции `schema` (старый файл) читается и получает
+    /// синтетическую схему — с сохранением категориального типа.
+    #[test]
+    fn legacy_checkpoint_without_schema_gets_synthetic_one() {
+        let nc = numeric_cfg(ModelKind::Mlp);
+        let specs = vec![
+            FeatureSpec::Continuous,
+            FeatureSpec::Categorical { cardinality: 3 },
+        ];
+        let model = nc.build(&specs, 1);
+        let data = blackbox::sum().generate(8, 0);
+        let in_norm = Normalizer::fit(&data.inputs, &specs);
+        let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
+
+        // Пишем те же секции, что и старая версия: без `schema`.
+        let path = tmp_path("surr_legacy_schema.bin");
+        let sections = vec![
+            ("config", build_numeric_config(&nc)),
+            ("meta", build_meta_surrogate(1)),
+            ("feature_specs", build_specs(&specs)),
+            ("params", build_params(&model.parameters()).unwrap()),
+            ("in_norm", build_norm(&in_norm)),
+            ("out_norm", build_norm(&out_norm)),
+        ];
+        write_file(&path, KIND_SURROGATE, &sections).unwrap();
+
+        let checkpoint = load_numeric_full(&path).unwrap();
+        assert_eq!(checkpoint.schema.input_names(), vec!["x0", "x1"]);
+        assert_eq!(checkpoint.schema.output_names(), vec!["y0"]);
+        assert_eq!(checkpoint.schema.feature_specs(), specs);
+        assert_eq!(
+            checkpoint.schema.inputs()[1].category_level(1).unwrap(),
+            "1"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Секции `schema` и `feature_specs` описывают одно и то же; расхождение —
+    /// битый файл, а не повод выбрать одну из версий.
+    #[test]
+    fn inconsistent_schema_and_specs_are_rejected() {
+        let nc = numeric_cfg(ModelKind::Mlp);
+        let specs = vec![FeatureSpec::Continuous, FeatureSpec::Continuous];
+        let model = nc.build(&specs, 1);
+        let data = blackbox::sum().generate(8, 0);
+        let in_norm = Normalizer::fit(&data.inputs, &specs);
+        let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
+
+        // В схеме второй вход категориальный, в feature_specs — числовой.
+        let mismatched = ModelSchema::synthetic_from_specs(
+            &[
+                FeatureSpec::Continuous,
+                FeatureSpec::Categorical { cardinality: 4 },
+            ],
+            1,
+        )
+        .unwrap();
+        let path = tmp_path("surr_schema_mismatch.bin");
+        let sections = vec![
+            ("config", build_numeric_config(&nc)),
+            ("meta", build_meta_surrogate(1)),
+            ("feature_specs", build_specs(&specs)),
+            ("schema", build_schema(&mismatched)),
+            ("params", build_params(&model.parameters()).unwrap()),
+            ("in_norm", build_norm(&in_norm)),
+            ("out_norm", build_norm(&out_norm)),
+        ];
+        write_file(&path, KIND_SURROGATE, &sections).unwrap();
+        assert!(load_numeric_full(&path).is_err());
+
+        // Схема на другое число выходов, чем meta.
+        let wrong_outputs = ModelSchema::synthetic_from_specs(&specs, 3).unwrap();
+        let sections = vec![
+            ("config", build_numeric_config(&nc)),
+            ("meta", build_meta_surrogate(1)),
+            ("feature_specs", build_specs(&specs)),
+            ("schema", build_schema(&wrong_outputs)),
+            ("params", build_params(&model.parameters()).unwrap()),
+            ("in_norm", build_norm(&in_norm)),
+            ("out_norm", build_norm(&out_norm)),
+        ];
+        write_file(&path, KIND_SURROGATE, &sections).unwrap();
+        assert!(load_numeric_full(&path).is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Испорченная секция не должна приводить к гигантским аллокациям.
+    #[test]
+    fn corrupt_schema_section_is_rejected() {
+        // Заявлено 2 входа и 1 выход, но байтов на них нет.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        assert!(read_schema(&bytes).is_err());
+
+        // Длина имени больше остатка секции.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 64]);
+        assert!(read_schema(&bytes).is_err());
+    }
+
+    #[test]
+    fn corrupt_metadata_counts_are_rejected_before_allocation_or_build() {
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(read_specs(&oversized).is_err());
+
+        let mut zero_cardinality = Vec::new();
+        zero_cardinality.extend_from_slice(&1u64.to_le_bytes());
+        zero_cardinality.extend_from_slice(&1u32.to_le_bytes());
+        zero_cardinality.extend_from_slice(&0u64.to_le_bytes());
+        assert!(read_specs(&zero_cardinality).is_err());
+
+        let mut trailing = build_specs(&[FeatureSpec::Continuous]);
+        trailing.push(0);
+        assert!(read_specs(&trailing).is_err());
+
+        let mut oversized_norm = Vec::new();
+        oversized_norm.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(read_norm(&oversized_norm).is_err());
+    }
+
+    #[test]
+    fn save_rejects_components_inconsistent_with_schema() {
+        let nc = numeric_cfg(ModelKind::Mlp);
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let specs = schema.feature_specs();
+        let model = nc.build(&specs, 1);
+        let data = blackbox::sum().generate(8, 0);
+        let in_norm = Normalizer::fit(&data.inputs, &specs);
+        let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
+        let path = tmp_path("surr_inconsistent_save.bin");
+        std::fs::remove_file(&path).ok();
+
+        let wrong_dims = ModelSchema::synthetic(3, 1).unwrap();
+        assert!(
+            save_numeric(&path, &nc, &wrong_dims, &model, &in_norm, &out_norm, None)
+                .unwrap_err()
+                .to_string()
+                .contains("интерфейс модели")
+        );
+
+        let wrong_kind = numeric_cfg(ModelKind::Kan);
+        assert!(save_numeric(
+            &path,
+            &wrong_kind,
+            &schema,
+            &model,
+            &in_norm,
+            &out_norm,
+            None
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("тип модели"));
+
+        let categorical_specs = vec![
+            FeatureSpec::Continuous,
+            FeatureSpec::Categorical { cardinality: 3 },
+        ];
+        let wrong_norm = Normalizer::fit(&data.inputs, &categorical_specs);
+        assert!(
+            save_numeric(&path, &nc, &schema, &model, &wrong_norm, &out_norm, None)
+                .unwrap_err()
+                .to_string()
+                .contains("in_norm")
+        );
+        assert!(!std::path::Path::new(&path).exists());
     }
 
     /// Структурно сжатая KAN (неоднородные слои) восстанавливается по секции
@@ -826,8 +1310,7 @@ mod tests {
         save_numeric(
             &path,
             &nc,
-            &specs,
-            1,
+            &ModelSchema::synthetic_from_specs(&specs, 1).unwrap(),
             &model,
             &in_norm,
             &out_norm,
@@ -860,7 +1343,16 @@ mod tests {
         assert!(pruned.0 < before.0, "тест должен реально что-то отсечь");
 
         let path = tmp_path("surr_pruned_kan.bin");
-        save_numeric(&path, &nc, &specs, 1, &model, &in_norm, &out_norm, None).unwrap();
+        save_numeric(
+            &path,
+            &nc,
+            &ModelSchema::synthetic_from_specs(&specs, 1).unwrap(),
+            &model,
+            &in_norm,
+            &out_norm,
+            None,
+        )
+        .unwrap();
         let checkpoint = load_numeric_full(&path).unwrap();
         let loaded_kan = checkpoint.model.as_kan().unwrap();
         assert_eq!(loaded_kan.active_edges(), pruned);

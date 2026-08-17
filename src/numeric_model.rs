@@ -141,6 +141,26 @@ pub enum NumericModel {
 }
 
 impl NumericModel {
+    pub fn kind(&self) -> ModelKind {
+        match self {
+            NumericModel::Transformer(_) => ModelKind::Transformer,
+            NumericModel::Mlp(_) => ModelKind::Mlp,
+            NumericModel::Kan(_) => ModelKind::Kan,
+        }
+    }
+
+    /// Размеры внешнего интерфейса модели независимо от её архитектуры.
+    pub fn interface_dims(&self) -> (usize, usize) {
+        match self {
+            NumericModel::Transformer(m) => m.interface_dims(),
+            NumericModel::Mlp(m) => m.interface_dims(),
+            NumericModel::Kan(m) => {
+                let dims = m.layer_dims();
+                (dims[0].0, dims.last().unwrap().1)
+            }
+        }
+    }
+
     pub fn predict(&self, values: &Tensor) -> Tensor {
         match self {
             NumericModel::Transformer(m) => m.predict(values),

@@ -28,6 +28,7 @@ use transformer::metrics::{evaluate, evaluate_per_output, Metrics};
 use transformer::numeric_model::{
     validate_numeric, KanConfig, ModelKind, NumericConfig, NumericModel,
 };
+use transformer::schema::ModelSchema;
 use transformer::serialize::{calibration_sample, load_numeric, save_numeric};
 use transformer::split::{
     SplitPlan, DEFAULT_DATA_SEED, DEFAULT_FINAL_INIT_SEED, DEFAULT_SPLIT_SEED,
@@ -615,14 +616,15 @@ fn build_and_train(
 fn run_numeric_flow(
     f: &Flags,
     data: NumericDataset,
-    in_specs: Vec<FeatureSpec>,
+    schema: ModelSchema,
     bb: Option<&blackbox::BlackBox>,
 ) {
+    let in_specs = schema.feature_specs();
     let epochs = resolve_epochs(f);
     let save_path = f.get("model").or_else(|| f.pos(2));
     let nc = numeric_config_from(f).unwrap_or_else(|e| fail(&e));
     let tcfg = train_config_from(f, epochs).unwrap_or_else(|e| fail(&e));
-    let n_outputs = data.outputs.ncols();
+    let n_outputs = schema.n_outputs();
 
     let plan = SplitPlan::default();
     let prepared = plan.prepare(&data).unwrap_or_else(|e| fail(&e));
@@ -738,8 +740,7 @@ fn run_numeric_flow(
         save_and_verify(
             path,
             &nc,
-            &in_specs,
-            n_outputs,
+            &schema,
             &model,
             &fin_in_norm,
             &fin_out_norm,
@@ -771,8 +772,9 @@ fn run_numeric(args: &[String]) {
     // Данные генерируются фиксированным data_seed: --seed меняет только
     // инициализацию модели и порядок батчей.
     let data = bb.generate(2000, DEFAULT_DATA_SEED);
-    let in_specs = vec![FeatureSpec::Continuous; bb.n_inputs()];
-    run_numeric_flow(&f, data, in_specs, Some(&bb));
+    // У встроенного ящика имён нет — схема синтетическая и это осознанно.
+    let schema = ModelSchema::synthetic(bb.n_inputs(), bb.n_outputs).unwrap_or_else(|e| fail(&e));
+    run_numeric_flow(&f, data, schema, Some(&bb));
 }
 
 fn run_numeric_file(args: &[String]) {
@@ -793,22 +795,19 @@ fn run_numeric_file(args: &[String]) {
             std::process::exit(1);
         }
     };
-    let in_specs = schema.feature_specs();
     println!(
         "Датасет: {path} ({} строк, {} вход -> {} выход)",
         data.len(),
         data.inputs.ncols(),
         data.outputs.ncols()
     );
-    run_numeric_flow(&f, data, in_specs, None);
+    run_numeric_flow(&f, data, schema, None);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn save_and_verify(
     path: &str,
     nc: &NumericConfig,
-    specs: &[FeatureSpec],
-    num_outputs: usize,
+    schema: &ModelSchema,
     model: &NumericModel,
     in_norm: &Normalizer,
     out_norm: &Normalizer,
@@ -820,8 +819,7 @@ fn save_and_verify(
     save_numeric(
         path,
         nc,
-        specs,
-        num_outputs,
+        schema,
         model,
         in_norm,
         out_norm,

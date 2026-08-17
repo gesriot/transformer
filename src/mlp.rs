@@ -49,6 +49,10 @@ impl MlpBaseline {
         p.extend(self.output.parameters());
         p
     }
+
+    pub(crate) fn interface_dims(&self) -> (usize, usize) {
+        (self.input.weight.shape()[0], self.output.weight.shape()[1])
+    }
 }
 
 #[cfg(test)]

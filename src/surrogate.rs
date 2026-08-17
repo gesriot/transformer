@@ -83,4 +83,12 @@ impl SurrogateModel {
         p.extend(self.head.parameters());
         p
     }
+
+    pub(crate) fn interface_dims(&self) -> (usize, usize) {
+        (self.input_enc.specs().len(), self.num_outputs)
+    }
+
+    pub(crate) fn input_specs(&self) -> &[FeatureSpec] {
+        self.input_enc.specs()
+    }
 }
