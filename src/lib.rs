@@ -20,6 +20,7 @@ pub mod numeric_model;
 pub mod ops;
 pub mod optim;
 pub mod serialize;
+pub mod split;
 pub mod surrogate;
 pub mod sweep;
 pub mod symbolic;
