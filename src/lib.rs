@@ -13,6 +13,7 @@ pub mod heads;
 pub mod init;
 pub mod kan;
 pub mod loss;
+pub mod markup;
 pub mod metrics;
 pub mod mlp;
 pub mod nn;

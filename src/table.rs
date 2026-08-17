@@ -189,7 +189,7 @@ impl Table {
                 return Err(format!(
                     "{}: строка {}: ожидалось {} колонок, получено {}",
                     self.source,
-                    self.row_label(r),
+                    self.file_row(r),
                     columns.len(),
                     row.len()
                 ));
@@ -205,9 +205,14 @@ impl Table {
         Ok(NumericDataset::new(inputs, outputs))
     }
 
-    /// Номер строки как в файле (1-based, с учётом заголовка) — иначе
-    /// пользователь ищет ошибку не там.
-    fn row_label(&self, r: usize) -> usize {
+    /// Номер строки данных `r` так, как она пронумерована в файле (1-based, с
+    /// учётом заголовка, комментариев и пустых строк) — иначе пользователь ищет
+    /// ошибку не там.
+    ///
+    /// # Panics
+    ///
+    /// Если `r >= self.n_rows()`.
+    pub fn file_row(&self, r: usize) -> usize {
         self.row_numbers[r]
     }
 
@@ -220,7 +225,7 @@ impl Table {
         allow_category_code: bool,
     ) -> Result<f32, String> {
         let column = &schema.columns()[c];
-        let at = format!("{}: строка {}", self.source, self.row_label(r));
+        let at = format!("{}: строка {}", self.source, self.file_row(r));
         let where_ = format!("{at}, колонка '{}'", column.name());
         if text.trim().is_empty() {
             return Err(format!("{where_}: пустая ячейка"));
