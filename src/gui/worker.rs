@@ -16,6 +16,7 @@ use crate::encoders::FeatureSpec;
 use crate::epoch_sweep::{self, EpochRow};
 use crate::generate::generate;
 use crate::init::set_init_seed;
+use crate::markup::TableProfile;
 use crate::metrics::evaluate;
 use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
 use crate::schema::ModelSchema;
@@ -23,9 +24,12 @@ use crate::serialize::{calibration_sample, load_numeric_full, save_numeric};
 use crate::split::{SplitPlan, DEFAULT_DATA_SEED};
 use crate::sweep::{self, SweepAxes, SweepObjective};
 use crate::symbolic;
+use crate::table::{Delimiter, Table};
 use crate::tensor::Tensor;
 use crate::textmodel::TextModel;
-use crate::tnum::{read_numeric_source, table_path_to_tnum, PrepareSpec};
+use crate::tnum::{
+    infer_prepare_spec_from_table, read_numeric_source, table_path_to_tnum, PrepareSpec,
+};
 use crate::train::{
     evaluate_surrogate, fit_normalizers, predict_dataset, train_surrogate_cb, train_text_cb,
     validate_train, TextTrainConfig, TrainConfig,
@@ -362,6 +366,24 @@ fn worker_loop(
                 }
                 ctx.request_repaint();
             }
+            Command::OpenTable { path, has_header } => {
+                match open_table(&path, has_header) {
+                    Ok((table, profile, suggested_inputs, suggested_categories)) => {
+                        let _ = evt_tx.send(Event::TableOpened {
+                            path,
+                            has_header,
+                            table: Box::new(table),
+                            profile: Box::new(profile),
+                            suggested_inputs,
+                            suggested_categories,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = evt_tx.send(Event::Error(e));
+                    }
+                }
+                ctx.request_repaint();
+            }
             Command::Prepare {
                 input,
                 output,
@@ -419,6 +441,7 @@ fn source_desc(s: &DataSource) -> String {
     match s {
         DataSource::Blackbox(name) => format!("blackbox: {name}"),
         DataSource::File(path) => format!("файл: {path}"),
+        DataSource::Prepared { name, .. } => format!("таблица: {name}"),
     }
 }
 
@@ -578,7 +601,8 @@ fn diagnose(l: &Loaded) -> Result<DiagnosticsResult, String> {
         DataSource::Blackbox(name) => blackbox::by_name(name).map(|bb| {
             crate::diagnostics::sensitivity_probe(&bb, &l.in_norm, &l.out_norm, 300, 0.01, 0)
         }),
-        DataSource::File(_) => None,
+        // Чувствительность исходного процесса известна только у демо-ящика.
+        DataSource::File(_) | DataSource::Prepared { .. } => None,
     };
 
     Ok(DiagnosticsResult {
@@ -898,6 +922,36 @@ fn run_epoch_sweep(
     Ok(())
 }
 
+/// Прочитать таблицу и посчитать профиль. Автоопределение подсказывает границу
+/// вход/выход, но роли всё равно подтверждает пользователь.
+fn open_table(
+    path: &str,
+    has_header: bool,
+) -> Result<(Table, TableProfile, Option<usize>, Vec<usize>), String> {
+    // Сначала читаем без выделенного заголовка: старая эвристика должна увидеть
+    // первую строку, а файл при этом остаётся прочитан ровно один раз.
+    let raw = Table::read_path(path, Delimiter::Auto, false)?;
+    let inferred = has_header
+        .then(|| infer_prepare_spec_from_table(&raw, Delimiter::Auto).ok())
+        .flatten();
+    let suggested_inputs = inferred.as_ref().map(|spec| spec.n_inputs);
+    let suggested_categories = inferred
+        .map(|spec| {
+            spec.categorical
+                .into_iter()
+                .map(|(index, _)| index)
+                .collect()
+        })
+        .unwrap_or_default();
+    let table = if has_header {
+        raw.promote_first_row_to_header()?
+    } else {
+        raw
+    };
+    let profile = TableProfile::of(&table);
+    Ok((table, profile, suggested_inputs, suggested_categories))
+}
+
 /// Обучение в worker-потоке. Возвращает обученную модель (Rc живёт здесь) или
 /// `None` при отмене.
 fn train_numeric(
@@ -911,17 +965,21 @@ fn train_numeric(
     validate_numeric(nc)?;
     validate_train(tcfg.lr, tcfg.batch_size)?;
 
-    let (data, schema) = match source {
+    let (data, schema): (Arc<NumericDataset>, ModelSchema) = match source {
+        DataSource::Prepared { data, schema, .. } => (Arc::clone(data), schema.clone()),
         DataSource::Blackbox(name) => {
             let bb = blackbox::by_name(name)
                 .ok_or_else(|| format!("неизвестный чёрный ящик: {name}"))?;
             // Seed обучения не должен менять саму выборку.
             (
-                bb.generate(2000, DEFAULT_DATA_SEED),
+                Arc::new(bb.generate(2000, DEFAULT_DATA_SEED)),
                 ModelSchema::synthetic(bb.n_inputs(), bb.n_outputs)?,
             )
         }
-        DataSource::File(path) => read_numeric_source(path)?,
+        DataSource::File(path) => {
+            let (data, schema) = read_numeric_source(path)?;
+            (Arc::new(data), schema)
+        }
     };
     let in_specs = schema.feature_specs();
     let n_inputs = data.inputs.ncols();
@@ -1066,5 +1124,23 @@ mod tests {
         assert!(metrics.r2.is_finite());
         assert!(result.kan_r2.expect("R² KAN есть").is_finite());
         assert!(result.weak_edges.iter().all(|edge| edge.r2 < 0.99));
+    }
+
+    #[test]
+    fn open_table_preserves_inferred_categorical_columns() {
+        let path = std::env::temp_dir().join(format!(
+            "transformer_gui_open_table_{}.csv",
+            std::process::id()
+        ));
+        std::fs::write(&path, "x0,material_id,y0\n1,0,2\n3,1,4\n").unwrap();
+
+        let (table, _, suggested_inputs, suggested_categories) =
+            open_table(path.to_str().unwrap(), true).unwrap();
+
+        std::fs::remove_file(path).ok();
+        assert_eq!(table.header().unwrap(), ["x0", "material_id", "y0"]);
+        assert_eq!(table.rows().len(), 2);
+        assert_eq!(suggested_inputs, Some(2));
+        assert_eq!(suggested_categories, vec![1]);
     }
 }

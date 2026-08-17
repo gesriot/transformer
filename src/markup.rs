@@ -18,6 +18,45 @@ use std::collections::BTreeSet;
 /// категории. Больше — это уже не категория, а свободный текст.
 const MAX_DISTINCT: usize = 256;
 
+/// Что делать с сообщением диагностики.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    /// Обучение невозможно, пока это не исправлено.
+    Blocking,
+    /// Помешает, если оставить как есть; колонку ещё можно исключить или
+    /// объявить категорией.
+    Warning,
+    /// На запуск не влияет, на интерпретацию результата — влияет.
+    Note,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Message {
+    pub severity: Severity,
+    pub text: String,
+}
+
+impl Message {
+    pub fn blocking(text: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Blocking,
+            text: text.into(),
+        }
+    }
+    pub fn warning(text: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Warning,
+            text: text.into(),
+        }
+    }
+    pub fn note(text: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Note,
+            text: text.into(),
+        }
+    }
+}
+
 // --- профиль таблицы (роли ещё не выбраны) ---
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,8 +160,11 @@ impl TableProfile {
         }
     }
 
-    /// Короткий человекочитаемый отчёт: только то, что действительно найдено.
-    pub fn warnings(&self) -> Vec<String> {
+    /// Сообщения о качестве таблицы, разделённые по тому, что с ними делать.
+    ///
+    /// Разделение здесь, а не в интерфейсе: решать, мешает ли пропуск запуску,
+    /// должен тот, кто знает смысл проверки.
+    pub fn messages(&self) -> Vec<Message> {
         let mut out = Vec::new();
         if !self.ragged_rows.is_empty() {
             let shown: Vec<String> = self
@@ -131,30 +173,40 @@ impl TableProfile {
                 .take(5)
                 .map(usize::to_string)
                 .collect();
-            out.push(format!(
+            out.push(Message::blocking(format!(
                 "строк с другим числом колонок: {} (например {})",
                 self.ragged_rows.len(),
                 shown.join(", ")
-            ));
-        }
-        if self.duplicate_rows > 0 {
-            out.push(format!("повторяющихся строк: {}", self.duplicate_rows));
+            )));
         }
         for c in &self.columns {
+            // Пропуск и текст мешают, только пока колонка участвует в модели:
+            // её ещё можно исключить или объявить категорией.
             if c.missing > 0 {
-                out.push(format!(
+                out.push(Message::warning(format!(
                     "'{}': пропусков {} из {}",
                     c.name, c.missing, c.total
-                ));
+                )));
             }
             if c.non_numeric > 0 {
-                out.push(format!(
+                out.push(Message::warning(format!(
                     "'{}': нечисловых значений {} из {}",
                     c.name, c.non_numeric, c.total
-                ));
+                )));
             }
+        }
+        if self.duplicate_rows > 0 {
+            out.push(Message::note(format!(
+                "повторяющихся строк: {}",
+                self.duplicate_rows
+            )));
+        }
+        for c in &self.columns {
             if c.is_constant() {
-                out.push(format!("'{}': одно значение на всю колонку", c.name));
+                out.push(Message::note(format!(
+                    "'{}': одно значение на всю колонку",
+                    c.name
+                )));
             }
         }
         out
@@ -459,7 +511,9 @@ const MIN_DEPENDENCY_ROWS: usize = 10;
 const MIN_RESIDUAL_DOF: usize = 5;
 
 impl RoleReport {
-    pub fn warnings(&self, draft: &SchemaDraft) -> Vec<String> {
+    /// Сообщения по ролям. Все справочные: связи входов не мешают обучению, но
+    /// без них результат интерпретируется неверно.
+    pub fn messages(&self, draft: &SchemaDraft) -> Vec<Message> {
         let name = |i: usize| {
             draft
                 .columns()
@@ -469,7 +523,10 @@ impl RoleReport {
         };
         let mut out = Vec::new();
         for &i in &self.constant_inputs {
-            out.push(format!("вход '{}' постоянен — модели он не нужен", name(i)));
+            out.push(Message::note(format!(
+                "вход '{}' постоянен — модели он не нужен",
+                name(i)
+            )));
         }
         for d in &self.dependencies {
             let terms: String = d
@@ -487,7 +544,7 @@ impl RoleReport {
                     )
                 })
                 .collect();
-            out.push(format!(
+            out.push(Message::note(format!(
                 "входы связаны{}: '{}' ≈ {}{terms} (R² = {:.6}). Вклад можно \
                  переложить между зависимыми входами, поэтому формулы и \
                  чувствительность по ним неоднозначны.",
@@ -499,7 +556,7 @@ impl RoleReport {
                 name(d.target),
                 fmt_coeff(d.intercept),
                 d.r2
-            ));
+            )));
         }
         out
     }
@@ -756,7 +813,28 @@ mod tests {
         assert_eq!(p.duplicate_rows, 1); // строка «1,x,5» встречается дважды
         assert!(p.ragged_rows.is_empty());
 
-        let warnings = p.warnings().join("\n");
+        let messages = p.messages();
+        let warnings = messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Пропуск мешает только пока колонка в модели — это предупреждение;
+        // константа влияет лишь на интерпретацию — справочно.
+        assert_eq!(
+            messages
+                .iter()
+                .find(|m| m.text.contains("пропусков"))
+                .map(|m| m.severity),
+            Some(Severity::Warning)
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .find(|m| m.text.contains("одно значение"))
+                .map(|m| m.severity),
+            Some(Severity::Note)
+        );
         assert!(warnings.contains("'a': пропусков 1 из 4"), "{warnings}");
         assert!(warnings.contains("одно значение"), "{warnings}");
     }
@@ -914,7 +992,13 @@ mod tests {
             assert!((k + 1.0).abs() < 1e-6, "коэффициент {k}");
         }
 
-        let warnings = report.warnings(&d).join("\n");
+        let messages = report.messages(&d);
+        assert!(messages.iter().all(|m| m.severity == Severity::Note));
+        let warnings = messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(warnings.contains("входы связаны точно"), "{warnings}");
         assert!(warnings.contains("неоднозначны"), "{warnings}");
     }
@@ -945,7 +1029,10 @@ mod tests {
         let report = analyze_roles(&t, &d);
         assert_eq!(report.constant_inputs, vec![1]);
         assert!(report.dependencies.is_empty());
-        assert!(report.warnings(&d).iter().any(|w| w.contains("постоянен")));
+        assert!(report
+            .messages(&d)
+            .iter()
+            .any(|m| m.text.contains("постоянен")));
     }
 
     #[test]

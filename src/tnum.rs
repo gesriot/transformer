@@ -159,7 +159,10 @@ fn infer_prepare_spec_from_rows(
     })
 }
 
-fn infer_prepare_spec_from_table(
+/// Эвристика старого `prepare` над уже прочитанной таблицей без выделенного
+/// заголовка: первая строка рассматривается как возможный header. Нужна GUI,
+/// чтобы подсказка не заставляла читать тот же файл второй раз.
+pub(crate) fn infer_prepare_spec_from_table(
     table: &Table,
     delimiter: Delimiter,
 ) -> Result<InferredPrepareSpec, String> {

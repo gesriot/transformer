@@ -2,20 +2,35 @@
 //! пересекают границу потока.
 
 use crate::config::ModelConfig;
-use crate::data::OutOfRange;
+use crate::data::{NumericDataset, OutOfRange};
 use crate::epoch_sweep::EpochRow;
+use crate::markup::TableProfile;
 use crate::metrics::Metrics;
 use crate::numeric_model::{ModelKind, NumericConfig};
 use crate::schema::ModelSchema;
 use crate::sweep::{SweepAxes, SweepObjective, SweepRow};
+use crate::table::Table;
 use crate::tnum::PrepareSpec;
 use crate::train::{TextTrainConfig, TrainConfig};
+use std::sync::Arc;
 
 /// Источник данных для обучения.
 #[derive(Clone)]
 pub enum DataSource {
     Blackbox(String),
+    /// Путь к готовому источнику (`.tnum` со своей схемой либо таблица,
+    /// размеченная автоопределением).
     File(String),
+    /// Данные, размеченные пользователем в диалоге.
+    ///
+    /// Передаём именно данные, а не путь: иначе worker открыл бы файл заново
+    /// через автоопределение и ручная разметка потерялась бы. Временный
+    /// адаптер до общего ядра обучения (Э4).
+    Prepared {
+        name: String,
+        data: Arc<NumericDataset>,
+        schema: ModelSchema,
+    },
 }
 
 /// Результат диагностики (числа для UI).
@@ -107,6 +122,12 @@ pub enum Command {
         output: String,
         spec: PrepareSpec,
     },
+    /// Открыть таблицу для разметки: чтение и профиль считаются в worker-е,
+    /// дальше диалог работает с ними локально.
+    OpenTable {
+        path: String,
+        has_header: bool,
+    },
     EpochSweep {
         path: String,
         nc: NumericConfig,
@@ -134,6 +155,16 @@ pub enum Event {
     /// Завершение обучения: `Some` — метрики на validation, `None` — отменено.
     TrainDone {
         metrics: Option<Metrics>,
+    },
+    /// Таблица прочитана и профилирована. Подсказки только заполняют начальное
+    /// состояние диалога, решение остаётся за пользователем.
+    TableOpened {
+        path: String,
+        has_header: bool,
+        table: Box<Table>,
+        profile: Box<TableProfile>,
+        suggested_inputs: Option<usize>,
+        suggested_categories: Vec<usize>,
     },
     /// Модель готова к предсказанию (после обучения или загрузки `.bin`).
     /// Число входов и выходов берётся из схемы, отдельных полей для них нет.
