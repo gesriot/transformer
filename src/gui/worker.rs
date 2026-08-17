@@ -21,7 +21,7 @@ use crate::metrics::evaluate;
 use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
 use crate::schema::ModelSchema;
 use crate::serialize::{calibration_sample, load_numeric_full, save_numeric};
-use crate::split::{SplitPlan, DEFAULT_DATA_SEED};
+use crate::split::{SplitPlan, DEFAULT_DATA_SEED, DEFAULT_FINAL_INIT_SEED};
 use crate::sweep::{self, SweepAxes, SweepObjective};
 use crate::symbolic;
 use crate::table::{Delimiter, Table};
@@ -31,9 +31,10 @@ use crate::tnum::{
     infer_prepare_spec_from_table, read_numeric_source, table_path_to_tnum, PrepareSpec,
 };
 use crate::train::{
-    evaluate_surrogate, fit_normalizers, predict_dataset, train_surrogate_cb, train_text_cb,
-    validate_train, TextTrainConfig, TrainConfig,
+    evaluate_surrogate, predict_dataset, train_text_cb, validate_train, TextTrainConfig,
+    TrainConfig,
 };
+use crate::training::{run_training, Dataset, TrainedModel, TrainingSetup};
 use eframe::egui;
 use ndarray::{Array2, Ix2};
 use rand::rngs::StdRng;
@@ -692,8 +693,8 @@ fn run_optimize_file(
     cancel: &AtomicBool,
 ) -> Result<(), String> {
     let (data, schema) = read_numeric_source(path)?;
-    let specs = schema.feature_specs();
-    let prepared = SplitPlan::default().prepare(&data)?;
+    let dataset = Dataset::new(data, schema)?;
+    let prepared = SplitPlan::default().prepare(dataset.data())?;
     let (total_configs, total_runs) = sweep::sweep_size(axes)?;
     let _ = evt_tx.send(Event::OptimizeStarted {
         total_configs,
@@ -701,7 +702,7 @@ fn run_optimize_file(
     });
     ctx.request_repaint();
 
-    let result = sweep::run_sweep(&prepared.search, &specs, axes, objective, cancel, |row| {
+    let result = sweep::run_sweep(&dataset, &prepared.search, axes, objective, cancel, |row| {
         let _ = evt_tx.send(Event::OptimizeRow { row: row.clone() });
         ctx.request_repaint();
     })?;
@@ -886,9 +887,8 @@ fn run_epoch_sweep(
     }
 
     let (data, schema) = read_numeric_source(path)?;
-    let specs = schema.feature_specs();
-    let n_out = data.outputs.ncols();
-    let prepared = SplitPlan::default().prepare(&data)?;
+    let dataset = Dataset::new(data, schema)?;
+    let prepared = SplitPlan::default().prepare(dataset.data())?;
     let mut points: Vec<usize> = milestones.iter().copied().filter(|&e| e > 0).collect();
     points.sort_unstable();
     points.dedup();
@@ -903,15 +903,14 @@ fn run_epoch_sweep(
         ctx.request_repaint();
     };
     let rows = epoch_sweep::run_epoch_sweep_cb(
+        &dataset,
         &prepared.search,
         nc,
-        &specs,
-        n_out,
         base_tcfg,
         &points,
         cancel,
         &mut on_row,
-    );
+    )?;
     let recommendation = epoch_sweep::recommended_stop(&rows, target_r2, min_gain, plateau_min);
     let _ = evt_tx.send(Event::EpochSweepDone {
         rows,
@@ -984,37 +983,42 @@ fn train_numeric(
     let in_specs = schema.feature_specs();
     let n_inputs = data.inputs.ncols();
     let n_out = data.outputs.ncols();
-    // Test откладывается и в GUI не открывается: единственный финальный замер
-    // появится вместе с явной финальной оценкой (Э4), а до тех пор все числа
-    // здесь — validation.
-    let prepared = SplitPlan::default().prepare(&data)?;
-    let (train, val) = prepared.search.fold(0)?;
-    let (in_norm, out_norm) = fit_normalizers(&train, &in_specs);
+    // Данные уже могут быть общими (размеченная таблица), поэтому Dataset
+    // строится из копии: владение остаётся у вызывающего.
+    let dataset = Dataset::new(
+        data.gather(&(0..data.len()).collect::<Vec<_>>()),
+        schema.clone(),
+    )?;
 
-    set_init_seed(tcfg.seed); // воспроизводимая инициализация
-    let model = nc.build(&in_specs, n_out);
-
+    // Счётчик параметров нужен до обучения; RNG это не сбивает — ядро само
+    // выставляет seed перед построением модели.
+    set_init_seed(tcfg.seed);
     let _ = evt_tx.send(Event::TrainStarted {
         total_epochs: tcfg.epochs,
-        parameter_count: model.parameter_count(),
+        parameter_count: nc.build(&in_specs, n_out).parameter_count(),
     });
     ctx.request_repaint();
 
-    train_surrogate_cb(
-        &model,
-        &train,
-        &in_norm,
-        &out_norm,
-        tcfg,
-        &mut |epoch, loss| {
+    // Test откладывается и в GUI не открывается: финальная фаза здесь не
+    // запрашивается, поэтому все числа — validation.
+    let setup = TrainingSetup::new(nc.clone(), tcfg.clone());
+    let outcome = run_training(
+        &dataset,
+        SplitPlan::default(),
+        &setup,
+        false,
+        DEFAULT_FINAL_INIT_SEED,
+        cancel,
+        &mut |_, point| {
             let _ = evt_tx.send(Event::Epoch {
-                epoch: epoch + 1,
-                loss,
+                epoch: point.epoch,
+                loss: point.train_loss,
             });
             ctx.request_repaint();
         },
-        cancel,
-    );
+        &mut |_, _| {},
+        &mut |_, _, _, _| {},
+    )?;
 
     if cancel.load(Ordering::Relaxed) {
         let _ = evt_tx.send(Event::TrainDone { metrics: None });
@@ -1022,6 +1026,14 @@ fn train_numeric(
         return Ok(None);
     }
 
+    let prepared = SplitPlan::default().prepare(dataset.data())?;
+    let (train, val) = prepared.search.fold(0)?;
+    let TrainedModel {
+        model,
+        in_norm,
+        out_norm,
+        ..
+    } = outcome.development;
     let metrics = evaluate_surrogate(&model, &val, &in_norm, &out_norm);
     let _ = evt_tx.send(Event::TrainDone {
         metrics: Some(metrics),
@@ -1054,6 +1066,7 @@ mod tests {
     use crate::config::ModelConfig;
     use crate::encoders::ValueEncoderConfig;
     use crate::numeric_model::{KanConfig, ModelKind};
+    use crate::train::fit_normalizers;
 
     #[test]
     fn samples_kan_edge_for_gui() {

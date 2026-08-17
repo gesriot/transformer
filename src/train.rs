@@ -112,20 +112,33 @@ pub fn train_surrogate(
     cfg: &TrainConfig,
 ) -> Vec<f32> {
     let never = AtomicBool::new(false);
-    train_surrogate_cb(model, data, in_norm, out_norm, cfg, &mut |_, _| {}, &never)
+    train_surrogate_cb(
+        model,
+        data,
+        in_norm,
+        out_norm,
+        cfg,
+        &mut |_, _| true,
+        &never,
+    )
 }
 
 /// Как `train_surrogate`, но зовёт `on_epoch(epoch_index_0based, mean_loss)` после
 /// каждой эпохи (живая кривая GUI / снапшоты epoch-sweep) и проверяет `cancel`
 /// ВНУТРИ батч-цикла — при взводе флага обучение прерывается на ближайшем
 /// minibatch (а не ждёт конца эпохи) и возвращает накопленную историю.
+///
+/// `on_epoch` возвращает `false`, чтобы остановить обучение после этой эпохи:
+/// так работает ранняя остановка по validation. Отмена пользователем и ранняя
+/// остановка — разные вещи и разными путями и приходят: первая может сработать
+/// посреди эпохи, вторая осмысленна только на её границе.
 pub fn train_surrogate_cb(
     model: &NumericModel,
     data: &NumericDataset,
     in_norm: &Normalizer,
     out_norm: &Normalizer,
     cfg: &TrainConfig,
-    on_epoch: &mut dyn FnMut(usize, f32),
+    on_epoch: &mut dyn FnMut(usize, f32) -> bool,
     cancel: &AtomicBool,
 ) -> Vec<f32> {
     let mut opt = Adam::new(model.parameters(), cfg.lr);
@@ -161,7 +174,9 @@ pub fn train_surrogate_cb(
         }
         let mean = epoch_loss / n_batches as f32;
         history.push(mean);
-        on_epoch(epoch, mean);
+        if !on_epoch(epoch, mean) {
+            return history;
+        }
     }
     history
 }

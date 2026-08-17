@@ -6,17 +6,13 @@
 
 use crate::blackbox;
 use crate::config::ModelConfig;
-use crate::data::{Normalizer, NumericDataset};
-use crate::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
-use crate::init::set_init_seed;
-use crate::metrics::{
-    aggregate_runs, evaluate, evaluate_per_output, ConfigEval, EvalSource, RunEval, RunOrigin,
-};
+use crate::encoders::{ValueEncoderConfig, ValueEncoderKind};
+use crate::metrics::{aggregate_runs, ConfigEval, EvalSource, RunEval};
 use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
+use crate::schema::ModelSchema;
 use crate::split::{SearchPool, SplitPlan, DEFAULT_DATA_SEED};
-use crate::train::{
-    fit_normalizers, predict_dataset, train_surrogate_cb, validate_train, LrSchedule, TrainConfig,
-};
+use crate::train::{validate_train, LrSchedule, TrainConfig};
+use crate::training::{evaluate_on, train_candidate, Dataset, TrainingSetup};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -521,22 +517,6 @@ fn sort_rows(rows: &mut [SweepRow], objective: SweepObjective) {
     });
 }
 
-/// Метрики одного прогона (одна пара seed × fold) на VALIDATION части fold.
-fn evaluate_run(
-    model: &crate::numeric_model::NumericModel,
-    val: &NumericDataset,
-    in_norm: &Normalizer,
-    out_norm: &Normalizer,
-    origin: RunOrigin,
-) -> RunEval {
-    let pred = predict_dataset(model, val, in_norm, out_norm);
-    RunEval {
-        metrics: evaluate(&pred, &val.outputs),
-        per_output: evaluate_per_output(&pred, &val.outputs),
-        origin,
-    }
-}
-
 /// Строка ранжирования из агрегата. `r2_std` — разброс по init_seed (свёртка
 /// folds уже произошла внутри seed), поэтому `±` означает устойчивость к
 /// инициализации, а не к разбиению.
@@ -576,8 +556,8 @@ fn row_from_config_eval(
 /// train КАЖДОГО fold, метрики снимаются на его validation. Свёртка — через
 /// [`aggregate_runs`] (folds внутри seed, затем seeds).
 pub fn run_sweep<F>(
+    dataset: &Dataset,
     pool: &SearchPool,
-    in_specs: &[FeatureSpec],
     axes: &SweepAxes,
     objective: SweepObjective,
     cancel: &AtomicBool,
@@ -589,18 +569,7 @@ where
     let configs = build_candidates(axes)?;
     let total_configs = configs.len();
     let total_runs = total_configs * axes.seeds.len() * pool.n_folds();
-    let n_out = pool.all().outputs.ncols();
     let mut rows = Vec::new();
-
-    // Fold-ы материализуются один раз на весь поиск: они не зависят от
-    // кандидата, а gather на каждой итерации стоил бы заметно дороже.
-    let folds: Vec<(NumericDataset, NumericDataset)> = (0..pool.n_folds())
-        .map(|i| pool.fold(i))
-        .collect::<Result<_, _>>()?;
-    let normalizers: Vec<(Normalizer, Normalizer)> = folds
-        .iter()
-        .map(|(train, _)| fit_normalizers(train, in_specs))
-        .collect();
 
     let cancelled_result = |rows: &mut Vec<SweepRow>| {
         sort_rows(rows, objective);
@@ -619,42 +588,44 @@ where
 
         let mut runs = Vec::new();
         for &seed in &axes.seeds {
-            for (fold, ((train, val), (in_norm, out_norm))) in
-                folds.iter().zip(normalizers.iter()).enumerate()
-            {
+            for fold in 0..pool.n_folds() {
                 if cancel.load(Ordering::Relaxed) {
                     return Ok(cancelled_result(&mut rows));
                 }
 
-                set_init_seed(seed);
-                let model = candidate.nc.build(in_specs, n_out);
-                let tcfg = TrainConfig {
-                    epochs: axes.epochs,
-                    batch_size: axes.batch_size,
-                    lr: candidate.lr,
-                    seed,
-                    schedule: candidate.schedule,
-                };
-                train_surrogate_cb(
-                    &model,
-                    train,
-                    in_norm,
-                    out_norm,
-                    &tcfg,
-                    &mut |_, _| {},
-                    cancel,
+                // Обучение — через общее ядро: нормализаторы по train fold,
+                // метрики на его validation, без собственной копии цикла.
+                let setup = TrainingSetup::new(
+                    candidate.nc.clone(),
+                    TrainConfig {
+                        epochs: axes.epochs,
+                        batch_size: axes.batch_size,
+                        lr: candidate.lr,
+                        seed,
+                        schedule: candidate.schedule,
+                    },
                 );
+                let trained = train_candidate(
+                    dataset,
+                    pool,
+                    fold,
+                    &setup,
+                    seed,
+                    cancel,
+                    &mut |_| {},
+                    &mut |_| {},
+                )?;
                 if cancel.load(Ordering::Relaxed) {
                     return Ok(cancelled_result(&mut rows));
                 }
 
-                runs.push(evaluate_run(
-                    &model,
-                    val,
-                    in_norm,
-                    out_norm,
-                    pool.run_origin(fold, seed),
-                ));
+                let (_, val) = pool.fold(fold)?;
+                let (metrics, per_output) = evaluate_on(&trained, &val);
+                runs.push(RunEval {
+                    metrics,
+                    per_output,
+                    origin: pool.run_origin(fold, seed),
+                });
             }
         }
 
@@ -706,15 +677,19 @@ where
 {
     let bb = blackbox::by_name(blackbox_name)
         .ok_or_else(|| format!("неизвестный чёрный ящик: {blackbox_name}"))?;
-    let in_specs = vec![FeatureSpec::Continuous; bb.n_inputs()];
     let data = bb.generate(2000, DEFAULT_DATA_SEED);
-    let prepared = SplitPlan::default().prepare(&data)?;
-    run_sweep(&prepared.search, &in_specs, axes, objective, cancel, on_row)
+    let dataset = Dataset::new(data, ModelSchema::synthetic(bb.n_inputs(), bb.n_outputs)?)?;
+    let prepared = SplitPlan::default().prepare(dataset.data())?;
+    run_sweep(&dataset, &prepared.search, axes, objective, cancel, on_row)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::NumericDataset;
+    use crate::encoders::FeatureSpec;
+    use crate::metrics::RunOrigin;
+    use crate::train::fit_normalizers;
     use ndarray::Array2;
     use std::sync::atomic::AtomicBool;
 
@@ -755,6 +730,13 @@ mod tests {
         assert!(result.rows[0].r2_mean.is_finite());
     }
 
+    /// Копия данных со схемой: тестам удобнее строить `Dataset` из готовой пары.
+    fn dataset_of(data: &NumericDataset, specs: &[FeatureSpec]) -> Dataset {
+        let copy = data.gather(&(0..data.len()).collect::<Vec<_>>());
+        let schema = ModelSchema::synthetic_from_specs(specs, data.outputs.ncols()).unwrap();
+        Dataset::new(copy, schema).unwrap()
+    }
+
     fn tiny_axes() -> SweepAxes {
         SweepAxes {
             model_kinds: vec![ModelKind::Transformer, ModelKind::Mlp, ModelKind::Kan],
@@ -775,11 +757,12 @@ mod tests {
     }
 
     fn sweep_r2s(data: &NumericDataset, specs: &[FeatureSpec]) -> Vec<f32> {
-        let prepared = SplitPlan::default().prepare(data).unwrap();
+        let dataset = dataset_of(data, specs);
+        let prepared = SplitPlan::default().prepare(dataset.data()).unwrap();
         let cancel = AtomicBool::new(false);
         let result = run_sweep(
+            &dataset,
             &prepared.search,
-            specs,
             &tiny_axes(),
             SweepObjective::WorstOutputR2,
             &cancel,
@@ -794,11 +777,12 @@ mod tests {
         let bb = blackbox::by_name("sum").unwrap();
         let data = bb.generate(96, 0);
         let specs = vec![FeatureSpec::Continuous; bb.n_inputs()];
-        let prepared = SplitPlan::default().prepare(&data).unwrap();
+        let dataset = dataset_of(&data, &specs);
+        let prepared = SplitPlan::default().prepare(dataset.data()).unwrap();
         let cancel = AtomicBool::new(false);
         let result = run_sweep(
+            &dataset,
             &prepared.search,
-            &specs,
             &tiny_axes(),
             SweepObjective::WorstOutputR2,
             &cancel,

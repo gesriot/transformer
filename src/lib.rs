@@ -31,6 +31,7 @@ pub mod tensor;
 pub mod textmodel;
 pub mod tnum;
 pub mod train;
+pub mod training;
 
 #[cfg(test)]
 pub(crate) mod gradcheck;
