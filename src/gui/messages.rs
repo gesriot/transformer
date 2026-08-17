@@ -5,7 +5,8 @@ use crate::config::ModelConfig;
 use crate::data::OutOfRange;
 use crate::epoch_sweep::EpochRow;
 use crate::metrics::Metrics;
-use crate::numeric_model::NumericConfig;
+use crate::numeric_model::{ModelKind, NumericConfig};
+use crate::schema::ModelSchema;
 use crate::sweep::{SweepAxes, SweepObjective, SweepRow};
 use crate::tnum::PrepareSpec;
 use crate::train::{TextTrainConfig, TrainConfig};
@@ -41,8 +42,8 @@ pub struct KanModelInfo {
 /// Слабое символьное ребро, передаваемое в UI без тензоров.
 pub struct KanWeakEdge {
     pub layer: usize,
-    pub input: usize,
-    pub output: usize,
+    pub input: String,
+    pub output: String,
     pub primitive: String,
     pub r2: f32,
 }
@@ -135,9 +136,11 @@ pub enum Event {
         metrics: Option<Metrics>,
     },
     /// Модель готова к предсказанию (после обучения или загрузки `.bin`).
+    /// Число входов и выходов берётся из схемы, отдельных полей для них нет.
     ModelReady {
-        n_inputs: usize,
-        n_outputs: usize,
+        schema: ModelSchema,
+        /// Нужен UI, чтобы предупредить о категориях без embedding.
+        kind: ModelKind,
         source: String,
         parameter_count: usize,
         kan: Option<KanModelInfo>,

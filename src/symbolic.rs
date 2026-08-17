@@ -17,6 +17,7 @@
 
 use crate::data::Normalizer;
 use crate::kan::KanNet;
+use crate::schema::ModelSchema;
 use ndarray::Array2;
 
 /// Примитив f с доменной защитой: `valid(u)` — точка u = b·x + c допустима
@@ -247,6 +248,49 @@ pub struct SymbolicLayer {
 }
 
 /// Символьная копия KAN: послойные формулы, вычислимые как модель.
+/// Имя переменной в формуле. Имя со спецсимволами берётся в обратные кавычки:
+/// иначе `12·температура, °C` читалось бы как два разных терма.
+fn var_name(raw: &str) -> String {
+    let mut chars = raw.chars();
+    let identifier = chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_');
+    // h{k}_{j} — зарезервированное пространство имён промежуточных узлов.
+    let hidden = raw
+        .strip_prefix('h')
+        .and_then(|rest| rest.split_once('_'))
+        .is_some_and(|(layer, node)| {
+            !layer.is_empty()
+                && !node.is_empty()
+                && layer.chars().all(|c| c.is_ascii_digit())
+                && node.chars().all(|c| c.is_ascii_digit())
+        });
+    if identifier && !hidden {
+        raw.to_string()
+    } else {
+        let escaped = raw.chars().fold(String::new(), |mut out, c| {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '`' => out.push_str("\\`"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                control if control.is_control() => out.extend(control.escape_default()),
+                other => out.push(other),
+            }
+            out
+        });
+        format!("`{escaped}`")
+    }
+}
+
+fn input_var(schema: &ModelSchema, i: usize) -> String {
+    var_name(schema.inputs()[i].name())
+}
+
+fn output_var(schema: &ModelSchema, o: usize) -> String {
+    var_name(schema.outputs()[o].name())
+}
+
 pub struct SymbolicKan {
     pub layers: Vec<SymbolicLayer>,
 }
@@ -327,6 +371,22 @@ fn fmt_arg(b: f32, var: &str, c: f32) -> String {
 }
 
 impl SymbolicKan {
+    fn check_schema(&self, schema: &ModelSchema) -> Result<(), String> {
+        let first = self
+            .layers
+            .first()
+            .ok_or_else(|| "символьная KAN не содержит слоёв".to_string())?;
+        let last = self.layers.last().unwrap();
+        if self
+            .layers
+            .windows(2)
+            .any(|pair| pair[0].n_outputs != pair[1].n_inputs)
+        {
+            return Err("несогласованные размерности слоёв символьной KAN".to_string());
+        }
+        schema.check_dims(first.n_inputs, last.n_outputs)
+    }
+
     /// Сворачивает нормализацию в коэффициенты: результат принимает СЫРЫЕ
     /// входы и выдаёт СЫРЫЕ выходы. Преобразование точное (не новый фит):
     /// вход слоя 0 `b·x_norm + c = (b/σ)·x_raw + (c − b·μ/σ)`; последний слой
@@ -377,16 +437,20 @@ impl SymbolicKan {
         SymbolicKan { layers }
     }
 
-    /// Послойные формулы: входы `x{i}`, промежуточные узлы `h{k}_{j}`,
-    /// выходы `y{o}`. Пространство — то, в котором живёт модель:
-    /// нормализованное после `symbolize`, исходное после `denormalize`.
-    pub fn formulas(&self) -> String {
+    /// Послойные формулы: входы и выходы названы по схеме, промежуточные узлы —
+    /// `h{k}_{j}`. Пространство — то, в котором живёт модель: нормализованное
+    /// после `symbolize`, исходное после `denormalize`.
+    ///
+    /// У модели без имён (старый checkpoint, чёрный ящик) схема синтетическая,
+    /// поэтому формулы выглядят как раньше: `x0`, `y0`.
+    pub fn formulas(&self, schema: &ModelSchema) -> Result<String, String> {
+        self.check_schema(schema)?;
         let mut out = String::new();
         for (k, layer) in self.layers.iter().enumerate() {
             let last = k + 1 == self.layers.len();
             for o in 0..layer.n_outputs {
                 let lhs = if last {
-                    format!("y{o}")
+                    output_var(schema, o)
                 } else {
                     format!("h{}_{o}", k + 1)
                 };
@@ -395,7 +459,7 @@ impl SymbolicKan {
                 let mut terms: Vec<String> = Vec::new();
                 for fit in layer.fits.iter().filter(|f| f.output == o) {
                     let var = if k == 0 {
-                        format!("x{}", fit.input)
+                        input_var(schema, fit.input)
                     } else {
                         format!("h{k}_{}", fit.input)
                     };
@@ -433,7 +497,38 @@ impl SymbolicKan {
                 out.push_str(&format!("{lhs} = {rhs}\n"));
             }
         }
-        out
+        Ok(out)
+    }
+
+    /// Человекочитаемые концы ребра: у первого/последнего слоя это колонки
+    /// схемы, внутри сети — промежуточные узлы `h{k}_{j}`.
+    pub fn edge_labels(
+        &self,
+        edge: &EdgeFit,
+        schema: &ModelSchema,
+    ) -> Result<(String, String), String> {
+        self.check_schema(schema)?;
+        let layer = self
+            .layers
+            .get(edge.layer)
+            .ok_or_else(|| format!("ребро ссылается на отсутствующий слой {}", edge.layer))?;
+        if edge.input >= layer.n_inputs || edge.output >= layer.n_outputs {
+            return Err(format!(
+                "ребро слоя {} имеет индексы {}→{} вне размерности {}→{}",
+                edge.layer, edge.input, edge.output, layer.n_inputs, layer.n_outputs
+            ));
+        }
+        let input = if edge.layer == 0 {
+            schema.inputs()[edge.input].display_name()
+        } else {
+            format!("h{}_{}", edge.layer, edge.input)
+        };
+        let output = if edge.layer + 1 == self.layers.len() {
+            schema.outputs()[edge.output].display_name()
+        } else {
+            format!("h{}_{}", edge.layer + 1, edge.output)
+        };
+        Ok((input, output))
     }
 
     /// Вычисление формул как модели: `[N, F]` (норм.) -> `[N, O]` (норм.).
@@ -568,7 +663,42 @@ mod tests {
                 n_outputs: 1,
             }],
         };
-        assert!(sym.formulas().contains("0.0001·x0"));
+        let synthetic = ModelSchema::synthetic(1, 1).unwrap();
+        assert!(sym.formulas(&synthetic).unwrap().contains("0.0001·x0"));
+
+        // Схема с именами подставляет их вместо x0/y0; имя со спецсимволами
+        // берётся в обратные кавычки.
+        let named = ModelSchema::new(
+            vec![crate::schema::Column::numeric(
+                "температура, °C",
+                crate::schema::ColumnRole::Input,
+            )
+            .unwrap()],
+            vec![
+                crate::schema::Column::numeric("moisture", crate::schema::ColumnRole::Output)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let text = sym.formulas(&named).unwrap();
+        assert!(text.starts_with("moisture = "), "формула: {text}");
+        assert!(text.contains("`температура, °C`"), "формула: {text}");
+        assert!(sym
+            .formulas(&ModelSchema::synthetic(2, 1).unwrap())
+            .is_err());
+
+        let (input, output) = sym.edge_labels(&sym.layers[0].fits[0], &named).unwrap();
+        assert_eq!(input, "температура, °C");
+        assert_eq!(output, "moisture");
+    }
+
+    #[test]
+    fn formula_variable_names_are_unambiguous() {
+        assert_eq!(var_name("temperature"), "temperature");
+        assert_eq!(var_name("_температура2"), "_температура2");
+        assert_eq!(var_name("2temperature"), "`2temperature`");
+        assert_eq!(var_name("h1_0"), "`h1_0`");
+        assert_eq!(var_name("a`b\n\\c\0"), "`a\\`b\\n\\\\c\\u{0}`");
     }
 
     /// Символьная копия воспроизводит обученную KAN: формулы — это модель.
@@ -594,7 +724,9 @@ mod tests {
         }
 
         let sym = symbolize(&net, &xn, 128);
-        let text = sym.formulas();
+        let text = sym
+            .formulas(&ModelSchema::synthetic(2, 1).unwrap())
+            .unwrap();
         assert!(text.starts_with("y0 = "), "формула: {text}");
 
         // Верность формул по отношению к самой KAN.

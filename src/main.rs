@@ -29,7 +29,7 @@ use transformer::numeric_model::{
     validate_numeric, KanConfig, ModelKind, NumericConfig, NumericModel,
 };
 use transformer::schema::ModelSchema;
-use transformer::serialize::{calibration_sample, load_numeric, save_numeric};
+use transformer::serialize::{calibration_sample, load_numeric, load_numeric_full, save_numeric};
 use transformer::split::{
     SplitPlan, DEFAULT_DATA_SEED, DEFAULT_FINAL_INIT_SEED, DEFAULT_SPLIT_SEED,
 };
@@ -416,6 +416,7 @@ fn run_kan_symbolic(
     eval: &NumericDataset,
     in_norm: &Normalizer,
     out_norm: &Normalizer,
+    schema: &ModelSchema,
 ) {
     let kan = model
         .as_kan()
@@ -426,7 +427,11 @@ fn run_kan_symbolic(
     let sym = symbolic::symbolize(kan, &calibration, 256).denormalize(in_norm, out_norm);
 
     println!("\n=== SYMBOLIC EXTRACTION (входы и выходы в исходных единицах данных) ===");
-    print!("{}", sym.formulas());
+    print!(
+        "{}",
+        sym.formulas(schema)
+            .unwrap_or_else(|e| fail(&format!("формулы KAN: {e}")))
+    );
 
     let (min_r2, mean_r2) = sym.edge_r2_stats();
     println!("Подгонка рёбер примитивами: min R² = {min_r2:.4}, среднее R² = {mean_r2:.4}");
@@ -434,9 +439,12 @@ fn run_kan_symbolic(
     if !weak.is_empty() {
         println!("Слабо подогнанные рёбра (R² < 0.99) – формула там приближённая:");
         for w in weak {
+            let (input, output) = sym
+                .edge_labels(w, schema)
+                .unwrap_or_else(|e| fail(&format!("слабое ребро KAN: {e}")));
             println!(
-                "  слой {}, вход {} -> выход {}: {} (R²={:.4})",
-                w.layer, w.input, w.output, w.name, w.r2
+                "  слой {}, {input} -> {output}: {} (R²={:.4})",
+                w.layer, w.name, w.r2
             );
         }
     }
@@ -554,8 +562,38 @@ fn print_config(nc: &NumericConfig, tcfg: &TrainConfig) {
     );
 }
 
-/// Печать метрик с явным указанием, откуда они взяты.
-fn print_metrics(title: &str, m: &Metrics, per: &[Metrics]) {
+/// MLP и KAN получают категориальный код как обычное число и неявно считают,
+/// что код 3 «между» 2 и 4. Embedding есть только у transformer, поэтому здесь
+/// предупреждение, а не тихое обучение на ложной геометрии.
+fn warn_categorical_without_embedding(nc: &NumericConfig, schema: &ModelSchema) {
+    if nc.kind == ModelKind::Transformer {
+        return;
+    }
+    let categorical: Vec<&str> = schema
+        .inputs()
+        .iter()
+        .filter(|c| c.cardinality().is_some())
+        .map(|c| c.name())
+        .collect();
+    if categorical.is_empty() {
+        return;
+    }
+    println!(
+        "ВНИМАНИЕ: категориальные входы ({}) в модели {} кодируются числами —\n\
+         \x20 порядок кодов будет воспринят как расстояние. Embedding категорий\n\
+         \x20 есть только у transformer.",
+        categorical.join(", "),
+        match nc.kind {
+            ModelKind::Mlp => "mlp",
+            ModelKind::Kan => "kan",
+            ModelKind::Transformer => unreachable!("проверено выше"),
+        }
+    );
+}
+
+/// Печать метрик с явным указанием, откуда они взяты. Выходы называются по
+/// схеме: у модели без имён это по-прежнему `y0`, `y1`, …
+fn print_metrics(title: &str, m: &Metrics, per: &[Metrics], schema: &ModelSchema) {
     println!("\n{title} (в исходных единицах):");
     println!("  RMSE        = {:.5}", m.rmse);
     println!("  MAE         = {:.5}", m.mae);
@@ -563,11 +601,25 @@ fn print_metrics(title: &str, m: &Metrics, per: &[Metrics]) {
     println!("  R²          = {:.5}", m.r2);
 
     if per.len() > 1 {
+        let names: Vec<String> = schema.outputs().iter().map(|c| c.display_name()).collect();
+        let width = names
+            .iter()
+            .map(|n| n.chars().count())
+            .max()
+            .unwrap_or(4)
+            .max(4);
         println!("\nПо выходам:");
-        println!("  out   RMSE        MAE       rel.err     R²");
+        println!(
+            "  {:<width$}  RMSE        MAE       rel.err     R²",
+            "выход"
+        );
         for (j, pm) in per.iter().enumerate() {
+            let name = names.get(j).cloned().unwrap_or_else(|| format!("y{j}"));
+            // Ширина считается в символах: у кириллицы и °C байт больше.
+            let pad = width.saturating_sub(name.chars().count());
             println!(
-                "  y{j:<3} {:>9.5}  {:>9.5}  {:>7.2}%  {:>8.5}",
+                "  {name}{:pad$}  {:>9.5}  {:>9.5}  {:>7.2}%  {:>8.5}",
+                "",
                 pm.rmse,
                 pm.mae,
                 pm.rel_error * 100.0,
@@ -639,6 +691,7 @@ fn run_numeric_flow(
     );
 
     print_config(&nc, &tcfg);
+    warn_categorical_without_embedding(&nc, &schema);
     let sparsity = kan_sparsity_from(f, &nc).unwrap_or_else(|e| fail(&e));
     validate_kan_symbolic(f, &nc).unwrap_or_else(|e| fail(&e));
 
@@ -653,6 +706,7 @@ fn run_numeric_flow(
         "Метрики на validation",
         &evaluate(&pred, &val.outputs),
         &evaluate_per_output(&pred, &val.outputs),
+        &schema,
     );
     if let Some(threshold) = sparsity.as_ref().and_then(|s| s.prune) {
         let ft = sparsity.as_ref().map_or(10, |s| s.finetune_epochs);
@@ -713,7 +767,7 @@ fn run_numeric_flow(
         run_kan_compact(&mut model, None, &fin_in_norm, &fin_out_norm);
     }
     if f.has("kan-symbolic") {
-        run_kan_symbolic(&model, &pool, &pool, &fin_in_norm, &fin_out_norm);
+        run_kan_symbolic(&model, &pool, &pool, &fin_in_norm, &fin_out_norm, &schema);
     }
 
     let final_eval = prepared
@@ -734,6 +788,7 @@ fn run_numeric_flow(
         ),
         &final_eval.metrics,
         &final_eval.per_output,
+        &schema,
     );
 
     if let Some(path) = save_path {
@@ -917,45 +972,88 @@ fn run_predict(args: &[String]) {
             std::process::exit(1);
         }
     };
-    let mut values = Vec::new();
-    for s in &args[3..] {
-        match s.parse::<f32>() {
-            Ok(v) => values.push(v),
-            Err(_) => fail(&format!("вход '{s}' не является числом")),
-        }
-    }
-    if values.is_empty() {
+    let raw_args = &args[3..];
+    if raw_args.is_empty() {
         fail("укажите входные значения: transformer predict model.bin v1 v2 ...");
     }
 
-    let (model, in_norm, out_norm) = match load_numeric(path) {
-        Ok(t) => t,
+    let checkpoint = match load_numeric_full(path) {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("Не удалось загрузить {path}: {e}");
             std::process::exit(1);
         }
     };
+    let schema = &checkpoint.schema;
+    warn_categorical_without_embedding(&checkpoint.config, schema);
 
-    if values.len() != in_norm.n_features() {
+    if raw_args.len() != schema.n_inputs() {
         fail(&format!(
-            "модель ожидает {} входов, получено {}",
-            in_norm.n_features(),
-            values.len()
+            "модель ожидает {} входов ({}), получено {}",
+            schema.n_inputs(),
+            schema
+                .input_names()
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            raw_args.len()
         ));
+    }
+
+    // Категориальный вход задаётся ПОДПИСЬЮ уровня, а не кодом: у старых
+    // моделей подписи и есть коды («0», «1»), поэтому прежние команды работают.
+    let mut values = Vec::with_capacity(raw_args.len());
+    for (i, arg) in raw_args.iter().enumerate() {
+        let column = &schema.inputs()[i];
+        let value = match column.cardinality() {
+            Some(_) => column.category_code(arg).unwrap_or_else(|e| fail(&e)) as f32,
+            None => {
+                let value = arg.parse::<f32>().unwrap_or_else(|_| {
+                    fail(&format!(
+                        "вход '{}' = '{arg}': ожидалось число",
+                        column.name()
+                    ))
+                });
+                if !value.is_finite() {
+                    fail(&format!(
+                        "вход '{}' = '{arg}': число должно быть конечным",
+                        column.name()
+                    ));
+                }
+                value
+            }
+        };
+        values.push(value);
     }
 
     let f = values.len();
     let raw = Array2::from_shape_vec((1, f), values.clone()).unwrap();
-    let x = Tensor::constant(in_norm.transform(&raw).into_dyn());
-    let pred_norm = model
+    let x = Tensor::constant(checkpoint.in_norm.transform(&raw).into_dyn());
+    let pred_norm = checkpoint
+        .model
         .predict(&x)
         .data()
         .into_dimensionality::<Ix2>()
         .expect("predict возвращает [1, O]");
-    let pred = out_norm.inverse_transform(&pred_norm);
+    let pred = checkpoint.out_norm.inverse_transform(&pred_norm);
 
-    println!("Вход:  {values:?}");
-    println!("Выход: {:?}", pred.row(0).to_vec());
+    println!("Вход:");
+    for (i, column) in schema.inputs().iter().enumerate() {
+        match column.cardinality() {
+            Some(_) => println!(
+                "  {} = {} (код {})",
+                column.display_name(),
+                raw_args[i],
+                values[i] as usize
+            ),
+            None => println!("  {} = {}", column.display_name(), values[i]),
+        }
+    }
+    println!("Выход:");
+    for (j, column) in schema.outputs().iter().enumerate() {
+        println!("  {} = {}", column.display_name(), pred[[0, j]]);
+    }
 }
 
 // --- epoch-sweep (свип по эпохам), CLI-only ---

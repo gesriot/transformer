@@ -138,8 +138,8 @@ fn worker_loop(
                 match train_numeric(&source, &nc, &tcfg, &evt_tx, &ctx, &cancel) {
                     Ok(Some(loaded)) => {
                         let _ = evt_tx.send(Event::ModelReady {
-                            n_inputs: loaded.n_inputs,
-                            n_outputs: loaded.n_outputs,
+                            schema: loaded.schema.clone(),
+                            kind: loaded.nc.kind,
                             source: source_desc(&source),
                             parameter_count: loaded.model.parameter_count(),
                             kan: kan_model_info(
@@ -161,8 +161,8 @@ fn worker_loop(
                 match load_model(&path) {
                     Ok(loaded) => {
                         let _ = evt_tx.send(Event::ModelReady {
-                            n_inputs: loaded.n_inputs,
-                            n_outputs: loaded.n_outputs,
+                            schema: loaded.schema.clone(),
+                            kind: loaded.nc.kind,
                             source: format!("файл: {path}"),
                             parameter_count: loaded.model.parameter_count(),
                             kan: kan_model_info(
@@ -489,14 +489,17 @@ fn extract_kan_symbolic(loaded: &Loaded) -> Result<KanSymbolicInfo, String> {
     let weak_edges = symbolic
         .weak_edges(0.99)
         .into_iter()
-        .map(|edge| KanWeakEdge {
-            layer: edge.layer,
-            input: edge.input,
-            output: edge.output,
-            primitive: edge.name.to_string(),
-            r2: edge.r2,
+        .map(|edge| {
+            let (input, output) = symbolic.edge_labels(edge, &loaded.schema)?;
+            Ok(KanWeakEdge {
+                layer: edge.layer,
+                input,
+                output,
+                primitive: edge.name.to_string(),
+                r2: edge.r2,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
     // Метрики формул есть только у модели, обученной в этой сессии, и считаются
     // на validation: test не открывается.
     let (formula_metrics, kan_r2) = match &loaded.diag {
@@ -512,7 +515,7 @@ fn extract_kan_symbolic(loaded: &Loaded) -> Result<KanSymbolicInfo, String> {
         None => (None, None),
     };
     Ok(KanSymbolicInfo {
-        formulas: symbolic.formulas(),
+        formulas: symbolic.formulas(&loaded.schema)?,
         min_edge_r2,
         mean_edge_r2,
         formula_metrics,

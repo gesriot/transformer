@@ -11,6 +11,7 @@ use crate::encoders::{ValueEncoderConfig, ValueEncoderKind};
 use crate::epoch_sweep::{self, EpochRow};
 use crate::metrics::Metrics;
 use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
+use crate::schema::{ColumnType, ModelSchema};
 use crate::sweep::{self, SweepAxes, SweepChoice, SweepObjective, SweepRow};
 use crate::tnum::{infer_prepare_spec_from_path, parse_categorical, Delimiter, PrepareSpec};
 use crate::train::{validate_train, LrSchedule, TextTrainConfig, TrainConfig};
@@ -730,6 +731,42 @@ fn objective_display_score(objective: SweepObjective, row: &SweepRow) -> f32 {
     }
 }
 
+/// Активная модель глазами UI. Схема — источник истины про число входов и
+/// выходов и про их имена, поэтому отдельных счётчиков рядом нет.
+#[derive(Clone)]
+struct ModelInfo {
+    schema: ModelSchema,
+    kind: ModelKind,
+    source: String,
+    parameter_count: usize,
+}
+
+impl ModelInfo {
+    /// MLP и KAN получают код категории как обычное число и воспринимают
+    /// порядок кодов как расстояние. Embedding категорий есть только у
+    /// transformer, поэтому здесь предупреждение, а не молчание.
+    fn categorical_warning(&self) -> Option<String> {
+        if self.kind == ModelKind::Transformer {
+            return None;
+        }
+        let names: Vec<&str> = self
+            .schema
+            .inputs()
+            .iter()
+            .filter(|c| c.cardinality().is_some())
+            .map(|c| c.name())
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "⚠ категориальные входы ({}) кодируются числами: порядок кодов будет \
+             воспринят как расстояние. Embedding категорий есть только у transformer.",
+            names.join(", ")
+        ))
+    }
+}
+
 pub struct App {
     worker: Worker,
     tab: Tab,
@@ -741,7 +778,7 @@ pub struct App {
     metrics: Option<Metrics>,
     train_parameter_count: Option<usize>,
     // Predict (UI-M5)
-    model_info: Option<(usize, usize, String, usize)>, // n_inputs, n_outputs, source, params
+    model_info: Option<ModelInfo>,
     predict_inputs: Vec<f32>,
     predict_outputs: Option<Vec<f32>>,
     extrapolation: Vec<OutOfRange>,
@@ -875,13 +912,19 @@ impl App {
                     }
                 }
                 Event::ModelReady {
-                    n_inputs,
-                    n_outputs,
+                    schema,
+                    kind,
                     source,
                     parameter_count,
                     kan,
                 } => {
-                    self.model_info = Some((n_inputs, n_outputs, source, parameter_count));
+                    let n_inputs = schema.n_inputs();
+                    self.model_info = Some(ModelInfo {
+                        schema,
+                        kind,
+                        source,
+                        parameter_count,
+                    });
                     self.predict_inputs = vec![0.0; n_inputs];
                     self.predict_outputs = None;
                     self.extrapolation.clear();
@@ -1501,6 +1544,13 @@ impl App {
             ));
             ui.label("Test отложен и в этой сессии не открывается.");
         }
+        if let Some(warning) = self
+            .model_info
+            .as_ref()
+            .and_then(ModelInfo::categorical_warning)
+        {
+            ui.colored_label(egui::Color32::from_rgb(200, 120, 0), warning);
+        }
     }
 
     fn ui_predict(&mut self, ui: &mut egui::Ui) {
@@ -1520,17 +1570,42 @@ impl App {
             None => {
                 ui.label("Обучите модель (вкладка Train) или загрузите .bin.");
             }
-            Some((n_in, n_out, source, parameter_count)) => {
+            Some(info) => {
+                let (n_in, n_out) = (info.schema.n_inputs(), info.schema.n_outputs());
+                let (source, parameter_count) = (&info.source, info.parameter_count);
                 ui.label(format!(
                     "Модель: {source} ({n_in} вход → {n_out} выход, {parameter_count} параметров)"
                 ));
+                if let Some(warning) = info.categorical_warning() {
+                    ui.colored_label(egui::Color32::from_rgb(200, 120, 0), warning);
+                }
                 ui.separator();
                 egui::Grid::new("predict_inputs")
                     .num_columns(2)
                     .show(ui, |ui| {
                         for (i, v) in self.predict_inputs.iter_mut().enumerate() {
-                            ui.label(format!("x{i}"));
-                            ui.add(egui::DragValue::new(v).speed(0.05));
+                            let column = &info.schema.inputs()[i];
+                            ui.label(column.display_name());
+                            match column.ty() {
+                                // Категория выбирается подписью: набрать код
+                                // вручную нельзя, поэтому неизвестный уровень
+                                // не может попасть в модель.
+                                ColumnType::Categorical { levels } => {
+                                    let code = (*v as usize).min(levels.len().saturating_sub(1));
+                                    egui::ComboBox::from_id_salt(format!("cat_{i}"))
+                                        .selected_text(&levels[code])
+                                        .show_ui(ui, |ui| {
+                                            for (c, level) in levels.iter().enumerate() {
+                                                if ui.selectable_label(c == code, level).clicked() {
+                                                    *v = c as f32;
+                                                }
+                                            }
+                                        });
+                                }
+                                ColumnType::Numeric => {
+                                    ui.add(egui::DragValue::new(v).speed(0.05));
+                                }
+                            }
                             ui.end_row();
                         }
                     });
@@ -1545,7 +1620,10 @@ impl App {
                 if let Some(out) = &self.predict_outputs {
                     ui.separator();
                     for (i, v) in out.iter().enumerate() {
-                        ui.label(format!("y{i} = {v:.6}"));
+                        ui.label(format!(
+                            "{} = {v:.6}",
+                            info.schema.outputs()[i].display_name()
+                        ));
                     }
                 }
                 if !self.extrapolation.is_empty() {
@@ -1556,8 +1634,11 @@ impl App {
                         ui.colored_label(
                             warn,
                             format!(
-                                "признак {} = {} вне [{}, {}]",
-                                e.feature, e.value, e.min, e.max
+                                "{} = {} вне [{}, {}]",
+                                info.schema.inputs()[e.feature].display_name(),
+                                e.value,
+                                e.min,
+                                e.max
                             ),
                         );
                     }
@@ -1770,8 +1851,8 @@ impl App {
                 ui.end_row();
                 for edge in &result.weak_edges {
                     ui.label(edge.layer.to_string());
-                    ui.label(edge.input.to_string());
-                    ui.label(edge.output.to_string());
+                    ui.label(&edge.input);
+                    ui.label(&edge.output);
                     ui.label(&edge.primitive);
                     ui.label(format!("{:.4}", edge.r2));
                     ui.end_row();
