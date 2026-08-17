@@ -1,10 +1,10 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-//! CLI: обучение surrogate-модели на чёрном ящике / .tnum файле, либо char-LM.
+//! CLI: обучение surrogate-модели на чёрном ящике / числовой таблице, либо char-LM.
 //!
 //! Использование:
 //!   transformer numeric <blackbox> [--epochs N] [--model out.bin] [конфиг-флаги]
-//!   transformer numeric-file <file.tnum> [--epochs N] [--model out.bin] [флаги]
+//!   transformer numeric-file <data> [--epochs N] [--model out.bin] [флаги]
 //!   transformer text <file.txt> [steps]
 //!   transformer predict <model.bin> <v1> <v2> ...
 //!
@@ -18,7 +18,7 @@ use rand::SeedableRng;
 use std::collections::HashMap;
 use transformer::blackbox;
 use transformer::config::ModelConfig;
-use transformer::data::{read_numeric_tnum, Normalizer, NumericDataset, TextDataset};
+use transformer::data::{Normalizer, NumericDataset, TextDataset};
 use transformer::diagnostics;
 use transformer::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
 use transformer::epoch_sweep;
@@ -38,7 +38,8 @@ use transformer::symbolic;
 use transformer::tensor::Tensor;
 use transformer::textmodel::TextModel;
 use transformer::tnum::{
-    infer_prepare_spec_from_path, parse_categorical, table_path_to_tnum, Delimiter, PrepareSpec,
+    infer_prepare_spec_from_path, parse_categorical, read_numeric_source, table_path_to_tnum,
+    Delimiter, PrepareSpec,
 };
 use transformer::train::{
     evaluate_surrogate, fit_normalizers, predict_dataset, train_surrogate, train_text,
@@ -503,11 +504,11 @@ fn print_usage() {
     eprintln!("  transformer                 без аргументов — GUI (основной режим)");
     eprintln!("  transformer gui             явный запуск GUI");
     eprintln!("  transformer numeric <blackbox> [--epochs N] [--model out.bin] [флаги]");
-    eprintln!("  transformer numeric-file <file.tnum> [--epochs N] [--model out.bin] [флаги]");
+    eprintln!("  transformer numeric-file <data> [--epochs N] [--model out.bin] [флаги]");
     eprintln!("  transformer sweep <blackbox> [--model-kinds transformer,mlp,kan]");
     eprintln!("                    [--d-models 32,64 --layers-list 2,3 --mlp-widths 128]");
     eprintln!("                    [--kan-widths 16,32 --kan-layers-list 2 --kan-grids 8,16]");
-    eprintln!("  transformer epoch-sweep <data.tnum> [--epochs 1,2,5,10,20,40] [конфиг-флаги]");
+    eprintln!("  transformer epoch-sweep <data> [--epochs 1,2,5,10,20,40] [конфиг-флаги]");
     eprintln!(
         "  transformer prepare <input> <out.tnum> --inputs N --outputs M [--has-header] [--categorical 9:4]"
     );
@@ -838,12 +839,12 @@ fn run_numeric_file(args: &[String]) {
     let path = match f.pos(0) {
         Some(p) => p,
         None => {
-            eprintln!("Укажите путь к .tnum файлу");
+            eprintln!("Укажите путь к .tnum, XLSX, CSV или TSV файлу");
             std::process::exit(1);
         }
     };
 
-    let (data, schema) = match read_numeric_tnum(path) {
+    let (data, schema) = match read_numeric_source(path) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Не удалось прочитать {path}: {e}");
@@ -960,7 +961,7 @@ fn run_diagnostics(
                 }
             );
         }
-        None => println!("Чувствительность: пропущена (нет вызываемого ящика для .tnum)"),
+        None => println!("Чувствительность: пропущена (нет вызываемого чёрного ящика)"),
     }
 }
 
@@ -1095,9 +1096,8 @@ fn run_epoch_sweep_cmd(args: &[String]) {
 
     let path = f
         .pos(0)
-        .unwrap_or_else(|| fail("укажите .tnum: epoch-sweep <data.tnum>"));
-    let (data, schema) =
-        read_numeric_tnum(path).unwrap_or_else(|e| fail(&format!("чтение {path}: {e}")));
+        .unwrap_or_else(|| fail("укажите данные: epoch-sweep <data>"));
+    let (data, schema) = read_numeric_source(path).unwrap_or_else(|e| fail(&e));
     let specs = schema.feature_specs();
     let n_out = data.outputs.ncols();
 

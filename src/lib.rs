@@ -25,6 +25,7 @@ pub mod split;
 pub mod surrogate;
 pub mod sweep;
 pub mod symbolic;
+pub mod table;
 pub mod tensor;
 pub mod textmodel;
 pub mod tnum;

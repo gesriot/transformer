@@ -138,6 +138,7 @@ impl Normalizer {
 }
 
 /// Числовой датасет: сырые (ненормализованные) пары вход/выход.
+#[derive(Debug)]
 pub struct NumericDataset {
     pub inputs: Array2<f32>,
     pub outputs: Array2<f32>,

@@ -11,7 +11,7 @@ use super::messages::{
 use crate::batch_predict::{read_prediction_xlsx, write_prediction_xlsx};
 use crate::blackbox;
 use crate::config::ModelConfig;
-use crate::data::{read_numeric_tnum, Normalizer, NumericDataset, OutOfRange, TextDataset};
+use crate::data::{Normalizer, NumericDataset, OutOfRange, TextDataset};
 use crate::encoders::FeatureSpec;
 use crate::epoch_sweep::{self, EpochRow};
 use crate::generate::generate;
@@ -25,7 +25,7 @@ use crate::sweep::{self, SweepAxes, SweepObjective};
 use crate::symbolic;
 use crate::tensor::Tensor;
 use crate::textmodel::TextModel;
-use crate::tnum::{table_path_to_tnum, PrepareSpec};
+use crate::tnum::{read_numeric_source, table_path_to_tnum, PrepareSpec};
 use crate::train::{
     evaluate_surrogate, fit_normalizers, predict_dataset, train_surrogate_cb, train_text_cb,
     validate_train, TextTrainConfig, TrainConfig,
@@ -667,7 +667,7 @@ fn run_optimize_file(
     ctx: &egui::Context,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    let (data, schema) = read_numeric_tnum(path).map_err(|e| format!("чтение {path}: {e}"))?;
+    let (data, schema) = read_numeric_source(path)?;
     let specs = schema.feature_specs();
     let prepared = SplitPlan::default().prepare(&data)?;
     let (total_configs, total_runs) = sweep::sweep_size(axes)?;
@@ -861,7 +861,7 @@ fn run_epoch_sweep(
         return Err("plateau-min-r2 должен быть конечным".to_string());
     }
 
-    let (data, schema) = read_numeric_tnum(path).map_err(|e| format!("чтение {path}: {e}"))?;
+    let (data, schema) = read_numeric_source(path)?;
     let specs = schema.feature_specs();
     let n_out = data.outputs.ncols();
     let prepared = SplitPlan::default().prepare(&data)?;
@@ -921,9 +921,7 @@ fn train_numeric(
                 ModelSchema::synthetic(bb.n_inputs(), bb.n_outputs)?,
             )
         }
-        DataSource::File(path) => {
-            read_numeric_tnum(path).map_err(|e| format!("чтение {path}: {e}"))?
-        }
+        DataSource::File(path) => read_numeric_source(path)?,
     };
     let in_specs = schema.feature_specs();
     let n_inputs = data.inputs.ncols();

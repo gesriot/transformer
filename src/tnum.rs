@@ -1,25 +1,18 @@
-//! Конвертер числовой таблицы (CSV/TSV/space/XLSX) в формат `.tnum` (TRNUM2).
-//! Нативный порт `tools/prepare_numeric_dataset.py`.
+//! Конвертер числовой таблицы в формат `.tnum` (TRNUM2) и эвристика разметки.
 //!
-//! Логика и валидация совпадают с Python-версией; формат уже читается
-//! `data::read_numeric_tnum`. Числа пишутся в кратчайшем round-trip
-//! представлении f32 (не байт-в-байт с `.9g` Python, но f32-эквивалентно).
+//! Чтение файлов живёт в [`crate::table`]; здесь остаётся только то, что
+//! ИНТЕРПРЕТИРУЕТ таблицу: где входы, где выходы, какие колонки категориальные.
+//! Сама конвертация — это `Table + TableSchema -> NumericDataset -> TRNUM2`,
+//! то есть тот же путь, которым таблицу открывает обучение.
 
-use crate::data::{write_numeric_tnum, NumericDataset};
-use crate::encoders::FeatureSpec;
-use crate::schema::{Column, ColumnRole, ModelSchema};
-use calamine::{open_workbook_auto, Data, Reader};
-use ndarray::Array2;
+use crate::data::{read_numeric_tnum, write_numeric_tnum, NumericDataset};
+use crate::schema::{Column, ColumnRole, ModelSchema, TableSchema};
+use crate::table::Table;
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Delimiter {
-    Auto,
-    Comma,
-    Tab,
-    Space,
-}
+pub use crate::table::Delimiter;
 
 pub struct PrepareSpec {
     pub n_inputs: usize,
@@ -69,131 +62,6 @@ pub fn parse_categorical(spec: &str, n_inputs: usize) -> Result<Vec<(usize, usiz
         out.push((idx, card));
     }
     Ok(out)
-}
-
-fn clean_lines(input: &str) -> Vec<&str> {
-    input
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or("").trim())
-        .filter(|l| !l.is_empty())
-        .collect()
-}
-
-fn detect_delim(line: &str, mode: Delimiter) -> Option<char> {
-    match mode {
-        Delimiter::Comma => Some(','),
-        Delimiter::Tab => Some('\t'),
-        Delimiter::Space => None,
-        Delimiter::Auto => {
-            if line.contains(',') {
-                Some(',')
-            } else if line.contains('\t') {
-                Some('\t')
-            } else {
-                None
-            }
-        }
-    }
-}
-
-fn split_line(line: &str, delim: Option<char>) -> Vec<&str> {
-    match delim {
-        Some(d) => line
-            .split(d)
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .collect(),
-        None => line.split_whitespace().collect(),
-    }
-}
-
-fn split_line_owned(line: &str, delim: Option<char>) -> Vec<String> {
-    split_line(line, delim)
-        .into_iter()
-        .map(str::to_string)
-        .collect()
-}
-
-fn text_to_rows(input: &str, mode: Delimiter) -> Result<Vec<Vec<String>>, String> {
-    let lines = clean_lines(input);
-    if lines.is_empty() {
-        return Err("нет строк данных".to_string());
-    }
-    let delim = detect_delim(lines[0], mode);
-    Ok(lines
-        .into_iter()
-        .map(|line| split_line_owned(line, delim))
-        .collect())
-}
-
-fn cell_to_token(cell: &Data, row: usize, col: usize) -> Result<String, String> {
-    match cell {
-        Data::Empty => Ok(String::new()),
-        Data::String(s) => Ok(s.trim().to_string()),
-        Data::Float(v) => {
-            if v.is_finite() {
-                Ok(format!("{v}"))
-            } else {
-                Err(format!("строка {row}, колонка {col}: значение не конечно"))
-            }
-        }
-        Data::Int(v) => Ok(v.to_string()),
-        Data::Bool(v) => Ok(if *v { "1".to_string() } else { "0".to_string() }),
-        Data::DateTime(_) | Data::DateTimeIso(_) | Data::DurationIso(_) => Err(format!(
-            "строка {row}, колонка {col}: даты/время в .xlsx не поддерживаются как числовые данные"
-        )),
-        Data::Error(e) => Err(format!("строка {row}, колонка {col}: ошибка Excel {e}")),
-    }
-}
-
-fn xlsx_to_rows(path: &Path) -> Result<Vec<Vec<String>>, String> {
-    let mut workbook =
-        open_workbook_auto(path).map_err(|e| format!("чтение {}: {e}", path.display()))?;
-    let sheet = workbook
-        .sheet_names()
-        .first()
-        .cloned()
-        .ok_or_else(|| format!("{}: workbook без листов", path.display()))?;
-    let range = workbook
-        .worksheet_range(&sheet)
-        .map_err(|e| format!("чтение листа '{sheet}': {e}"))?;
-
-    let mut rows = Vec::new();
-    for (r, row) in range.rows().enumerate() {
-        let mut toks = row
-            .iter()
-            .enumerate()
-            .map(|(c, cell)| cell_to_token(cell, r, c))
-            .collect::<Result<Vec<_>, _>>()?;
-        while toks.last().is_some_and(|t| t.trim().is_empty()) {
-            toks.pop();
-        }
-        if toks.iter().any(|t| !t.trim().is_empty()) {
-            rows.push(toks);
-        }
-    }
-    if rows.is_empty() {
-        return Err(format!("{}: нет строк данных", path.display()));
-    }
-    Ok(rows)
-}
-
-fn rows_from_path(path: &Path, delimiter: Delimiter) -> Result<Vec<Vec<String>>, String> {
-    match path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("xlsx") | Some("xlsm") | Some("xlsb") | Some("xls") | Some("ods") => {
-            xlsx_to_rows(path)
-        }
-        _ => {
-            let text = std::fs::read_to_string(path)
-                .map_err(|e| format!("чтение {}: {e}", path.display()))?;
-            text_to_rows(&text, delimiter)
-        }
-    }
 }
 
 fn is_finite_number(token: &str) -> bool {
@@ -291,34 +159,38 @@ fn infer_prepare_spec_from_rows(
     })
 }
 
+fn infer_prepare_spec_from_table(
+    table: &Table,
+    delimiter: Delimiter,
+) -> Result<InferredPrepareSpec, String> {
+    infer_prepare_spec_from_rows(table.rows(), delimiter)
+}
+
 pub fn infer_prepare_spec_from_text(
     input: &str,
     delimiter: Delimiter,
 ) -> Result<InferredPrepareSpec, String> {
-    let rows = text_to_rows(input, delimiter)?;
-    infer_prepare_spec_from_rows(&rows, delimiter)
+    // Заголовок ищет сама эвристика, поэтому таблица читается как «без
+    // заголовка»: иначе первая строка ушла бы из выборки до анализа.
+    let table = Table::parse_text(input, delimiter, false)?;
+    infer_prepare_spec_from_table(&table, delimiter)
 }
 
 pub fn infer_prepare_spec_from_path(
     path: impl AsRef<Path>,
     delimiter: Delimiter,
 ) -> Result<InferredPrepareSpec, String> {
-    let path = path.as_ref();
-    let rows = rows_from_path(path, delimiter)?;
-    infer_prepare_spec_from_rows(&rows, delimiter)
+    let table = Table::read_path(path, delimiter, false)?;
+    infer_prepare_spec_from_table(&table, delimiter)
 }
 
-/// Конвертирует таблицу в строку формата `.tnum`. Валидирует число колонок,
-/// конечность значений и категориальные коды (целочисленность + диапазон).
-pub fn table_to_tnum(input: &str, spec: &PrepareSpec) -> Result<String, String> {
-    rows_to_tnum(text_to_rows(input, spec.delimiter)?, spec)
-}
-
-pub fn table_path_to_tnum(path: impl AsRef<Path>, spec: &PrepareSpec) -> Result<String, String> {
-    rows_to_tnum(rows_from_path(path.as_ref(), spec.delimiter)?, spec)
-}
-
-fn rows_to_tnum(mut lines: Vec<Vec<String>>, spec: &PrepareSpec) -> Result<String, String> {
+/// Разметка колонок по [`PrepareSpec`]: первые `n_inputs` колонок — входы,
+/// остальные — выходы. Имена берутся из заголовка таблицы, а у категорий
+/// подписями служат сами коды: настоящих подписей `PrepareSpec` не знает.
+pub fn table_schema_from_prepare_spec(
+    table: &Table,
+    spec: &PrepareSpec,
+) -> Result<TableSchema, String> {
     if spec.n_inputs == 0 || spec.n_outputs == 0 {
         return Err("inputs и outputs должны быть > 0".to_string());
     }
@@ -333,100 +205,123 @@ fn rows_to_tnum(mut lines: Vec<Vec<String>>, spec: &PrepareSpec) -> Result<Strin
             return Err("cardinality должна быть > 0".to_string());
         }
     }
-
-    if lines.is_empty() {
-        return Err("нет строк данных".to_string());
-    }
     let expected = spec.n_inputs + spec.n_outputs;
-    let header = if spec.has_header {
-        let header = lines.remove(0);
-        if header.len() != expected {
-            return Err(format!(
-                "заголовок: ожидалось {expected} колонок ({} вход + {} выход), получено {}",
-                spec.n_inputs,
-                spec.n_outputs,
-                header.len()
-            ));
-        }
-        Some(header)
-    } else {
-        None
-    };
-    if lines.is_empty() {
-        return Err("нет строк данных после заголовка".to_string());
+    if table.n_columns() != expected {
+        return Err(format!(
+            "{}: ожидалось {expected} колонок ({} вход + {} выход), получено {}",
+            table.source(),
+            spec.n_inputs,
+            spec.n_outputs,
+            table.n_columns()
+        ));
     }
 
-    let mut rows: Vec<Vec<f32>> = Vec::with_capacity(lines.len());
-    for (r, line) in lines.iter().enumerate() {
-        if line.len() != expected {
-            return Err(format!(
-                "строка {r}: ожидалось {expected} колонок ({} вход + {} выход), получено {}",
-                spec.n_inputs,
-                spec.n_outputs,
-                line.len()
-            ));
-        }
-        let mut row = Vec::with_capacity(expected);
-        for (c, t) in line.iter().enumerate() {
-            let v: f32 = t
-                .parse()
-                .map_err(|_| format!("строка {r}, колонка {c}: не число: '{t}'"))?;
-            if !v.is_finite() {
-                return Err(format!(
-                    "строка {r}, колонка {c}: значение не конечно: '{t}'"
-                ));
-            }
-            row.push(v);
-        }
-        rows.push(row);
-    }
-
-    // PrepareSpec пока знает только cardinality, поэтому уровни категорий —
-    // честные коды «0…n-1». Имена уже есть в заголовке таблицы: терять их при
-    // переходе на TRNUM2 незачем. Без заголовка используем synthetic fallback.
     let cat_map: HashMap<usize, usize> = spec.categorical.iter().copied().collect();
-    let feature_specs: Vec<FeatureSpec> = (0..spec.n_inputs)
-        .map(|i| match cat_map.get(&i) {
-            Some(&cardinality) => FeatureSpec::Categorical { cardinality },
-            None => FeatureSpec::Continuous,
-        })
-        .collect();
-    let schema = match header {
-        Some(names) => {
-            let mut inputs = Vec::with_capacity(spec.n_inputs);
-            for (i, feature_spec) in feature_specs.iter().enumerate() {
-                let column = match feature_spec {
-                    FeatureSpec::Continuous => Column::numeric(&names[i], ColumnRole::Input),
-                    FeatureSpec::Categorical { cardinality } => Column::categorical(
-                        &names[i],
-                        ColumnRole::Input,
-                        (0..*cardinality).map(|code| code.to_string()).collect(),
-                    ),
-                }?;
-                inputs.push(column);
-            }
-            let outputs = names[spec.n_inputs..]
-                .iter()
-                .map(|name| Column::numeric(name, ColumnRole::Output))
-                .collect::<Result<Vec<_>, _>>()?;
-            ModelSchema::new(inputs, outputs)?
-        }
-        None => ModelSchema::synthetic_from_specs(&feature_specs, spec.n_outputs)?,
-    };
-
-    let mut inputs = Array2::<f32>::zeros((rows.len(), spec.n_inputs));
-    let mut outputs = Array2::<f32>::zeros((rows.len(), spec.n_outputs));
-    for (r, row) in rows.iter().enumerate() {
-        for (c, &v) in row.iter().take(spec.n_inputs).enumerate() {
-            inputs[[r, c]] = v;
-        }
-        for (c, &v) in row.iter().skip(spec.n_inputs).enumerate() {
-            outputs[[r, c]] = v;
-        }
+    let mut columns = Vec::with_capacity(expected);
+    for i in 0..expected {
+        let name = match table.header() {
+            Some(header) => header[i].clone(),
+            None if i < spec.n_inputs => format!("x{i}"),
+            None => format!("y{}", i - spec.n_inputs),
+        };
+        let role = if i < spec.n_inputs {
+            ColumnRole::Input
+        } else {
+            ColumnRole::Output
+        };
+        columns.push(match cat_map.get(&i) {
+            Some(&cardinality) => Column::categorical(
+                name,
+                role,
+                (0..cardinality).map(|code| code.to_string()).collect(),
+            )?,
+            None => Column::numeric(name, role)?,
+        });
     }
-    // Коды категорий проверяет writer — он единственное место, где формат
-    // создаётся.
-    write_numeric_tnum(&schema, &NumericDataset::new(inputs, outputs))
+    TableSchema::new(columns)
+}
+
+/// Открыть источник данных: `.tnum` читается как есть, любая другая таблица
+/// размечается эвристикой и превращается в датасет напрямую — без промежуточной
+/// строки TRNUM2.
+///
+/// Эвристика та же, что у `prepare`: заголовок вида `x…/y…`. Если её не хватает,
+/// ошибка отправляет к `prepare`, где разметка задаётся флагами.
+pub fn read_numeric_source(path: &str) -> Result<(NumericDataset, ModelSchema), String> {
+    let source_path = Path::new(path);
+    if is_tnum_source(source_path)? {
+        return read_numeric_tnum(path).map_err(|e| format!("чтение {path}: {e}"));
+    }
+    // Читаем таблицу один раз: иначе файл мог измениться между распознаванием
+    // заголовка и конвертацией, а Excel пришлось бы разбирать дважды.
+    let table = Table::read_path(source_path, Delimiter::Auto, false)?;
+    let inferred = infer_prepare_spec_from_table(&table, Delimiter::Auto).map_err(|e| {
+        format!(
+            "{path}: {e}\n\
+             Подготовьте файл явно: transformer prepare {path} data.tnum --inputs N --outputs M"
+        )
+    })?;
+    let spec = PrepareSpec {
+        n_inputs: inferred.n_inputs,
+        n_outputs: inferred.n_outputs,
+        delimiter: inferred.delimiter,
+        has_header: inferred.has_header,
+        categorical: inferred.categorical,
+    };
+    let table = if spec.has_header {
+        table.promote_first_row_to_header()?
+    } else {
+        table
+    };
+    let schema = table_schema_from_prepare_spec(&table, &spec)?;
+    let code_columns = category_columns(&spec);
+    let dataset = table.to_dataset_with_category_codes(&schema, &code_columns)?;
+    Ok((dataset, schema.to_model_schema()?))
+}
+
+/// `.tnum` обычно узнаётся по расширению, но сериализованный датасет остаётся
+/// таким же источником и после переименования: план Э3 требует учитывать и
+/// содержимое. Для таблиц читается только короткий префикс, не весь файл.
+fn is_tnum_source(path: &Path) -> Result<bool, String> {
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("tnum"))
+    {
+        return Ok(true);
+    }
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("чтение {}: {e}", path.display()))?;
+    let mut prefix = [0_u8; 6];
+    let bytes_read = file
+        .read(&mut prefix)
+        .map_err(|e| format!("чтение {}: {e}", path.display()))?;
+    Ok(bytes_read == prefix.len() && matches!(&prefix, b"TRNUM1" | b"TRNUM2"))
+}
+
+fn category_columns(spec: &PrepareSpec) -> Vec<usize> {
+    spec.categorical.iter().map(|&(index, _)| index).collect()
+}
+
+/// Конвертирует таблицу в строку формата `.tnum`.
+pub fn table_to_tnum(input: &str, spec: &PrepareSpec) -> Result<String, String> {
+    to_tnum(
+        &Table::parse_text(input, spec.delimiter, spec.has_header)?,
+        spec,
+    )
+}
+
+pub fn table_path_to_tnum(path: impl AsRef<Path>, spec: &PrepareSpec) -> Result<String, String> {
+    to_tnum(
+        &Table::read_path(path.as_ref(), spec.delimiter, spec.has_header)?,
+        spec,
+    )
+}
+
+fn to_tnum(table: &Table, spec: &PrepareSpec) -> Result<String, String> {
+    let schema = table_schema_from_prepare_spec(table, spec)?;
+    let dataset = table.to_dataset_with_category_codes(&schema, &category_columns(spec))?;
+    write_numeric_tnum(&schema.to_model_schema()?, &dataset)
 }
 
 #[cfg(test)]
@@ -496,6 +391,47 @@ mod tests {
         assert_eq!(schema.output_names(), vec!["y"]);
         assert!((ds.inputs[[0, 0]] - 0.5).abs() < 1e-6);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn numeric_source_recognizes_tnum_by_contents() {
+        let path = std::env::temp_dir().join("transformer_tnum_magic_without_extension.data");
+        std::fs::write(
+            &path,
+            "TRNUM1\ninputs 1\noutputs 1\nspecs C\nrows 1\ndata\n2 3\n",
+        )
+        .unwrap();
+        let (dataset, schema) = read_numeric_source(path.to_str().unwrap()).unwrap();
+        assert_eq!(dataset.inputs[[0, 0]], 2.0);
+        assert_eq!(dataset.outputs[[0, 0]], 3.0);
+        assert_eq!(schema.n_inputs(), 1);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn direct_table_source_matches_prepare_path() {
+        let csv = "x0,material_id,y0\n0.5,1.0,2\n1.5,2,3\n";
+        let path = std::env::temp_dir().join("transformer_direct_numeric_source.csv");
+        std::fs::write(&path, csv).unwrap();
+
+        let (direct_data, direct_schema) = read_numeric_source(path.to_str().unwrap()).unwrap();
+        let prepared = table_to_tnum(
+            csv,
+            &PrepareSpec {
+                n_inputs: 2,
+                n_outputs: 1,
+                delimiter: Delimiter::Auto,
+                has_header: true,
+                categorical: vec![(1, 3)],
+            },
+        )
+        .unwrap();
+        let (prepared_data, prepared_schema) = crate::data::parse_numeric_tnum(&prepared).unwrap();
+
+        assert_eq!(direct_data.inputs, prepared_data.inputs);
+        assert_eq!(direct_data.outputs, prepared_data.outputs);
+        assert_eq!(direct_schema, prepared_schema);
+        std::fs::remove_file(path).ok();
     }
 
     #[test]
