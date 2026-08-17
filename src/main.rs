@@ -786,13 +786,14 @@ fn run_numeric_file(args: &[String]) {
         }
     };
 
-    let (data, in_specs) = match read_numeric_tnum(path) {
+    let (data, schema) = match read_numeric_tnum(path) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Не удалось прочитать {path}: {e}");
             std::process::exit(1);
         }
     };
+    let in_specs = schema.feature_specs();
     println!(
         "Датасет: {path} ({} строк, {} вход -> {} выход)",
         data.len(),
@@ -999,8 +1000,9 @@ fn run_epoch_sweep_cmd(args: &[String]) {
     let path = f
         .pos(0)
         .unwrap_or_else(|| fail("укажите .tnum: epoch-sweep <data.tnum>"));
-    let (data, specs) =
+    let (data, schema) =
         read_numeric_tnum(path).unwrap_or_else(|e| fail(&format!("чтение {path}: {e}")));
+    let specs = schema.feature_specs();
     let n_out = data.outputs.ncols();
 
     let milestones = csv_usize(&f, "epochs", "1,2,5,10,20,40");
@@ -1156,7 +1158,13 @@ fn run_prepare(args: &[String]) {
     };
 
     let tnum = table_path_to_tnum(input, &spec).unwrap_or_else(|e| fail(&e));
-    let rows = tnum.lines().count().saturating_sub(6); // 6 строк заголовка
+    // Число строк берём из самого заголовка: их количество в TRNUM2 зависит от
+    // наличия units и levels, поэтому вычитать фиксированную константу нельзя.
+    let rows = tnum
+        .lines()
+        .find_map(|l| l.strip_prefix("rows "))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| fail("в записанном .tnum нет строки rows"));
     std::fs::write(output, &tnum).unwrap_or_else(|e| fail(&format!("запись {output}: {e}")));
     println!("Записано {output}: {rows} строк, {n_inputs} вход -> {n_outputs} выход");
 }

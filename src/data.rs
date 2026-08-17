@@ -7,6 +7,7 @@
 //! - `TextDataset` + `Vocab` — char-уровень, нарезка контекст→продолжение.
 
 use crate::encoders::FeatureSpec;
+use crate::schema::{Column, ColumnRole, ColumnType, ModelSchema};
 use ndarray::Array2;
 use rand::rngs::StdRng;
 use rand::Rng;
@@ -178,20 +179,6 @@ fn invalid_data(msg: impl Into<String>) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, msg.into())
 }
 
-fn parse_usize(token: Option<&str>, what: &str) -> io::Result<usize> {
-    token
-        .ok_or_else(|| invalid_data(format!("ожидали {what}")))?
-        .parse::<usize>()
-        .map_err(|_| invalid_data(format!("не удалось прочитать {what}")))
-}
-
-fn parse_f32(token: Option<&str>, what: &str) -> io::Result<f32> {
-    token
-        .ok_or_else(|| invalid_data(format!("ожидали {what}")))?
-        .parse::<f32>()
-        .map_err(|_| invalid_data(format!("не удалось прочитать {what}")))
-}
-
 fn parse_feature_spec(token: &str) -> io::Result<FeatureSpec> {
     let lower = token.to_ascii_lowercase();
     if lower == "c" || lower == "continuous" {
@@ -211,80 +198,464 @@ fn parse_feature_spec(token: &str) -> io::Result<FeatureSpec> {
     )))
 }
 
-/// Прочитать числовой датасет из простого текстового формата `.tnum`.
-///
-/// Формат:
-/// ```text
-/// TRNUM1
-/// inputs 2
-/// outputs 1
-/// specs C C
-/// rows 3
-/// data
-/// 0.1 0.2 0.3
-/// 0.4 0.5 0.9
-/// 0.7 0.8 1.5
-/// ```
-pub fn read_numeric_tnum(path: &str) -> io::Result<(NumericDataset, Vec<FeatureSpec>)> {
-    let text = std::fs::read_to_string(path)?;
-    let mut tokens = Vec::new();
-    for line in text.lines() {
-        let clean = line.split('#').next().unwrap_or("").trim();
-        tokens.extend(clean.split_whitespace().map(str::to_string));
+// --- формат .tnum ---
+//
+// TRNUM1 (устаревший, читается) знает только типы признаков:
+//
+//     TRNUM1 / inputs 2 / outputs 1 / specs C K:3 / rows 2 / data / ...
+//
+// TRNUM2 добавляет имена, единицы и подписи уровней категорий. Имена могут
+// содержать пробелы, кавычки и Unicode, поэтому они пишутся в кавычках, а
+// токенизатор понимает кавычки и экранирование:
+//
+//     TRNUM2
+//     inputs 2
+//     outputs 1
+//     specs C K:3
+//     names "temperature, °C" "материал" "влажность"
+//     units "°C" - "%"
+//     levels 1 "песок" "глина" "торф"
+//     rows 2
+//     data
+//     80 0 12.5
+//     60 2 18.1
+
+/// Токен заголовка. Различать кавычки обязательно: `rows` — это директива, а
+/// `"rows"` — допустимое имя колонки.
+#[derive(Debug, Clone, PartialEq)]
+enum Token {
+    Bare(String),
+    Quoted(String),
+}
+
+impl Token {
+    /// `Some` только для директив и чисел — имя в кавычках директивой не станет.
+    fn as_bare(&self) -> Option<&str> {
+        match self {
+            Token::Bare(s) => Some(s),
+            Token::Quoted(_) => None,
+        }
+    }
+}
+
+/// Разбор в токены: `#` вне кавычек начинает комментарий до конца строки,
+/// внутри кавычек это обычный символ. Поддерживаются `\"`, `\\`, `\n`, `\r` и `\t`.
+fn tokenize(text: &str) -> io::Result<Vec<Token>> {
+    let mut out = Vec::new();
+    for (lineno, line) in text.lines().enumerate() {
+        let line_no = lineno + 1;
+        let mut chars = line.chars().peekable();
+        loop {
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+            match chars.peek() {
+                None | Some('#') => break,
+                Some('"') => {
+                    chars.next();
+                    let mut value = String::new();
+                    loop {
+                        match chars.next() {
+                            None => {
+                                return Err(invalid_data(format!(
+                                    "строка {line_no}: незакрытая кавычка"
+                                )))
+                            }
+                            Some('"') => break,
+                            Some('\\') => match chars.next() {
+                                Some('"') => value.push('"'),
+                                Some('\\') => value.push('\\'),
+                                Some('n') => value.push('\n'),
+                                Some('r') => value.push('\r'),
+                                Some('t') => value.push('\t'),
+                                Some(other) => {
+                                    return Err(invalid_data(format!(
+                                        "строка {line_no}: неизвестная escape-последовательность \\{other}"
+                                    )))
+                                }
+                                None => {
+                                    return Err(invalid_data(format!(
+                                        "строка {line_no}: незакрытая кавычка"
+                                    )))
+                                }
+                            },
+                            Some(c) => value.push(c),
+                        }
+                    }
+                    if let Some(&next) = chars.peek() {
+                        if !next.is_whitespace() && next != '#' {
+                            return Err(invalid_data(format!(
+                                "строка {line_no}: после закрывающей кавычки нужен пробел или комментарий"
+                            )));
+                        }
+                    }
+                    out.push(Token::Quoted(value));
+                }
+                Some(_) => {
+                    let mut value = String::new();
+                    while let Some(&c) = chars.peek() {
+                        if c.is_whitespace() || c == '#' {
+                            break;
+                        }
+                        value.push(c);
+                        chars.next();
+                    }
+                    out.push(Token::Bare(value));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Курсор по токенам заголовка: каждая директива знает свою арность, поэтому
+/// переводы строк для разбора не нужны.
+struct Cursor<'a> {
+    tokens: &'a [Token],
+    i: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn peek_bare(&self) -> Option<&str> {
+        self.tokens.get(self.i).and_then(Token::as_bare)
     }
 
-    let mut it = tokens.iter().map(String::as_str);
-    if it.next() != Some("TRNUM1") {
-        return Err(invalid_data("ожидали магию TRNUM1"));
+    fn next_token(&mut self, what: &str) -> io::Result<&'a Token> {
+        let t = self
+            .tokens
+            .get(self.i)
+            .ok_or_else(|| invalid_data(format!("ожидали {what}, файл закончился")))?;
+        self.i += 1;
+        Ok(t)
     }
 
-    if it.next() != Some("inputs") {
-        return Err(invalid_data("ожидали строку: inputs <N>"));
+    fn expect_bare(&mut self, word: &str) -> io::Result<()> {
+        match self.next_token(word)? {
+            Token::Bare(s) if s == word => Ok(()),
+            other => Err(invalid_data(format!(
+                "ожидали '{word}', получили {other:?}"
+            ))),
+        }
     }
-    let n_inputs = parse_usize(it.next(), "число входов")?;
 
-    if it.next() != Some("outputs") {
-        return Err(invalid_data("ожидали строку: outputs <M>"));
+    fn next_usize(&mut self, what: &str) -> io::Result<usize> {
+        match self.next_token(what)? {
+            Token::Bare(s) => s
+                .parse()
+                .map_err(|_| invalid_data(format!("не удалось прочитать {what}: '{s}'"))),
+            Token::Quoted(s) => Err(invalid_data(format!("{what} не может быть строкой: '{s}'"))),
+        }
     }
-    let n_outputs = parse_usize(it.next(), "число выходов")?;
 
-    if it.next() != Some("specs") {
-        return Err(invalid_data("ожидали строку: specs ..."));
+    fn next_f32(&mut self, what: &str) -> io::Result<f32> {
+        match self.next_token(what)? {
+            Token::Bare(s) => s
+                .parse()
+                .map_err(|_| invalid_data(format!("не удалось прочитать {what}: '{s}'"))),
+            Token::Quoted(s) => Err(invalid_data(format!("{what} не может быть строкой: '{s}'"))),
+        }
     }
-    let mut specs = Vec::with_capacity(n_inputs);
+
+    /// Строковое поле: обязано быть в кавычках, иначе имя вида `rows` было бы
+    /// неотличимо от директивы.
+    fn next_quoted(&mut self, what: &str) -> io::Result<String> {
+        match self.next_token(what)? {
+            Token::Quoted(s) => Ok(s.clone()),
+            Token::Bare(s) => Err(invalid_data(format!(
+                "{what} должно быть в кавычках, получили '{s}'"
+            ))),
+        }
+    }
+
+    fn finished(&self) -> io::Result<()> {
+        match self.tokens.get(self.i) {
+            None => Ok(()),
+            Some(extra) => Err(invalid_data(format!("лишние данные в конце: {extra:?}"))),
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.tokens.len() - self.i
+    }
+}
+
+/// Прочитать числовой датасет и его схему из `.tnum` (TRNUM1 или TRNUM2).
+pub fn read_numeric_tnum(path: &str) -> io::Result<(NumericDataset, ModelSchema)> {
+    parse_numeric_tnum(&std::fs::read_to_string(path)?)
+}
+
+/// Разбор `.tnum` из строки. У TRNUM1 имён нет, поэтому схема достраивается
+/// синтетически — с сохранением категориальных типов.
+pub fn parse_numeric_tnum(text: &str) -> io::Result<(NumericDataset, ModelSchema)> {
+    let tokens = tokenize(text)?;
+    let mut c = Cursor {
+        tokens: &tokens,
+        i: 0,
+    };
+
+    let version = match c.next_token("магию TRNUM1/TRNUM2")? {
+        Token::Bare(s) if s == "TRNUM1" => 1,
+        Token::Bare(s) if s == "TRNUM2" => 2,
+        other => {
+            return Err(invalid_data(format!(
+                "ожидали магию TRNUM1 или TRNUM2, получили {other:?}"
+            )))
+        }
+    };
+
+    c.expect_bare("inputs")?;
+    let n_inputs = c.next_usize("число входов")?;
+    c.expect_bare("outputs")?;
+    let n_outputs = c.next_usize("число выходов")?;
+    let n_columns = n_inputs
+        .checked_add(n_outputs)
+        .ok_or_else(|| invalid_data("суммарное число колонок не помещается в usize"))?;
+    c.expect_bare("specs")?;
+    // Не резервируем память по ещё не проверенному числу из внешнего файла.
+    let mut specs = Vec::new();
     for _ in 0..n_inputs {
-        specs.push(parse_feature_spec(
-            it.next()
-                .ok_or_else(|| invalid_data("specs короче числа входов"))?,
-        )?);
+        match c.next_token("тип признака")? {
+            Token::Bare(s) => specs.push(parse_feature_spec(s)?),
+            Token::Quoted(s) => return Err(invalid_data(format!("тип признака не строка: '{s}'"))),
+        }
     }
 
-    if it.next() != Some("rows") {
-        return Err(invalid_data("ожидали строку: rows <N>"));
-    }
-    let rows = parse_usize(it.next(), "число строк")?;
+    let schema = if version == 1 {
+        ModelSchema::synthetic_from_specs(&specs, n_outputs).map_err(invalid_data)?
+    } else {
+        read_v2_schema(&mut c, &specs, n_inputs, n_outputs, n_columns)?
+    };
 
-    if it.next() != Some("data") {
-        return Err(invalid_data("ожидали маркер data"));
+    c.expect_bare("rows")?;
+    let rows = c.next_usize("число строк")?;
+    c.expect_bare("data")?;
+    let expected_values = rows
+        .checked_mul(n_columns)
+        .ok_or_else(|| invalid_data("размер секции data не помещается в usize"))?;
+    if c.remaining() != expected_values {
+        return Err(invalid_data(format!(
+            "в секции data ожидалось {expected_values} значений ({rows} × {n_columns}), получено {}",
+            c.remaining()
+        )));
     }
 
     let mut inputs = Array2::<f32>::zeros((rows, n_inputs));
     let mut outputs = Array2::<f32>::zeros((rows, n_outputs));
     for r in 0..rows {
-        for c in 0..n_inputs {
-            inputs[[r, c]] = parse_f32(it.next(), "входное значение")?;
+        for col in 0..n_inputs {
+            inputs[[r, col]] = c.next_f32("входное значение")?;
         }
-        for c in 0..n_outputs {
-            outputs[[r, c]] = parse_f32(it.next(), "выходное значение")?;
+        for col in 0..n_outputs {
+            outputs[[r, col]] = c.next_f32("выходное значение")?;
         }
     }
-    if let Some(extra) = it.next() {
-        return Err(invalid_data(format!(
-            "лишние данные после {rows} строк: {extra}"
-        )));
+    c.finished()?;
+
+    let data = NumericDataset::new(inputs, outputs);
+    validate_numeric_tnum(&schema, &data).map_err(invalid_data)?;
+    Ok((data, schema))
+}
+
+/// Заголовок TRNUM2: обязательный `names`, необязательные `units` и `levels`.
+fn read_v2_schema(
+    c: &mut Cursor<'_>,
+    specs: &[FeatureSpec],
+    n_inputs: usize,
+    n_outputs: usize,
+    n_columns: usize,
+) -> io::Result<ModelSchema> {
+    c.expect_bare("names")?;
+    // Как и specs, не резервируем память по непроверенному размеру файла.
+    let mut names = Vec::new();
+    for i in 0..n_columns {
+        names.push(c.next_quoted(&format!("имя колонки {i}"))?);
     }
 
-    Ok((NumericDataset::new(inputs, outputs), specs))
+    let mut units: Vec<Option<String>> = vec![None; n_columns];
+    if c.peek_bare() == Some("units") {
+        c.expect_bare("units")?;
+        for unit in units.iter_mut() {
+            match c.next_token("единицу измерения")? {
+                // Голый дефис — «единицы нет»; иначе имя '-' было бы неотличимо.
+                Token::Bare(s) if s == "-" => {}
+                Token::Quoted(s) if !s.trim().is_empty() => *unit = Some(s.clone()),
+                Token::Quoted(_) => {
+                    return Err(invalid_data("пустая единица измерения: используйте '-'"))
+                }
+                Token::Bare(s) => {
+                    return Err(invalid_data(format!(
+                        "единица измерения должна быть в кавычках или '-', получили '{s}'"
+                    )))
+                }
+            }
+        }
+    }
+
+    // levels <индекс входа> "уровень"...; по строке на каждый категориальный вход.
+    let mut levels: HashMap<usize, Vec<String>> = HashMap::new();
+    while c.peek_bare() == Some("levels") {
+        c.expect_bare("levels")?;
+        let idx = c.next_usize("индекс категориального входа")?;
+        let cardinality = match specs.get(idx) {
+            Some(FeatureSpec::Categorical { cardinality }) => *cardinality,
+            Some(FeatureSpec::Continuous) => {
+                return Err(invalid_data(format!(
+                    "levels {idx}: вход не категориальный"
+                )))
+            }
+            None => {
+                return Err(invalid_data(format!(
+                    "levels {idx}: индекс вне диапазона 0..{n_inputs}"
+                )))
+            }
+        };
+        if levels.contains_key(&idx) {
+            return Err(invalid_data(format!("levels {idx}: повторная секция")));
+        }
+        let mut values = Vec::with_capacity(cardinality);
+        for l in 0..cardinality {
+            values.push(c.next_quoted(&format!("подпись уровня {l} входа {idx}"))?);
+        }
+        levels.insert(idx, values);
+    }
+
+    let mut columns = Vec::with_capacity(n_columns);
+    for (i, spec) in specs.iter().enumerate() {
+        let column = match *spec {
+            FeatureSpec::Continuous => Column::numeric(&names[i], ColumnRole::Input),
+            FeatureSpec::Categorical { cardinality } => {
+                // Отсутствие подписей у K:n — испорченный файл: writer их всегда
+                // пишет, а тихий откат к «0…n-1» подменил бы данные.
+                let values = levels.remove(&i).ok_or_else(|| {
+                    invalid_data(format!(
+                        "вход {i} объявлен как K:{cardinality}, но секции levels {i} нет"
+                    ))
+                })?;
+                Column::categorical(&names[i], ColumnRole::Input, values)
+            }
+        }
+        .map_err(invalid_data)?;
+        columns.push(match &units[i] {
+            Some(u) => column.with_unit(u),
+            None => column,
+        });
+    }
+    let inputs = columns;
+
+    let mut outputs = Vec::with_capacity(n_outputs);
+    for j in 0..n_outputs {
+        let k = n_inputs + j;
+        let column = Column::numeric(&names[k], ColumnRole::Output).map_err(invalid_data)?;
+        outputs.push(match &units[k] {
+            Some(u) => column.with_unit(u),
+            None => column,
+        });
+    }
+
+    ModelSchema::new(inputs, outputs).map_err(invalid_data)
+}
+
+fn quote(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            other => escaped.push(other),
+        }
+    }
+    format!("\"{escaped}\"")
+}
+
+/// Общая валидация данных формата. Writer не создаёт битый файл, а reader
+/// не доверяет кодам категорий и NaN/Inf из внешнего файла.
+fn validate_numeric_tnum(schema: &ModelSchema, data: &NumericDataset) -> Result<(), String> {
+    schema.check_dims(data.inputs.ncols(), data.outputs.ncols())?;
+
+    for r in 0..data.len() {
+        for (i, column) in schema.inputs().iter().enumerate() {
+            let raw = data.inputs[[r, i]];
+            if !raw.is_finite() {
+                return Err(format!("строка {r}, вход {i}: значение не конечно: {raw}"));
+            }
+            let Some(cardinality) = column.cardinality() else {
+                continue;
+            };
+            let rounded = raw.round();
+            if (raw - rounded).abs() >= 1e-4 {
+                return Err(format!(
+                    "строка {r}, вход {i}: код категории должен быть целым, получено {raw}"
+                ));
+            }
+            if rounded < 0.0 || (rounded as usize) >= cardinality {
+                return Err(format!(
+                    "строка {r}, вход {i}: категория {rounded} вне [0, {cardinality})"
+                ));
+            }
+        }
+        for j in 0..data.outputs.ncols() {
+            let raw = data.outputs[[r, j]];
+            if !raw.is_finite() {
+                return Err(format!("строка {r}, выход {j}: значение не конечно: {raw}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Записать датасет в TRNUM2 с явной схемой.
+///
+/// Схема обязательна: без неё имена пришлось бы выдумывать, а именно этого
+/// формат и должен избежать.
+pub fn write_numeric_tnum(schema: &ModelSchema, data: &NumericDataset) -> Result<String, String> {
+    validate_numeric_tnum(schema, data)?;
+
+    let specs: Vec<String> = schema
+        .feature_specs()
+        .iter()
+        .map(|spec| match spec {
+            FeatureSpec::Continuous => "C".to_string(),
+            FeatureSpec::Categorical { cardinality } => format!("K:{cardinality}"),
+        })
+        .collect();
+    let columns = || schema.inputs().iter().chain(schema.outputs().iter());
+
+    let mut out = String::new();
+    out.push_str("TRNUM2\n");
+    out.push_str(&format!("inputs {}\n", schema.n_inputs()));
+    out.push_str(&format!("outputs {}\n", schema.n_outputs()));
+    out.push_str(&format!("specs {}\n", specs.join(" ")));
+    let names: Vec<String> = columns().map(|c| quote(c.name())).collect();
+    out.push_str(&format!("names {}\n", names.join(" ")));
+    if columns().any(|c| c.unit().is_some()) {
+        let units: Vec<String> = columns()
+            .map(|c| c.unit().map_or("-".to_string(), quote))
+            .collect();
+        out.push_str(&format!("units {}\n", units.join(" ")));
+    }
+    for (i, column) in schema.inputs().iter().enumerate() {
+        if let ColumnType::Categorical { levels } = column.ty() {
+            let quoted: Vec<String> = levels.iter().map(|l| quote(l)).collect();
+            out.push_str(&format!("levels {i} {}\n", quoted.join(" ")));
+        }
+    }
+    out.push_str(&format!("rows {}\n", data.len()));
+    out.push_str("data\n");
+    for r in 0..data.len() {
+        let row: Vec<String> = data
+            .inputs
+            .row(r)
+            .iter()
+            .chain(data.outputs.row(r).iter())
+            .map(|v| format!("{v}"))
+            .collect();
+        out.push_str(&row.join(" "));
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 /// Словарь char-уровня: отсортированные уникальные символы корпуса.
@@ -447,15 +818,251 @@ mod tests {
             "TRNUM1\ninputs 2\noutputs 1\nspecs C C\nrows 2\ndata\n1 2 3\n4 5 9\n",
         )
         .unwrap();
-        let (ds, specs) = read_numeric_tnum(path.to_str().unwrap()).unwrap();
+        let (ds, schema) = read_numeric_tnum(path.to_str().unwrap()).unwrap();
         assert_eq!(
-            specs,
+            schema.feature_specs(),
             vec![FeatureSpec::Continuous, FeatureSpec::Continuous]
         );
         assert_eq!(ds.inputs.dim(), (2, 2));
         assert_eq!(ds.outputs.dim(), (2, 1));
         assert_eq!(ds.outputs[[1, 0]], 9.0);
         std::fs::remove_file(path).ok();
+    }
+
+    /// Схема с именами, единицами, категорией и «неудобными» подписями.
+    fn rich_schema() -> ModelSchema {
+        ModelSchema::new(
+            vec![
+                Column::numeric("температура, °C", ColumnRole::Input)
+                    .unwrap()
+                    .with_unit("°C"),
+                Column::categorical(
+                    "материал",
+                    ColumnRole::Input,
+                    vec![
+                        "песок".into(),
+                        "глина \"жирная\"".into(),
+                        "торф # верховой\nвлажный\\слой".into(),
+                    ],
+                )
+                .unwrap(),
+                // Имя, совпадающее с директивой формата: без кавычек разбор бы сломался.
+                Column::numeric("rows", ColumnRole::Input).unwrap(),
+            ],
+            vec![Column::numeric("влажность", ColumnRole::Output)
+                .unwrap()
+                .with_unit("%\tмас.")],
+        )
+        .unwrap()
+    }
+
+    fn rich_data() -> NumericDataset {
+        NumericDataset::new(
+            array![[80.0, 0.0, 1.5], [60.0, 2.0, 2.5]],
+            array![[12.5], [18.25]],
+        )
+    }
+
+    #[test]
+    fn trnum2_round_trip_keeps_names_units_and_levels() {
+        let schema = rich_schema();
+        let text = write_numeric_tnum(&schema, &rich_data()).unwrap();
+        assert!(text.starts_with("TRNUM2\n"), "{text}");
+
+        let (ds, back) = parse_numeric_tnum(&text).unwrap();
+        assert_eq!(back, schema);
+        assert_eq!(
+            back.input_names(),
+            vec!["температура, °C", "материал", "rows"]
+        );
+        assert_eq!(back.output_names(), vec!["влажность"]);
+        assert_eq!(back.inputs()[0].unit(), Some("°C"));
+        assert_eq!(back.outputs()[0].unit(), Some("%\tмас."));
+        assert_eq!(
+            back.inputs()[1].category_level(1).unwrap(),
+            "глина \"жирная\""
+        );
+        assert_eq!(
+            back.inputs()[1].category_level(2).unwrap(),
+            "торф # верховой\nвлажный\\слой"
+        );
+        assert!(text.contains("\\n"), "{text}");
+        assert!(text.contains("\\t"), "{text}");
+        assert_eq!(ds.inputs, rich_data().inputs);
+        assert_eq!(ds.outputs, rich_data().outputs);
+    }
+
+    #[test]
+    fn trnum2_omits_units_line_when_none() {
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let data = NumericDataset::new(array![[1.0, 2.0]], array![[3.0]]);
+        let text = write_numeric_tnum(&schema, &data).unwrap();
+        assert!(!text.contains("units"), "{text}");
+        assert_eq!(parse_numeric_tnum(&text).unwrap().1, schema);
+    }
+
+    #[test]
+    fn comment_inside_quotes_is_kept_but_outside_is_stripped() {
+        let text = concat!(
+            "TRNUM2  # заголовок\n",
+            "inputs 1\noutputs 1\nspecs C\n",
+            "names \"a # b\" \"y\"\n",
+            "rows 1\ndata\n1 2\n",
+        );
+        let (_, schema) = parse_numeric_tnum(text).unwrap();
+        assert_eq!(schema.input_names(), vec!["a # b"]);
+    }
+
+    #[test]
+    fn trnum2_rejects_malformed_headers() {
+        let base = "TRNUM2\ninputs 1\noutputs 1\nspecs C\nnames \"x\" \"y\"\nrows 1\ndata\n1 2\n";
+        assert!(parse_numeric_tnum(base).is_ok());
+
+        // Имя без кавычек неотличимо от директивы.
+        assert!(parse_numeric_tnum(
+            "TRNUM2\ninputs 1\noutputs 1\nspecs C\nnames x y\nrows 1\ndata\n1 2\n"
+        )
+        .is_err());
+        // Незакрытая кавычка.
+        assert!(parse_numeric_tnum(
+            "TRNUM2\ninputs 1\noutputs 1\nspecs C\nnames \"x \"y\"\nrows 1\ndata\n1 2\n"
+        )
+        .is_err());
+        // Имён меньше, чем колонок.
+        assert!(parse_numeric_tnum(
+            "TRNUM2\ninputs 2\noutputs 1\nspecs C C\nnames \"x\" \"y\"\nrows 1\ndata\n1 2 3\n"
+        )
+        .is_err());
+        // Лишние данные после объявленных строк.
+        assert!(parse_numeric_tnum(&format!("{base}9 9\n")).is_err());
+        // Данных меньше объявленного.
+        assert!(parse_numeric_tnum(
+            "TRNUM2\ninputs 1\noutputs 1\nspecs C\nnames \"x\" \"y\"\nrows 2\ndata\n1 2\n"
+        )
+        .is_err());
+        // Неизвестная escape-последовательность.
+        assert!(parse_numeric_tnum(
+            "TRNUM2\ninputs 1\noutputs 1\nspecs C\nnames \"a\\qb\" \"y\"\nrows 1\ndata\n1 2\n"
+        )
+        .is_err());
+        // Между двумя строковыми полями нужен разделитель.
+        assert!(parse_numeric_tnum(
+            "TRNUM2\ninputs 1\noutputs 1\nspecs C\nnames \"x\"\"y\"\nrows 1\ndata\n1 2\n"
+        )
+        .is_err());
+        // Пустая единица не является вторым способом записать отсутствие.
+        assert!(parse_numeric_tnum(
+            "TRNUM2\ninputs 1\noutputs 1\nspecs C\nnames \"x\" \"y\"\nunits \"\" -\nrows 1\ndata\n1 2\n"
+        )
+        .is_err());
+        // Объявленный размер проверяется до выделения массивов.
+        let oversized = format!(
+            "TRNUM2\ninputs 1\noutputs 1\nspecs C\nnames \"x\" \"y\"\nrows {}\ndata\n",
+            usize::MAX
+        );
+        assert!(parse_numeric_tnum(&oversized)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("не помещается"));
+    }
+
+    #[test]
+    fn categorical_without_levels_is_an_error() {
+        // K:2 без секции levels — испорченный файл, а не повод выдумать подписи.
+        assert!(parse_numeric_tnum(
+            "TRNUM2\ninputs 1\noutputs 1\nspecs K:2\nnames \"m\" \"y\"\nrows 1\ndata\n0 2\n"
+        )
+        .is_err());
+        // levels на числовом входе.
+        assert!(parse_numeric_tnum(
+            "TRNUM2\ninputs 1\noutputs 1\nspecs C\nnames \"m\" \"y\"\nlevels 0 \"a\"\nrows 1\ndata\n0 2\n"
+        )
+        .is_err());
+        // Повторная секция levels.
+        assert!(parse_numeric_tnum(concat!(
+            "TRNUM2\ninputs 1\noutputs 1\nspecs K:1\nnames \"m\" \"y\"\n",
+            "levels 0 \"a\"\nlevels 0 \"b\"\nrows 1\ndata\n0 2\n"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn writer_checks_dims_and_category_codes() {
+        let schema = rich_schema();
+        // Схема на 3 входа, данные на 2.
+        let wrong = NumericDataset::new(array![[1.0, 0.0]], array![[1.0]]);
+        assert!(write_numeric_tnum(&schema, &wrong).is_err());
+
+        let fractional = NumericDataset::new(array![[80.0, 0.5, 1.0]], array![[1.0]]);
+        assert!(write_numeric_tnum(&schema, &fractional)
+            .unwrap_err()
+            .contains("целым"));
+
+        let out_of_range = NumericDataset::new(array![[80.0, 7.0, 1.0]], array![[1.0]]);
+        assert!(write_numeric_tnum(&schema, &out_of_range)
+            .unwrap_err()
+            .contains("вне [0, 3)"));
+
+        let non_finite = NumericDataset::new(array![[f32::NAN, 0.0, 1.0]], array![[1.0]]);
+        assert!(write_numeric_tnum(&schema, &non_finite)
+            .unwrap_err()
+            .contains("не конечно"));
+    }
+
+    #[test]
+    fn reader_checks_values_from_external_files() {
+        // TRNUM1 тоже не должен обходить проверку категориальных кодов.
+        assert!(parse_numeric_tnum(
+            "TRNUM1\ninputs 1\noutputs 1\nspecs K:2\nrows 1\ndata\n0.5 2\n"
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("целым"));
+
+        assert!(parse_numeric_tnum(concat!(
+            "TRNUM2\ninputs 1\noutputs 1\nspecs K:2\n",
+            "names \"material\" \"y\"\nlevels 0 \"a\" \"b\"\n",
+            "rows 1\ndata\n2 3\n"
+        ))
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("вне [0, 2)"));
+
+        assert!(
+            parse_numeric_tnum("TRNUM1\ninputs 1\noutputs 1\nspecs C\nrows 1\ndata\nNaN 2\n")
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("не конечно")
+        );
+    }
+
+    #[test]
+    fn legacy_trnum1_still_reads_with_categorical() {
+        let (ds, schema) = parse_numeric_tnum(
+            "TRNUM1\ninputs 2\noutputs 1\nspecs C K:3\nrows 2\ndata\n1 0 3\n4 2 9\n",
+        )
+        .unwrap();
+        assert_eq!(schema.input_names(), vec!["x0", "x1"]);
+        assert_eq!(schema.output_names(), vec!["y0"]);
+        assert_eq!(
+            schema.feature_specs(),
+            vec![
+                FeatureSpec::Continuous,
+                FeatureSpec::Categorical { cardinality: 3 }
+            ]
+        );
+        // Подписи старого файла — честные коды, а не выдуманные названия.
+        assert_eq!(schema.inputs()[1].category_level(2).unwrap(), "2");
+        assert_eq!(ds.outputs[[1, 0]], 9.0);
+        // Комментарии и произвольные переводы строк по-прежнему допустимы.
+        assert!(parse_numeric_tnum(
+            "TRNUM1 inputs 1 outputs 1 specs C rows 1 # хвост\ndata\n1 2\n"
+        )
+        .is_ok());
     }
 
     #[test]

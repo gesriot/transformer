@@ -661,7 +661,8 @@ fn run_optimize_file(
     ctx: &egui::Context,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    let (data, specs) = read_numeric_tnum(path).map_err(|e| format!("чтение {path}: {e}"))?;
+    let (data, schema) = read_numeric_tnum(path).map_err(|e| format!("чтение {path}: {e}"))?;
+    let specs = schema.feature_specs();
     let prepared = SplitPlan::default().prepare(&data)?;
     let (total_configs, total_runs) = sweep::sweep_size(axes)?;
     let _ = evt_tx.send(Event::OptimizeStarted {
@@ -854,7 +855,8 @@ fn run_epoch_sweep(
         return Err("plateau-min-r2 должен быть конечным".to_string());
     }
 
-    let (data, specs) = read_numeric_tnum(path).map_err(|e| format!("чтение {path}: {e}"))?;
+    let (data, schema) = read_numeric_tnum(path).map_err(|e| format!("чтение {path}: {e}"))?;
+    let specs = schema.feature_specs();
     let n_out = data.outputs.ncols();
     let prepared = SplitPlan::default().prepare(&data)?;
     let mut points: Vec<usize> = milestones.iter().copied().filter(|&e| e > 0).collect();
@@ -912,7 +914,10 @@ fn train_numeric(
             (bb.generate(2000, DEFAULT_DATA_SEED), specs)
         }
         DataSource::File(path) => {
-            read_numeric_tnum(path).map_err(|e| format!("чтение {path}: {e}"))?
+            let (data, schema) =
+                read_numeric_tnum(path).map_err(|e| format!("чтение {path}: {e}"))?;
+            let specs = schema.feature_specs();
+            (data, specs)
         }
     };
     let n_inputs = data.inputs.ncols();

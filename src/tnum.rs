@@ -1,11 +1,15 @@
-//! Конвертер числовой таблицы (CSV/TSV/space) в формат `.tnum` (TRNUM1).
-//! Нативный порт `tools/prepare_numeric_dataset.py` (PlanUI.md §1.1).
+//! Конвертер числовой таблицы (CSV/TSV/space/XLSX) в формат `.tnum` (TRNUM2).
+//! Нативный порт `tools/prepare_numeric_dataset.py`.
 //!
 //! Логика и валидация совпадают с Python-версией; формат уже читается
 //! `data::read_numeric_tnum`. Числа пишутся в кратчайшем round-trip
 //! представлении f32 (не байт-в-байт с `.9g` Python, но f32-эквивалентно).
 
+use crate::data::{write_numeric_tnum, NumericDataset};
+use crate::encoders::FeatureSpec;
+use crate::schema::{Column, ColumnRole, ModelSchema};
 use calamine::{open_workbook_auto, Data, Reader};
+use ndarray::Array2;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -333,14 +337,24 @@ fn rows_to_tnum(mut lines: Vec<Vec<String>>, spec: &PrepareSpec) -> Result<Strin
     if lines.is_empty() {
         return Err("нет строк данных".to_string());
     }
-    if spec.has_header {
-        lines.remove(0);
-    }
+    let expected = spec.n_inputs + spec.n_outputs;
+    let header = if spec.has_header {
+        let header = lines.remove(0);
+        if header.len() != expected {
+            return Err(format!(
+                "заголовок: ожидалось {expected} колонок ({} вход + {} выход), получено {}",
+                spec.n_inputs,
+                spec.n_outputs,
+                header.len()
+            ));
+        }
+        Some(header)
+    } else {
+        None
+    };
     if lines.is_empty() {
         return Err("нет строк данных после заголовка".to_string());
     }
-
-    let expected = spec.n_inputs + spec.n_outputs;
 
     let mut rows: Vec<Vec<f32>> = Vec::with_capacity(lines.len());
     for (r, line) in lines.iter().enumerate() {
@@ -367,44 +381,52 @@ fn rows_to_tnum(mut lines: Vec<Vec<String>>, spec: &PrepareSpec) -> Result<Strin
         rows.push(row);
     }
 
-    for (r, row) in rows.iter().enumerate() {
-        for &(idx, card) in &spec.categorical {
-            let raw = row[idx];
-            let rounded = raw.round();
-            if (raw - rounded).abs() >= 1e-4 {
-                return Err(format!(
-                    "строка {r}, вход {idx}: код категории должен быть целым, получено {raw}"
-                ));
-            }
-            if rounded < 0.0 || (rounded as usize) >= card {
-                return Err(format!(
-                    "строка {r}, вход {idx}: категория {rounded} вне [0, {card})"
-                ));
-            }
-        }
-    }
-
+    // PrepareSpec пока знает только cardinality, поэтому уровни категорий —
+    // честные коды «0…n-1». Имена уже есть в заголовке таблицы: терять их при
+    // переходе на TRNUM2 незачем. Без заголовка используем synthetic fallback.
     let cat_map: HashMap<usize, usize> = spec.categorical.iter().copied().collect();
-    let specs: Vec<String> = (0..spec.n_inputs)
+    let feature_specs: Vec<FeatureSpec> = (0..spec.n_inputs)
         .map(|i| match cat_map.get(&i) {
-            Some(&card) => format!("K:{card}"),
-            None => "C".to_string(),
+            Some(&cardinality) => FeatureSpec::Categorical { cardinality },
+            None => FeatureSpec::Continuous,
         })
         .collect();
+    let schema = match header {
+        Some(names) => {
+            let mut inputs = Vec::with_capacity(spec.n_inputs);
+            for (i, feature_spec) in feature_specs.iter().enumerate() {
+                let column = match feature_spec {
+                    FeatureSpec::Continuous => Column::numeric(&names[i], ColumnRole::Input),
+                    FeatureSpec::Categorical { cardinality } => Column::categorical(
+                        &names[i],
+                        ColumnRole::Input,
+                        (0..*cardinality).map(|code| code.to_string()).collect(),
+                    ),
+                }?;
+                inputs.push(column);
+            }
+            let outputs = names[spec.n_inputs..]
+                .iter()
+                .map(|name| Column::numeric(name, ColumnRole::Output))
+                .collect::<Result<Vec<_>, _>>()?;
+            ModelSchema::new(inputs, outputs)?
+        }
+        None => ModelSchema::synthetic_from_specs(&feature_specs, spec.n_outputs)?,
+    };
 
-    let mut out = String::new();
-    out.push_str("TRNUM1\n");
-    out.push_str(&format!("inputs {}\n", spec.n_inputs));
-    out.push_str(&format!("outputs {}\n", spec.n_outputs));
-    out.push_str(&format!("specs {}\n", specs.join(" ")));
-    out.push_str(&format!("rows {}\n", rows.len()));
-    out.push_str("data\n");
-    for row in &rows {
-        let line: Vec<String> = row.iter().map(|v| format!("{v}")).collect();
-        out.push_str(&line.join(" "));
-        out.push('\n');
+    let mut inputs = Array2::<f32>::zeros((rows.len(), spec.n_inputs));
+    let mut outputs = Array2::<f32>::zeros((rows.len(), spec.n_outputs));
+    for (r, row) in rows.iter().enumerate() {
+        for (c, &v) in row.iter().take(spec.n_inputs).enumerate() {
+            inputs[[r, c]] = v;
+        }
+        for (c, &v) in row.iter().skip(spec.n_inputs).enumerate() {
+            outputs[[r, c]] = v;
+        }
     }
-    Ok(out)
+    // Коды категорий проверяет writer — он единственное место, где формат
+    // создаётся.
+    write_numeric_tnum(&schema, &NumericDataset::new(inputs, outputs))
 }
 
 #[cfg(test)]
@@ -425,10 +447,11 @@ mod tests {
     fn converts_csv_with_categorical() {
         let csv = "x0,x1,mat,y\n0.5,-0.2,1,2.0\n# комментарий\n1.5,0.3,2,3.0\n";
         let out = table_to_tnum(csv, &spec(vec![(2, 3)])).unwrap();
-        assert!(out.starts_with("TRNUM1\n"));
+        assert!(out.starts_with("TRNUM2\n"));
         assert!(out.contains("inputs 3\n"));
         assert!(out.contains("outputs 1\n"));
         assert!(out.contains("specs C C K:3\n"));
+        assert!(out.contains("names \"x0\" \"x1\" \"mat\" \"y\"\n"));
         assert!(out.contains("rows 2\n"));
         assert!(out.contains("0.5 -0.2 1 2\n")); // 1.0 пишется как "1", 2.0 как "2"
     }
@@ -460,15 +483,44 @@ mod tests {
         let out = table_to_tnum(csv, &spec(vec![(2, 3)])).unwrap();
         let path = std::env::temp_dir().join("tnum_roundtrip.tnum");
         std::fs::write(&path, &out).unwrap();
-        let (ds, specs) = crate::data::read_numeric_tnum(path.to_str().unwrap()).unwrap();
+        let (ds, schema) = crate::data::read_numeric_tnum(path.to_str().unwrap()).unwrap();
         assert_eq!(ds.inputs.dim(), (2, 3));
         assert_eq!(ds.outputs.dim(), (2, 1));
         assert_eq!(
-            specs[2],
+            schema.feature_specs()[2],
             crate::encoders::FeatureSpec::Categorical { cardinality: 3 }
         );
+        // PrepareSpec подписей категорий не знает: уровни — честные коды.
+        assert_eq!(schema.inputs()[2].category_level(1).unwrap(), "1");
+        assert_eq!(schema.input_names(), vec!["x0", "x1", "mat"]);
+        assert_eq!(schema.output_names(), vec!["y"]);
         assert!((ds.inputs[[0, 0]] - 0.5).abs() < 1e-6);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn prepare_preserves_header_names_and_falls_back_without_header() {
+        let named = PrepareSpec {
+            n_inputs: 2,
+            n_outputs: 1,
+            delimiter: Delimiter::Comma,
+            has_header: true,
+            categorical: vec![],
+        };
+        let text =
+            table_to_tnum("температура,скорость потока,влажность\n80,1.5,12\n", &named).unwrap();
+        let (_, schema) = crate::data::parse_numeric_tnum(&text).unwrap();
+        assert_eq!(schema.input_names(), vec!["температура", "скорость потока"]);
+        assert_eq!(schema.output_names(), vec!["влажность"]);
+
+        let unnamed = PrepareSpec {
+            has_header: false,
+            ..named
+        };
+        let text = table_to_tnum("80,1.5,12\n", &unnamed).unwrap();
+        let (_, schema) = crate::data::parse_numeric_tnum(&text).unwrap();
+        assert_eq!(schema.input_names(), vec!["x0", "x1"]);
+        assert_eq!(schema.output_names(), vec!["y0"]);
     }
 
     #[test]
