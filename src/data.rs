@@ -1,15 +1,15 @@
-//! Данные и нормализация (Plan.md §4, §6).
+//! Данные и нормализация.
 //!
 //! - `Normalizer` — z-score по континуальным колонкам, identity по
 //!   категориальным; хранит диапазоны для предупреждения об экстраполяции.
-//! - `NumericDataset` — пары вход/выход, детерминированный split, выборка строк.
+//! - `NumericDataset` — пары вход/выход и выборка строк. Разбиение живёт в
+//!   `split.rs`: оно отвечает не за данные, а за протокол оценки.
 //! - `TextDataset` + `Vocab` — char-уровень, нарезка контекст→продолжение.
 
 use crate::encoders::FeatureSpec;
 use ndarray::Array2;
 use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
+use rand::Rng;
 use std::collections::{BTreeSet, HashMap};
 use std::io::{self, ErrorKind};
 
@@ -98,7 +98,7 @@ impl Normalizer {
     }
 
     /// Координаты `(row, col)` континуальных значений вне обученного диапазона
-    /// `[min, max]` — сигнал экстраполяции (Plan.md §4: модель ненадёжна вне
+    /// `[min, max]` — сигнал экстраполяции: модель ненадёжна вне
     /// распределения обучения).
     pub fn out_of_range(&self, data: &Array2<f32>) -> Vec<(usize, usize)> {
         let (n, cols) = data.dim();
@@ -158,18 +158,6 @@ impl NumericDataset {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Детерминированный train/test split: фиксированный seed -> одинаковое
-    /// разбиение. Перемешивает индексы и режет по `train_frac`.
-    pub fn split(&self, train_frac: f32, seed: u64) -> (NumericDataset, NumericDataset) {
-        assert!((0.0..=1.0).contains(&train_frac), "train_frac в [0,1]");
-        let n = self.len();
-        let mut idx: Vec<usize> = (0..n).collect();
-        let mut rng = StdRng::seed_from_u64(seed);
-        idx.shuffle(&mut rng);
-        let n_train = (n as f32 * train_frac).round() as usize;
-        (self.gather(&idx[..n_train]), self.gather(&idx[n_train..]))
     }
 
     /// Собрать подвыборку по индексам строк.
@@ -398,6 +386,7 @@ impl TextDataset {
 mod tests {
     use super::*;
     use ndarray::array;
+    use rand::SeedableRng;
 
     #[test]
     fn normalizer_round_trip() {
@@ -448,25 +437,6 @@ mod tests {
         let probe = array![[1.0], [5.0], [-3.0]];
         let flags = norm.out_of_range(&probe);
         assert_eq!(flags, vec![(1, 0), (2, 0)]); // 5 и -3 вне [0, 2]
-    }
-
-    #[test]
-    fn split_is_deterministic_and_partitions() {
-        let inputs = Array2::from_shape_fn((10, 2), |(i, j)| (i * 2 + j) as f32);
-        let outputs = Array2::from_shape_fn((10, 1), |(i, _)| i as f32);
-        let ds = NumericDataset::new(inputs, outputs);
-
-        let (tr1, te1) = ds.split(0.7, 42);
-        let (tr2, te2) = ds.split(0.7, 42);
-        assert_eq!(tr1.len(), 7);
-        assert_eq!(te1.len(), 3);
-        assert_eq!(tr1.len() + te1.len(), ds.len());
-        // Один seed -> идентичное разбиение.
-        assert_eq!(tr1.inputs, tr2.inputs);
-        assert_eq!(te1.inputs, te2.inputs);
-        // Другой seed -> другое (с большой вероятностью) разбиение.
-        let (tr3, _) = ds.split(0.7, 7);
-        assert_ne!(tr1.inputs, tr3.inputs);
     }
 
     #[test]

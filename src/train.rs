@@ -1,9 +1,10 @@
-//! Обучение и оценка surrogate-модели (Plan.md §8).
+//! Обучение и оценка surrogate-модели.
 //!
 //! Модель учится в НОРМАЛИЗОВАННОМ пространстве; метрики считаются в исходных
 //! единицах (предсказания денормализуются перед сравнением).
 
 use crate::data::{Normalizer, NumericDataset, TextDataset};
+use crate::encoders::FeatureSpec;
 use crate::metrics::{evaluate, Metrics};
 use crate::numeric_model::NumericModel;
 use crate::optim::Adam;
@@ -85,6 +86,21 @@ impl Default for TrainConfig {
 
 fn to_tensor(a: &Array2<f32>) -> Tensor {
     Tensor::constant(a.clone().into_dyn())
+}
+
+/// Единая точка создания нормализаторов. В поиске сюда передаётся только
+/// train конкретного fold; при финальном refit — весь train+validation pool.
+/// Test не участвует в `fit` никогда.
+pub fn fit_normalizers(
+    train: &NumericDataset,
+    in_specs: &[FeatureSpec],
+) -> (Normalizer, Normalizer) {
+    let in_norm = Normalizer::fit(&train.inputs, in_specs);
+    let out_norm = Normalizer::fit(
+        &train.outputs,
+        &Normalizer::all_continuous(train.outputs.ncols()),
+    );
+    (in_norm, out_norm)
 }
 
 /// Обучает модель, возвращает средний loss по эпохам (для диагностики).

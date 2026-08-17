@@ -1,4 +1,4 @@
-//! Worker-поток (PlanUI §2.1): владеет Rc-состоянием моделей, выполняет долгие
+//! Worker-поток: владеет Rc-состоянием моделей, выполняет долгие
 //! задачи, общается с UI каналами. Отмена — кооперативно через `Arc<AtomicBool>`,
 //! проверяемый внутри батч-цикла `train_surrogate_cb` (не ждёт конца эпохи).
 //!
@@ -19,14 +19,15 @@ use crate::init::set_init_seed;
 use crate::metrics::evaluate;
 use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
 use crate::serialize::{calibration_sample, load_numeric_full, save_numeric};
+use crate::split::{SplitPlan, DEFAULT_DATA_SEED};
 use crate::sweep::{self, SweepAxes, SweepObjective};
 use crate::symbolic;
 use crate::tensor::Tensor;
 use crate::textmodel::TextModel;
 use crate::tnum::{table_path_to_tnum, PrepareSpec};
 use crate::train::{
-    evaluate_surrogate, predict_dataset, train_surrogate_cb, train_text_cb, validate_train,
-    TextTrainConfig, TrainConfig,
+    evaluate_surrogate, fit_normalizers, predict_dataset, train_surrogate_cb, train_text_cb,
+    validate_train, TextTrainConfig, TrainConfig,
 };
 use eframe::egui;
 use ndarray::{Array2, Ix2};
@@ -105,7 +106,9 @@ struct DiagData {
     source: DataSource,
     in_specs: Vec<FeatureSpec>,
     train: NumericDataset,
-    test: NumericDataset,
+    /// Validation текущей сессии. Test сюда не попадает: он отложен в
+    /// `HoldoutTest` и в GUI пока не открывается вовсе.
+    val: NumericDataset,
 }
 
 struct LoadedText {
@@ -491,15 +494,16 @@ fn extract_kan_symbolic(loaded: &Loaded) -> Result<KanSymbolicInfo, String> {
             r2: edge.r2,
         })
         .collect();
-    // Test-метрики есть только у модели, обученной в этой сессии.
+    // Метрики формул есть только у модели, обученной в этой сессии, и считаются
+    // на validation: test не открывается.
     let (formula_metrics, kan_r2) = match &loaded.diag {
         Some(diag) => (
             Some(evaluate(
-                &symbolic.predict(&diag.test.inputs),
-                &diag.test.outputs,
+                &symbolic.predict(&diag.val.inputs),
+                &diag.val.outputs,
             )),
             Some(
-                evaluate_surrogate(&loaded.model, &diag.test, &loaded.in_norm, &loaded.out_norm).r2,
+                evaluate_surrogate(&loaded.model, &diag.val, &loaded.in_norm, &loaded.out_norm).r2,
             ),
         ),
         None => (None, None),
@@ -544,7 +548,7 @@ fn save_model(loaded: &Loaded, path: &str) -> Result<(), String> {
     .map_err(|e| format!("сохранение {path}: {e}"))
 }
 
-/// Диагностика обученной модели (PlanUI шаг 2). Доступна только если есть
+/// Диагностика обученной модели. Доступна только если есть
 /// данные обучения (`diag`).
 fn diagnose(l: &Loaded) -> Result<DiagnosticsResult, String> {
     let d = l.diag.as_ref().ok_or_else(|| {
@@ -556,9 +560,9 @@ fn diagnose(l: &Loaded) -> Result<DiagnosticsResult, String> {
     let overfit_loss =
         crate::diagnostics::overfit_probe(&d.nc, &d.in_specs, l.n_outputs, &subset, 80);
 
-    let rr = crate::diagnostics::range_report(&l.in_norm, &d.test.inputs);
-    let pred = predict_dataset(&l.model, &d.test, &l.in_norm, &l.out_norm);
-    let res = crate::diagnostics::residual_diagnostics(&d.test.inputs, &pred, &d.test.outputs);
+    let rr = crate::diagnostics::range_report(&l.in_norm, &d.val.inputs);
+    let pred = predict_dataset(&l.model, &d.val, &l.in_norm, &l.out_norm);
+    let res = crate::diagnostics::residual_diagnostics(&d.val.inputs, &pred, &d.val.outputs);
     let residuals = res
         .iter()
         .map(|r| (r.sign_change_rate, r.tail_ratio))
@@ -658,6 +662,7 @@ fn run_optimize_file(
     cancel: &AtomicBool,
 ) -> Result<(), String> {
     let (data, specs) = read_numeric_tnum(path).map_err(|e| format!("чтение {path}: {e}"))?;
+    let prepared = SplitPlan::default().prepare(&data)?;
     let (total_configs, total_runs) = sweep::sweep_size(axes)?;
     let _ = evt_tx.send(Event::OptimizeStarted {
         total_configs,
@@ -665,7 +670,7 @@ fn run_optimize_file(
     });
     ctx.request_repaint();
 
-    let result = sweep::run_file_sweep(&data, &specs, axes, objective, cancel, |row| {
+    let result = sweep::run_sweep(&prepared.search, &specs, axes, objective, cancel, |row| {
         let _ = evt_tx.send(Event::OptimizeRow { row: row.clone() });
         ctx.request_repaint();
     })?;
@@ -851,9 +856,7 @@ fn run_epoch_sweep(
 
     let (data, specs) = read_numeric_tnum(path).map_err(|e| format!("чтение {path}: {e}"))?;
     let n_out = data.outputs.ncols();
-    let (train, test) = data.split(0.8, 1);
-    let in_norm = Normalizer::fit(&train.inputs, &specs);
-    let out_norm = Normalizer::fit(&train.outputs, &Normalizer::all_continuous(n_out));
+    let prepared = SplitPlan::default().prepare(&data)?;
     let mut points: Vec<usize> = milestones.iter().copied().filter(|&e| e > 0).collect();
     points.sort_unstable();
     points.dedup();
@@ -868,10 +871,7 @@ fn run_epoch_sweep(
         ctx.request_repaint();
     };
     let rows = epoch_sweep::run_epoch_sweep_cb(
-        &train,
-        &test,
-        &in_norm,
-        &out_norm,
+        &prepared.search,
         nc,
         &specs,
         n_out,
@@ -908,7 +908,8 @@ fn train_numeric(
             let bb = blackbox::by_name(name)
                 .ok_or_else(|| format!("неизвестный чёрный ящик: {name}"))?;
             let specs = vec![FeatureSpec::Continuous; bb.n_inputs()];
-            (bb.generate(2000, tcfg.seed), specs)
+            // Seed обучения не должен менять саму выборку.
+            (bb.generate(2000, DEFAULT_DATA_SEED), specs)
         }
         DataSource::File(path) => {
             read_numeric_tnum(path).map_err(|e| format!("чтение {path}: {e}"))?
@@ -916,9 +917,12 @@ fn train_numeric(
     };
     let n_inputs = data.inputs.ncols();
     let n_out = data.outputs.ncols();
-    let (train, test) = data.split(0.8, 1);
-    let in_norm = Normalizer::fit(&train.inputs, &in_specs);
-    let out_norm = Normalizer::fit(&train.outputs, &Normalizer::all_continuous(n_out));
+    // Test откладывается и в GUI не открывается: единственный финальный замер
+    // появится вместе с явной финальной оценкой (Э4), а до тех пор все числа
+    // здесь — validation.
+    let prepared = SplitPlan::default().prepare(&data)?;
+    let (train, val) = prepared.search.fold(0)?;
+    let (in_norm, out_norm) = fit_normalizers(&train, &in_specs);
 
     set_init_seed(tcfg.seed); // воспроизводимая инициализация
     let model = nc.build(&in_specs, n_out);
@@ -951,7 +955,7 @@ fn train_numeric(
         return Ok(None);
     }
 
-    let metrics = evaluate_surrogate(&model, &test, &in_norm, &out_norm);
+    let metrics = evaluate_surrogate(&model, &val, &in_norm, &out_norm);
     let _ = evt_tx.send(Event::TrainDone {
         metrics: Some(metrics),
     });
@@ -970,7 +974,7 @@ fn train_numeric(
             source: source.clone(),
             in_specs,
             train,
-            test,
+            val,
         }),
         calibration,
     }))
@@ -1023,13 +1027,10 @@ mod tests {
             },
         };
         let data = blackbox::sum().generate(64, 0);
-        let (train, test) = data.split(0.8, 1);
+        let prepared = SplitPlan::default().prepare(&data).unwrap();
+        let (train, val) = prepared.search.fold(0).unwrap();
         let in_specs = vec![FeatureSpec::Continuous; train.inputs.ncols()];
-        let in_norm = Normalizer::fit(&train.inputs, &in_specs);
-        let out_norm = Normalizer::fit(
-            &train.outputs,
-            &Normalizer::all_continuous(train.outputs.ncols()),
-        );
+        let (in_norm, out_norm) = fit_normalizers(&train, &in_specs);
         let loaded = Loaded {
             model: config.build(&in_specs, train.outputs.ncols()),
             nc: config.clone(),
@@ -1043,7 +1044,7 @@ mod tests {
                 source: DataSource::Blackbox("sum".to_string()),
                 in_specs,
                 train,
-                test,
+                val,
             }),
             calibration: None,
         };
@@ -1052,7 +1053,7 @@ mod tests {
         assert!(result.formulas.starts_with("y0 = "));
         let metrics = result
             .formula_metrics
-            .expect("после обучения test-метрики есть");
+            .expect("после обучения validation-метрики есть");
         assert!(metrics.r2.is_finite());
         assert!(result.kan_r2.expect("R² KAN есть").is_finite());
         assert!(result.weak_edges.iter().all(|edge| edge.r2 < 0.99));

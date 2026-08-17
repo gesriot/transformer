@@ -1,4 +1,4 @@
-//! Диагностика surrogate-модели (roadmap шаг 2): инструменты понять причину
+//! Диагностика surrogate-модели: инструменты понять причину
 //! плохой точности ДО смены архитектуры — underfit (ёмкость/кодирование) vs
 //! покрытие данных vs чувствительность карты.
 
@@ -6,7 +6,7 @@ use crate::blackbox::BlackBox;
 use crate::data::{Normalizer, NumericDataset};
 use crate::encoders::FeatureSpec;
 use crate::numeric_model::NumericConfig;
-use crate::train::{train_surrogate, TrainConfig};
+use crate::train::{fit_normalizers, train_surrogate, TrainConfig};
 use ndarray::Array2;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -23,8 +23,7 @@ pub fn overfit_probe(
     subset: &NumericDataset,
     epochs: usize,
 ) -> f32 {
-    let in_norm = Normalizer::fit(&subset.inputs, specs);
-    let out_norm = Normalizer::fit(&subset.outputs, &Normalizer::all_continuous(n_outputs));
+    let (in_norm, out_norm) = fit_normalizers(subset, specs);
     let model = nc.build(specs, n_outputs);
     let tcfg = TrainConfig {
         epochs,
@@ -43,7 +42,7 @@ pub struct RangeReport {
     pub per_feature: Vec<usize>,
 }
 
-/// Сколько test-точек выходят за обученный диапазон входов (экстраполяция).
+/// Сколько точек выходят за обученный диапазон входов (экстраполяция).
 pub fn range_report(in_norm: &Normalizer, inputs: &Array2<f32>) -> RangeReport {
     let flags = in_norm.out_of_range(inputs);
     let mut per_feature = vec![0usize; inputs.ncols()];

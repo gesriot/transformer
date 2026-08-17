@@ -9,9 +9,15 @@ use crate::config::ModelConfig;
 use crate::data::{Normalizer, NumericDataset};
 use crate::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
 use crate::init::set_init_seed;
-use crate::metrics::{evaluate, evaluate_per_output};
+use crate::metrics::{
+    aggregate_runs, evaluate, evaluate_per_output, ConfigEval, EvalSource, RunEval, RunOrigin,
+};
 use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
-use crate::train::{predict_dataset, train_surrogate_cb, validate_train, LrSchedule, TrainConfig};
+use crate::split::{SearchPool, SplitPlan, DEFAULT_DATA_SEED};
+use crate::train::{
+    fit_normalizers, predict_dataset, train_surrogate_cb, validate_train, LrSchedule, TrainConfig,
+};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone)]
@@ -68,11 +74,17 @@ pub struct SweepRow {
     pub label: String,
     pub choice: SweepChoice,
     pub r2_mean: f32,
+    /// Разброс R² по init_seed (folds уже свёрнуты внутри seed).
     pub r2_std: f32,
+    /// Средний по seed разброс R² между folds (0 у holdout).
+    pub r2_std_folds: f32,
     pub worst_output_r2_mean: f32,
     pub mean_output_r2_mean: f32,
     pub nrmse_mean: f32,
     pub rel_mean: f32,
+    /// Откуда метрики: validation или CV. Ранжирование по test невозможно —
+    /// поиск его не видит.
+    pub source: EvalSource,
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +173,9 @@ pub fn validate_axes(axes: &SweepAxes) -> Result<(), String> {
     }
     if axes.seeds.is_empty() {
         return Err("seeds: пустой список".to_string());
+    }
+    if axes.seeds.iter().copied().collect::<BTreeSet<_>>().len() != axes.seeds.len() {
+        return Err("seeds содержит дубликаты".to_string());
     }
     if axes.d_models.is_empty() {
         return Err("d-models: пустой список".to_string());
@@ -497,12 +512,6 @@ fn mean(xs: &[f32]) -> f32 {
     xs.iter().sum::<f32>() / xs.len().max(1) as f32
 }
 
-fn mean_std(xs: &[f32]) -> (f32, f32) {
-    let m = mean(xs);
-    let var = xs.iter().map(|x| (x - m) * (x - m)).sum::<f32>() / xs.len().max(1) as f32;
-    (m, var.sqrt())
-}
-
 fn sort_rows(rows: &mut [SweepRow], objective: SweepObjective) {
     rows.sort_by(|a, b| {
         objective
@@ -512,56 +521,161 @@ fn sort_rows(rows: &mut [SweepRow], objective: SweepObjective) {
     });
 }
 
-struct RunEval {
-    r2: f32,
-    rel: f32,
-    nrmse: f32,
-    worst_output_r2: f32,
-    mean_output_r2: f32,
-}
-
+/// Метрики одного прогона (одна пара seed × fold) на VALIDATION части fold.
 fn evaluate_run(
     model: &crate::numeric_model::NumericModel,
-    test: &NumericDataset,
+    val: &NumericDataset,
     in_norm: &Normalizer,
     out_norm: &Normalizer,
+    origin: RunOrigin,
 ) -> RunEval {
-    let pred = predict_dataset(model, test, in_norm, out_norm);
-    let aggregate = evaluate(&pred, &test.outputs);
-    let per = evaluate_per_output(&pred, &test.outputs);
-    let worst_output_r2 = per
-        .iter()
-        .map(|m| m.r2)
-        .fold(f32::INFINITY, |a, b| a.min(b));
-    let mean_output_r2 = mean(&per.iter().map(|m| m.r2).collect::<Vec<_>>());
+    let pred = predict_dataset(model, val, in_norm, out_norm);
     RunEval {
-        r2: aggregate.r2,
-        rel: aggregate.rel_error,
-        nrmse: (1.0 - aggregate.r2).max(0.0).sqrt(),
-        worst_output_r2,
-        mean_output_r2,
+        metrics: evaluate(&pred, &val.outputs),
+        per_output: evaluate_per_output(&pred, &val.outputs),
+        origin,
     }
 }
 
-fn row_from_runs(label: String, choice: SweepChoice, runs: &[RunEval]) -> SweepRow {
-    let r2s: Vec<f32> = runs.iter().map(|m| m.r2).collect();
-    let rels: Vec<f32> = runs.iter().map(|m| m.rel).collect();
-    let nrmses: Vec<f32> = runs.iter().map(|m| m.nrmse).collect();
-    let worsts: Vec<f32> = runs.iter().map(|m| m.worst_output_r2).collect();
-    let means: Vec<f32> = runs.iter().map(|m| m.mean_output_r2).collect();
-    let (r2_mean, r2_std) = mean_std(&r2s);
+/// Строка ранжирования из агрегата. `r2_std` — разброс по init_seed (свёртка
+/// folds уже произошла внутри seed), поэтому `±` означает устойчивость к
+/// инициализации, а не к разбиению.
+fn row_from_config_eval(
+    label: String,
+    choice: SweepChoice,
+    agg: &ConfigEval,
+    runs: &[RunEval],
+) -> SweepRow {
+    let per_output_r2: Vec<f32> = agg.per_output_mean.iter().map(|m| m.r2).collect();
+    // nRMSE — нелинейное преобразование R², поэтому его нужно считать для
+    // каждого seed × fold до усреднения, а не из уже среднего R².
+    let nrmse_mean = runs
+        .iter()
+        .map(|run| (1.0 - run.metrics.r2).max(0.0).sqrt())
+        .sum::<f32>()
+        / runs.len().max(1) as f32;
     SweepRow {
         label,
         choice,
-        r2_mean,
-        r2_std,
-        worst_output_r2_mean: mean(&worsts),
-        mean_output_r2_mean: mean(&means),
-        nrmse_mean: mean(&nrmses),
-        rel_mean: mean(&rels),
+        r2_mean: agg.mean.r2,
+        r2_std: agg.r2_std_seeds,
+        r2_std_folds: agg.r2_std_folds,
+        worst_output_r2_mean: per_output_r2.iter().copied().fold(f32::INFINITY, f32::min),
+        mean_output_r2_mean: mean(&per_output_r2),
+        nrmse_mean,
+        rel_mean: agg.mean.rel_error,
+        source: agg.origin.source,
     }
 }
 
+/// Поиск по сетке на подготовленном pool. Test сюда не попадает физически:
+/// [`SearchPool`] его не содержит, поэтому отбор конфигурации не может
+/// подсмотреть отложенные данные.
+///
+/// Для каждого кандидата: все init_seed × все folds; нормализаторы строятся по
+/// train КАЖДОГО fold, метрики снимаются на его validation. Свёртка — через
+/// [`aggregate_runs`] (folds внутри seed, затем seeds).
+pub fn run_sweep<F>(
+    pool: &SearchPool,
+    in_specs: &[FeatureSpec],
+    axes: &SweepAxes,
+    objective: SweepObjective,
+    cancel: &AtomicBool,
+    mut on_row: F,
+) -> Result<SweepResult, String>
+where
+    F: FnMut(&SweepRow),
+{
+    let configs = build_candidates(axes)?;
+    let total_configs = configs.len();
+    let total_runs = total_configs * axes.seeds.len() * pool.n_folds();
+    let n_out = pool.all().outputs.ncols();
+    let mut rows = Vec::new();
+
+    // Fold-ы материализуются один раз на весь поиск: они не зависят от
+    // кандидата, а gather на каждой итерации стоил бы заметно дороже.
+    let folds: Vec<(NumericDataset, NumericDataset)> = (0..pool.n_folds())
+        .map(|i| pool.fold(i))
+        .collect::<Result<_, _>>()?;
+    let normalizers: Vec<(Normalizer, Normalizer)> = folds
+        .iter()
+        .map(|(train, _)| fit_normalizers(train, in_specs))
+        .collect();
+
+    let cancelled_result = |rows: &mut Vec<SweepRow>| {
+        sort_rows(rows, objective);
+        SweepResult {
+            rows: std::mem::take(rows),
+            total_configs,
+            total_runs,
+            cancelled: true,
+        }
+    };
+
+    for candidate in configs {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(cancelled_result(&mut rows));
+        }
+
+        let mut runs = Vec::new();
+        for &seed in &axes.seeds {
+            for (fold, ((train, val), (in_norm, out_norm))) in
+                folds.iter().zip(normalizers.iter()).enumerate()
+            {
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(cancelled_result(&mut rows));
+                }
+
+                set_init_seed(seed);
+                let model = candidate.nc.build(in_specs, n_out);
+                let tcfg = TrainConfig {
+                    epochs: axes.epochs,
+                    batch_size: axes.batch_size,
+                    lr: candidate.lr,
+                    seed,
+                    schedule: candidate.schedule,
+                };
+                train_surrogate_cb(
+                    &model,
+                    train,
+                    in_norm,
+                    out_norm,
+                    &tcfg,
+                    &mut |_, _| {},
+                    cancel,
+                );
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(cancelled_result(&mut rows));
+                }
+
+                runs.push(evaluate_run(
+                    &model,
+                    val,
+                    in_norm,
+                    out_norm,
+                    pool.run_origin(fold, seed),
+                ));
+            }
+        }
+
+        let agg = aggregate_runs(&runs, &axes.seeds, pool.source())?;
+        let row = row_from_config_eval(candidate.label, candidate.choice, &agg, &runs);
+        on_row(&row);
+        rows.push(row);
+    }
+
+    sort_rows(&mut rows, objective);
+    Ok(SweepResult {
+        rows,
+        total_configs,
+        total_runs,
+        cancelled: false,
+    })
+}
+
+/// Поиск на встроенном чёрном ящике (демо). Данные генерируются ОДИН РАЗ с
+/// фиксированным `data_seed`: ось `seeds` меняет только инициализацию модели,
+/// иначе `±` смешивал бы разброс инициализации с разбросом выборки.
 pub fn run_blackbox_sweep<F>(
     blackbox_name: &str,
     axes: &SweepAxes,
@@ -585,189 +699,38 @@ pub fn run_blackbox_sweep_with_objective<F>(
     axes: &SweepAxes,
     objective: SweepObjective,
     cancel: &AtomicBool,
-    mut on_row: F,
+    on_row: F,
 ) -> Result<SweepResult, String>
 where
     F: FnMut(&SweepRow),
 {
     let bb = blackbox::by_name(blackbox_name)
         .ok_or_else(|| format!("неизвестный чёрный ящик: {blackbox_name}"))?;
-    let configs = build_candidates(axes)?;
-    let total_configs = configs.len();
-    let total_runs = total_configs * axes.seeds.len();
     let in_specs = vec![FeatureSpec::Continuous; bb.n_inputs()];
-    let n_out = bb.n_outputs;
-    let mut rows = Vec::new();
-
-    for candidate in configs {
-        if cancel.load(Ordering::Relaxed) {
-            sort_rows(&mut rows, objective);
-            return Ok(SweepResult {
-                rows,
-                total_configs,
-                total_runs,
-                cancelled: true,
-            });
-        }
-
-        let mut runs = Vec::new();
-        for &seed in &axes.seeds {
-            if cancel.load(Ordering::Relaxed) {
-                sort_rows(&mut rows, objective);
-                return Ok(SweepResult {
-                    rows,
-                    total_configs,
-                    total_runs,
-                    cancelled: true,
-                });
-            }
-
-            let data = bb.generate(2000, seed);
-            let (train, test) = data.split(0.8, 1);
-            let in_norm = Normalizer::fit(&train.inputs, &in_specs);
-            let out_norm = Normalizer::fit(&train.outputs, &Normalizer::all_continuous(n_out));
-            set_init_seed(seed);
-            let model = candidate.nc.build(&in_specs, n_out);
-            let tcfg = TrainConfig {
-                epochs: axes.epochs,
-                batch_size: axes.batch_size,
-                lr: candidate.lr,
-                seed,
-                schedule: candidate.schedule,
-            };
-            train_surrogate_cb(
-                &model,
-                &train,
-                &in_norm,
-                &out_norm,
-                &tcfg,
-                &mut |_, _| {},
-                cancel,
-            );
-            if cancel.load(Ordering::Relaxed) {
-                sort_rows(&mut rows, objective);
-                return Ok(SweepResult {
-                    rows,
-                    total_configs,
-                    total_runs,
-                    cancelled: true,
-                });
-            }
-
-            runs.push(evaluate_run(&model, &test, &in_norm, &out_norm));
-        }
-
-        let row = row_from_runs(candidate.label, candidate.choice, &runs);
-        on_row(&row);
-        rows.push(row);
-    }
-
-    sort_rows(&mut rows, objective);
-    Ok(SweepResult {
-        rows,
-        total_configs,
-        total_runs,
-        cancelled: false,
-    })
-}
-
-pub fn run_file_sweep<F>(
-    data: &NumericDataset,
-    in_specs: &[FeatureSpec],
-    axes: &SweepAxes,
-    objective: SweepObjective,
-    cancel: &AtomicBool,
-    mut on_row: F,
-) -> Result<SweepResult, String>
-where
-    F: FnMut(&SweepRow),
-{
-    let configs = build_candidates(axes)?;
-    let total_configs = configs.len();
-    let total_runs = total_configs * axes.seeds.len();
-    let n_out = data.outputs.ncols();
-    let (train, test) = data.split(0.8, 1);
-    let in_norm = Normalizer::fit(&train.inputs, in_specs);
-    let out_norm = Normalizer::fit(&train.outputs, &Normalizer::all_continuous(n_out));
-    let mut rows = Vec::new();
-
-    for candidate in configs {
-        if cancel.load(Ordering::Relaxed) {
-            sort_rows(&mut rows, objective);
-            return Ok(SweepResult {
-                rows,
-                total_configs,
-                total_runs,
-                cancelled: true,
-            });
-        }
-
-        let mut runs = Vec::new();
-        for &seed in &axes.seeds {
-            if cancel.load(Ordering::Relaxed) {
-                sort_rows(&mut rows, objective);
-                return Ok(SweepResult {
-                    rows,
-                    total_configs,
-                    total_runs,
-                    cancelled: true,
-                });
-            }
-
-            set_init_seed(seed);
-            let model = candidate.nc.build(in_specs, n_out);
-            let tcfg = TrainConfig {
-                epochs: axes.epochs,
-                batch_size: axes.batch_size,
-                lr: candidate.lr,
-                seed,
-                schedule: candidate.schedule,
-            };
-            train_surrogate_cb(
-                &model,
-                &train,
-                &in_norm,
-                &out_norm,
-                &tcfg,
-                &mut |_, _| {},
-                cancel,
-            );
-            if cancel.load(Ordering::Relaxed) {
-                sort_rows(&mut rows, objective);
-                return Ok(SweepResult {
-                    rows,
-                    total_configs,
-                    total_runs,
-                    cancelled: true,
-                });
-            }
-
-            runs.push(evaluate_run(&model, &test, &in_norm, &out_norm));
-        }
-
-        let row = row_from_runs(candidate.label, candidate.choice, &runs);
-        on_row(&row);
-        rows.push(row);
-    }
-
-    sort_rows(&mut rows, objective);
-    Ok(SweepResult {
-        rows,
-        total_configs,
-        total_runs,
-        cancelled: false,
-    })
+    let data = bb.generate(2000, DEFAULT_DATA_SEED);
+    let prepared = SplitPlan::default().prepare(&data)?;
+    run_sweep(&prepared.search, &in_specs, axes, objective, cancel, on_row)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::Array2;
     use std::sync::atomic::AtomicBool;
 
     #[test]
     fn validate_rejects_empty_axes() {
         let mut axes = SweepAxes::default();
         axes.d_models.clear();
+        assert!(validate_axes(&axes).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_seeds_before_training() {
+        let axes = SweepAxes {
+            seeds: vec![7, 7],
+            ..SweepAxes::default()
+        };
         assert!(validate_axes(&axes).is_err());
     }
 
@@ -792,12 +755,8 @@ mod tests {
         assert!(result.rows[0].r2_mean.is_finite());
     }
 
-    #[test]
-    fn file_sweep_runs_all_model_kinds() {
-        let bb = blackbox::by_name("sum").unwrap();
-        let data = bb.generate(96, 0);
-        let specs = vec![FeatureSpec::Continuous; bb.n_inputs()];
-        let axes = SweepAxes {
+    fn tiny_axes() -> SweepAxes {
+        SweepAxes {
             model_kinds: vec![ModelKind::Transformer, ModelKind::Mlp, ModelKind::Kan],
             epochs: 1,
             batch_size: 32,
@@ -812,12 +771,35 @@ mod tests {
             kan_layers: vec![2],
             kan_grids: vec![5],
             ..SweepAxes::default()
-        };
+        }
+    }
+
+    fn sweep_r2s(data: &NumericDataset, specs: &[FeatureSpec]) -> Vec<f32> {
+        let prepared = SplitPlan::default().prepare(data).unwrap();
         let cancel = AtomicBool::new(false);
-        let result = run_file_sweep(
-            &data,
+        let result = run_sweep(
+            &prepared.search,
+            specs,
+            &tiny_axes(),
+            SweepObjective::WorstOutputR2,
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        result.rows.iter().map(|r| r.r2_mean).collect()
+    }
+
+    #[test]
+    fn file_sweep_runs_all_model_kinds() {
+        let bb = blackbox::by_name("sum").unwrap();
+        let data = bb.generate(96, 0);
+        let specs = vec![FeatureSpec::Continuous; bb.n_inputs()];
+        let prepared = SplitPlan::default().prepare(&data).unwrap();
+        let cancel = AtomicBool::new(false);
+        let result = run_sweep(
+            &prepared.search,
             &specs,
-            &axes,
+            &tiny_axes(),
             SweepObjective::WorstOutputR2,
             &cancel,
             |_| {},
@@ -826,6 +808,11 @@ mod tests {
         assert_eq!(result.total_configs, 3);
         assert_eq!(result.rows.len(), 3);
         assert!(result.rows.iter().all(|r| r.r2_mean.is_finite()));
+        // Ранжирование по validation — поиск не видит test даже по типу.
+        assert!(result
+            .rows
+            .iter()
+            .all(|r| r.source == EvalSource::Validation));
         let kan_row = result
             .rows
             .iter()
@@ -833,5 +820,194 @@ mod tests {
             .expect("kan-кандидат должен попасть в результаты");
         assert_eq!(kan_row.choice.kan.width, 8);
         assert_eq!(kan_row.choice.kan.grid, 5);
+    }
+
+    /// Ключевой тест Э1: порча целевых значений, попавших в test, не меняет
+    /// результат поиска НИ НА БИТ. Разбиение детерминировано, поэтому строки
+    /// test одни и те же в обоих прогонах.
+    #[test]
+    fn search_ignores_test_targets() {
+        let bb = blackbox::by_name("sum").unwrap();
+        let data = bb.generate(96, 0);
+        let specs = vec![FeatureSpec::Continuous; bb.n_inputs()];
+        let baseline = sweep_r2s(&data, &specs);
+
+        // Выясняем, какие строки ушли в test, и портим ИМЕННО их.
+        let prepared = SplitPlan::default().prepare(&data).unwrap();
+        let test_rows = prepared.test.len();
+        let mut test_inputs = Vec::new();
+        prepared
+            .test
+            .evaluate(
+                |inputs| {
+                    test_inputs = inputs.rows().into_iter().map(|r| r.to_vec()).collect();
+                    Array2::zeros((inputs.nrows(), data.outputs.ncols()))
+                },
+                0,
+            )
+            .unwrap();
+
+        let mut poisoned = NumericDataset::new(data.inputs.clone(), data.outputs.clone());
+        let mut poisoned_rows = 0;
+        for i in 0..poisoned.len() {
+            let row: Vec<f32> = poisoned.inputs.row(i).to_vec();
+            if test_inputs.contains(&row) {
+                poisoned_rows += 1;
+                for j in 0..poisoned.outputs.ncols() {
+                    poisoned.outputs[[i, j]] = 1e6;
+                }
+            }
+        }
+        assert_eq!(poisoned_rows, test_rows, "испортили не те строки");
+
+        assert_eq!(
+            baseline,
+            sweep_r2s(&poisoned, &specs),
+            "порча test изменила результат поиска — это утечка"
+        );
+    }
+
+    /// Обратная сторона: поиск обязан РЕАГИРОВАТЬ на validation. Проверяем не
+    /// перестановку кандидатов (на реальных моделях она не гарантирована и тест
+    /// был бы flaky), а сам факт зависимости метрик от validation-таргетов.
+    #[test]
+    fn search_depends_on_validation_targets() {
+        let bb = blackbox::by_name("sum").unwrap();
+        let data = bb.generate(96, 0);
+        let specs = vec![FeatureSpec::Continuous; bb.n_inputs()];
+        let baseline = sweep_r2s(&data, &specs);
+
+        let prepared = SplitPlan::default().prepare(&data).unwrap();
+        let (_, val) = prepared.search.fold(0).unwrap();
+        let val_inputs: Vec<Vec<f32>> = val.inputs.rows().into_iter().map(|r| r.to_vec()).collect();
+
+        let mut poisoned = NumericDataset::new(data.inputs.clone(), data.outputs.clone());
+        for i in 0..poisoned.len() {
+            let row: Vec<f32> = poisoned.inputs.row(i).to_vec();
+            if val_inputs.contains(&row) {
+                for j in 0..poisoned.outputs.ncols() {
+                    poisoned.outputs[[i, j]] = 1e6;
+                }
+            }
+        }
+
+        assert_ne!(
+            baseline,
+            sweep_r2s(&poisoned, &specs),
+            "поиск не отреагировал на validation — значит меряет что-то другое"
+        );
+    }
+
+    /// Ранжирование обязано переставляться, когда меняются validation-данные.
+    /// На настоящих моделях это не гарантировано, поэтому проверяем на
+    /// детерминированном фиктивном scorer-е: он ранжирует кандидатов по сумме
+    /// validation-таргетов, и порядок меняется по построению.
+    #[test]
+    fn ranking_follows_validation_scores() {
+        let inputs = Array2::from_shape_fn((40, 1), |(i, _)| i as f32);
+        let outputs = Array2::from_shape_fn((40, 1), |(i, _)| (i % 4) as f32);
+        let data = NumericDataset::new(inputs, outputs);
+        let prepared = SplitPlan::default().prepare(&data).unwrap();
+        let (_, val) = prepared.search.fold(0).unwrap();
+
+        // «Кандидат» = множитель; счёт = корреляция с validation-таргетами.
+        let score = |k: f32, val: &NumericDataset| -> f32 {
+            val.outputs.iter().map(|&y| k * y).sum::<f32>()
+        };
+        let choice = build_candidates(&tiny_axes()).unwrap().remove(0).choice;
+        let row = |label: &str, k: f32, validation: &NumericDataset| SweepRow {
+            label: label.to_string(),
+            choice: choice.clone(),
+            r2_mean: score(k, validation),
+            r2_std: 0.0,
+            r2_std_folds: 0.0,
+            worst_output_r2_mean: 0.0,
+            mean_output_r2_mean: 0.0,
+            nrmse_mean: 0.0,
+            rel_mean: 0.0,
+            source: EvalSource::Validation,
+        };
+        let mut ranked = vec![row("negative", -1.0, &val), row("positive", 2.0, &val)];
+        sort_rows(&mut ranked, SweepObjective::AggregateR2);
+        assert_eq!(ranked[0].label, "positive");
+
+        // Меняем знак validation-таргетов -> порядок обязан перевернуться.
+        let flipped = NumericDataset::new(val.inputs.clone(), -val.outputs.clone());
+        let mut ranked = vec![
+            row("negative", -1.0, &flipped),
+            row("positive", 2.0, &flipped),
+        ];
+        sort_rows(&mut ranked, SweepObjective::AggregateR2);
+        assert_eq!(ranked[0].label, "negative");
+    }
+
+    #[test]
+    fn nrmse_is_averaged_per_run_not_derived_from_mean_r2() {
+        let metric = |r2| crate::metrics::Metrics {
+            rmse: 0.0,
+            mae: 0.0,
+            rel_error: 0.0,
+            r2,
+        };
+        let runs = vec![
+            RunEval {
+                metrics: metric(0.0),
+                per_output: vec![metric(0.0)],
+                origin: RunOrigin {
+                    fold: None,
+                    init_seed: 0,
+                },
+            },
+            RunEval {
+                metrics: metric(1.0),
+                per_output: vec![metric(1.0)],
+                origin: RunOrigin {
+                    fold: None,
+                    init_seed: 1,
+                },
+            },
+        ];
+        let agg = aggregate_runs(&runs, &[0, 1], EvalSource::Validation).unwrap();
+        let choice = build_candidates(&tiny_axes()).unwrap().remove(0).choice;
+        let row = row_from_config_eval("synthetic".to_string(), choice, &agg, &runs);
+
+        assert!((row.nrmse_mean - 0.5).abs() < 1e-6);
+        assert!((row.nrmse_mean - (1.0_f32 - agg.mean.r2).sqrt()).abs() > 0.1);
+    }
+
+    /// Нормализаторы каждого fold строятся ТОЛЬКО по его train: статистики
+    /// обязаны отличаться от статистик всего pool.
+    #[test]
+    fn fold_normalizers_use_only_fold_train() {
+        let inputs = Array2::from_shape_fn((60, 1), |(i, _)| i as f32);
+        let outputs = Array2::from_shape_fn((60, 1), |(i, _)| i as f32 * 2.0);
+        let data = NumericDataset::new(inputs, outputs);
+        let plan = SplitPlan::KFold {
+            k: 3,
+            folds_seed: 1,
+            test_frac: 0.2,
+            test_seed: 1,
+        };
+        let prepared = plan.prepare(&data).unwrap();
+        let specs = vec![FeatureSpec::Continuous; 1];
+
+        let pool = prepared.search.all();
+        let (pool_norm, _) = fit_normalizers(&pool, &specs);
+        let mut differ = 0;
+        for i in 0..prepared.search.n_folds() {
+            let (train, val) = prepared.search.fold(i).unwrap();
+            let (fold_norm, _) = fit_normalizers(&train, &specs);
+            // Статистики fold считаются по его train, а не по pool.
+            let expected = train.inputs.iter().sum::<f32>() / train.len() as f32;
+            assert!((fold_norm.mean[0] - expected).abs() < 1e-3);
+            if (fold_norm.mean[0] - pool_norm.mean[0]).abs() > 1e-6 {
+                differ += 1;
+            }
+            assert!(!val.is_empty());
+        }
+        assert!(
+            differ > 0,
+            "хотя бы один fold обязан иметь статистики, отличные от pool"
+        );
     }
 }

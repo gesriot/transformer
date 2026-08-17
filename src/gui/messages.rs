@@ -1,4 +1,4 @@
-//! Сообщения UI <-> worker (PlanUI §2.2). Только `Send`-данные; Rc-модели не
+//! Сообщения UI <-> worker. Только `Send`-данные; Rc-модели не
 //! пересекают границу потока.
 
 use crate::config::ModelConfig;
@@ -17,7 +17,7 @@ pub enum DataSource {
     File(String),
 }
 
-/// Результат диагностики (числа для UI; PlanUI шаг 2).
+/// Результат диагностики (числа для UI).
 pub struct DiagnosticsResult {
     pub overfit_loss: f32,
     pub extrapolation_rows: usize,
@@ -52,7 +52,7 @@ pub struct KanSymbolicInfo {
     pub formulas: String,
     pub min_edge_r2: f32,
     pub mean_edge_r2: f32,
-    /// Метрики формул на test: `None` у модели из checkpoint-а (нет test-набора).
+    /// Метрики формул на validation: `None` у модели из checkpoint-а.
     pub formula_metrics: Option<Metrics>,
     pub kan_r2: Option<f32>,
     pub weak_edges: Vec<KanWeakEdge>,
@@ -130,7 +130,7 @@ pub enum Event {
         epoch: usize,
         loss: f32,
     },
-    /// Завершение обучения: `Some` — метрики на тесте, `None` — отменено.
+    /// Завершение обучения: `Some` — метрики на validation, `None` — отменено.
     TrainDone {
         metrics: Option<Metrics>,
     },

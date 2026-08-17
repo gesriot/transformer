@@ -24,11 +24,14 @@ use transformer::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
 use transformer::epoch_sweep;
 use transformer::generate::generate;
 use transformer::init::set_init_seed;
-use transformer::metrics::{evaluate, evaluate_per_output};
+use transformer::metrics::{evaluate, evaluate_per_output, Metrics};
 use transformer::numeric_model::{
     validate_numeric, KanConfig, ModelKind, NumericConfig, NumericModel,
 };
 use transformer::serialize::{calibration_sample, load_numeric, save_numeric};
+use transformer::split::{
+    SplitPlan, DEFAULT_DATA_SEED, DEFAULT_FINAL_INIT_SEED, DEFAULT_SPLIT_SEED,
+};
 use transformer::sweep as sweep_core;
 use transformer::symbolic;
 use transformer::tensor::Tensor;
@@ -37,8 +40,8 @@ use transformer::tnum::{
     infer_prepare_spec_from_path, parse_categorical, table_path_to_tnum, Delimiter, PrepareSpec,
 };
 use transformer::train::{
-    evaluate_surrogate, predict_dataset, train_surrogate, train_text, validate_train, LrSchedule,
-    TextTrainConfig, TrainConfig,
+    evaluate_surrogate, fit_normalizers, predict_dataset, train_surrogate, train_text,
+    validate_train, LrSchedule, TextTrainConfig, TrainConfig,
 };
 
 /// Разобранные аргументы: `--key value` во flags, остальное — позиционные.
@@ -317,12 +320,16 @@ fn apply_kan_l1(model: &NumericModel, sparsity: &Option<KanSparsity>) {
 }
 
 /// Прунинг + fine-tune обученной KAN: важность p95 |φ| на train, hard-prune
-/// ниже относительного порога, дообучение с λ=0 и сравнение R² по фазам.
+/// ниже относительного порога, дообучение с λ=0.
+///
+/// `eval` — набор для отчёта о влиянии прунинга (validation в фазе разработки).
+/// У финальной модели его нет: test потратить нельзя, а train+validation уже
+/// внутри обучения, поэтому там печатаются только активные рёбра.
 #[allow(clippy::too_many_arguments)]
 fn run_kan_prune(
     model: &NumericModel,
     train: &NumericDataset,
-    test: &NumericDataset,
+    eval: Option<&NumericDataset>,
     in_norm: &Normalizer,
     out_norm: &Normalizer,
     tcfg: &TrainConfig,
@@ -330,7 +337,7 @@ fn run_kan_prune(
     finetune_epochs: usize,
 ) {
     let kan = model.as_kan().expect("прунинг вызывается только для KAN");
-    let before = evaluate_surrogate(model, test, in_norm, out_norm);
+    let before = eval.map(|d| evaluate_surrogate(model, d, in_norm, out_norm));
 
     let calibration = in_norm.transform(&train.inputs);
     let report = kan.prune_edges(threshold, &calibration);
@@ -338,7 +345,7 @@ fn run_kan_prune(
     for (l, (a, t)) in report.per_layer.iter().enumerate() {
         println!("  слой {l}: {a}/{t} активных рёбер");
     }
-    let after_prune = evaluate_surrogate(model, test, in_norm, out_norm);
+    let after_prune = eval.map(|d| evaluate_surrogate(model, d, in_norm, out_norm));
 
     kan.set_l1_lambda(0.0);
     let ft_cfg = TrainConfig {
@@ -346,13 +353,15 @@ fn run_kan_prune(
         ..tcfg.clone()
     };
     train_surrogate(model, train, in_norm, out_norm, &ft_cfg);
-    let after_ft = evaluate_surrogate(model, test, in_norm, out_norm);
 
     let (active, total) = report.totals();
-    println!(
-        "R² на test: до прунинга {:.5} -> после {:.5} -> после fine-tune ({finetune_epochs} эпох, λ=0) {:.5}",
-        before.r2, after_prune.r2, after_ft.r2
-    );
+    if let (Some(before), Some(after_prune), Some(eval)) = (before, after_prune, eval) {
+        let after_ft = evaluate_surrogate(model, eval, in_norm, out_norm);
+        println!(
+            "R² на validation: до прунинга {:.5} -> после {:.5} -> после fine-tune ({finetune_epochs} эпох, λ=0) {:.5}",
+            before.r2, after_prune.r2, after_ft.r2
+        );
+    }
     println!("Активных рёбер: {active}/{total} (параметры не сжимаются — это следующий шаг)");
 }
 
@@ -368,35 +377,42 @@ fn validate_kan_symbolic(f: &Flags, nc: &NumericConfig) -> Result<(), String> {
 
 /// Структурное сжатие KAN: физически удаляет мёртвые скрытые узлы (после
 /// hard-prune) с реальным уменьшением числа параметров и проверяет, что
-/// функция сети не изменилась (R² на test до/после).
+/// функция сети не изменилась (R² на переданной eval-части до/после).
 fn run_kan_compact(
     model: &mut NumericModel,
-    test: &NumericDataset,
+    eval: Option<&NumericDataset>,
     in_norm: &Normalizer,
     out_norm: &Normalizer,
 ) {
-    let before = evaluate_surrogate(model, test, in_norm, out_norm);
+    let before = eval.map(|d| evaluate_surrogate(model, d, in_norm, out_norm));
     let report = model
         .as_kan_mut()
         .expect("структурное сжатие вызывается только для KAN")
         .compact();
-    let after = evaluate_surrogate(model, test, in_norm, out_norm);
     println!(
         "\nСтруктурное сжатие: скрытых узлов {} -> {}, параметров {} -> {}",
         report.nodes_before, report.nodes_after, report.params_before, report.params_after
     );
-    println!(
-        "R² на test: {:.5} -> {:.5} (удаление точное — совпадение ожидаемо)",
-        before.r2, after.r2
-    );
+    if let (Some(before), Some(eval)) = (before, eval) {
+        let after = evaluate_surrogate(model, eval, in_norm, out_norm);
+        println!(
+            "R² на validation: {:.5} -> {:.5} (удаление точное — совпадение ожидаемо)",
+            before.r2, after.r2
+        );
+    }
 }
 
-/// Symbolic extraction обученной KAN: фит рёбер примитивами по train-активациям,
-/// послойные формулы и верность формул на test.
+/// Symbolic extraction обученной KAN: фит рёбер примитивами по активациям,
+/// послойные формулы и верность формул.
+///
+/// Запускается на ФИНАЛЬНОЙ модели — той, что сохраняется, — поэтому формулы
+/// соответствуют сохранённому checkpoint-у. Верность считается на train+
+/// validation: test потратить нельзя, и число рядом с R² самой KAN на тех же
+/// данных показывает именно расхождение «формулы против модели».
 fn run_kan_symbolic(
     model: &NumericModel,
     train: &NumericDataset,
-    test: &NumericDataset,
+    eval: &NumericDataset,
     in_norm: &Normalizer,
     out_norm: &Normalizer,
 ) {
@@ -424,15 +440,16 @@ fn run_kan_symbolic(
         }
     }
 
-    let pred = sym.predict(&test.inputs);
-    let m = evaluate(&pred, &test.outputs);
-    let kan_m = evaluate_surrogate(model, test, in_norm, out_norm);
+    let pred = sym.predict(&eval.inputs);
+    let m = evaluate(&pred, &eval.outputs);
+    let kan_m = evaluate_surrogate(model, eval, in_norm, out_norm);
     println!(
-        "Формулы как модель на test: R² = {:.5} (KAN: {:.5}), rel = {:.2}%",
+        "Формулы как модель на train+validation: R² = {:.5} (KAN там же: {:.5}), rel = {:.2}%",
         m.r2,
         kan_m.r2,
         m.rel_error * 100.0
     );
+    println!("  (обучающие данные — это верность формул модели, а не обобщение)");
 }
 
 /// Число эпох: флаг `--epochs`, иначе позиционный аргумент (legacy), иначе 40.
@@ -536,37 +553,14 @@ fn print_config(nc: &NumericConfig, tcfg: &TrainConfig) {
     );
 }
 
-fn report_and_eval(
-    model: &NumericModel,
-    train: &NumericDataset,
-    test: &NumericDataset,
-    in_norm: &Normalizer,
-    out_norm: &Normalizer,
-    tcfg: &TrainConfig,
-) {
-    let n_params: usize = model.parameters().iter().map(|p| p.data().len()).sum();
-    println!("Параметров: {n_params}");
-    println!(
-        "Обучение: {} эпох, {} train / {} test...",
-        tcfg.epochs,
-        train.len(),
-        test.len()
-    );
-    let history = train_surrogate(model, train, in_norm, out_norm, tcfg);
-    for (e, loss) in history.iter().enumerate() {
-        if e % 5 == 0 || e + 1 == history.len() {
-            println!("  эпоха {e:>3}: train loss (норм.) = {loss:.5}");
-        }
-    }
-    let pred = predict_dataset(model, test, in_norm, out_norm);
-    let m = evaluate(&pred, &test.outputs);
-    println!("\nМетрики на test (в исходных единицах):");
+/// Печать метрик с явным указанием, откуда они взяты.
+fn print_metrics(title: &str, m: &Metrics, per: &[Metrics]) {
+    println!("\n{title} (в исходных единицах):");
     println!("  RMSE        = {:.5}", m.rmse);
     println!("  MAE         = {:.5}", m.mae);
     println!("  rel. error  = {:.2}%", m.rel_error * 100.0);
     println!("  R²          = {:.5}", m.r2);
 
-    let per = evaluate_per_output(&pred, &test.outputs);
     if per.len() > 1 {
         println!("\nПо выходам:");
         println!("  out   RMSE        MAE       rel.err     R²");
@@ -582,15 +576,182 @@ fn report_and_eval(
     }
 }
 
+/// Собрать и обучить модель. `init_seed` разделён с `tcfg.seed` (порядок
+/// батчей), потому что финальная модель инициализируется заранее заданным
+/// `final_init_seed`, а не тем, что подбирался в поиске.
+#[allow(clippy::too_many_arguments)]
+fn build_and_train(
+    nc: &NumericConfig,
+    specs: &[FeatureSpec],
+    n_outputs: usize,
+    train: &NumericDataset,
+    in_norm: &Normalizer,
+    out_norm: &Normalizer,
+    tcfg: &TrainConfig,
+    sparsity: &Option<KanSparsity>,
+    init_seed: u64,
+) -> NumericModel {
+    set_init_seed(init_seed);
+    let model = nc.build(specs, n_outputs);
+    apply_kan_l1(&model, sparsity);
+    let n_params: usize = model.parameters().iter().map(|p| p.data().len()).sum();
+    println!("Параметров: {n_params}");
+    println!("Обучение: {} эпох, {} строк...", tcfg.epochs, train.len());
+    let history = train_surrogate(&model, train, in_norm, out_norm, tcfg);
+    for (e, loss) in history.iter().enumerate() {
+        if e % 5 == 0 || e + 1 == history.len() {
+            println!("  эпоха {e:>3}: train loss (норм.) = {loss:.5}");
+        }
+    }
+    model
+}
+
+/// Общий поток обучения для `numeric` и `numeric-file`.
+///
+/// Две фазы. Разработка: обучение на train, все решения и диагностика по
+/// validation. Финал: та же конфигурация и тот же KAN-конвейер переобучаются на
+/// train+validation с `final_init_seed`, после чего test открывается ОДИН раз.
+/// Сохраняется и разбирается на формулы именно финальная модель.
+fn run_numeric_flow(
+    f: &Flags,
+    data: NumericDataset,
+    in_specs: Vec<FeatureSpec>,
+    bb: Option<&blackbox::BlackBox>,
+) {
+    let epochs = resolve_epochs(f);
+    let save_path = f.get("model").or_else(|| f.pos(2));
+    let nc = numeric_config_from(f).unwrap_or_else(|e| fail(&e));
+    let tcfg = train_config_from(f, epochs).unwrap_or_else(|e| fail(&e));
+    let n_outputs = data.outputs.ncols();
+
+    let plan = SplitPlan::default();
+    let prepared = plan.prepare(&data).unwrap_or_else(|e| fail(&e));
+    // CLI работает по holdout, поэтому fold ровно один: train / validation.
+    let (train, val) = prepared.search.fold(0).unwrap_or_else(|e| fail(&e));
+    println!(
+        "Разбиение: {} train / {} validation / {} test (holdout, seed {})",
+        train.len(),
+        val.len(),
+        prepared.test.len(),
+        DEFAULT_SPLIT_SEED
+    );
+
+    print_config(&nc, &tcfg);
+    let sparsity = kan_sparsity_from(f, &nc).unwrap_or_else(|e| fail(&e));
+    validate_kan_symbolic(f, &nc).unwrap_or_else(|e| fail(&e));
+
+    // --- Фаза разработки: всё, что влияет на решения, меряется по validation.
+    println!("\n=== ФАЗА РАЗРАБОТКИ (метрики на validation) ===");
+    let (in_norm, out_norm) = fit_normalizers(&train, &in_specs);
+    let mut dev = build_and_train(
+        &nc, &in_specs, n_outputs, &train, &in_norm, &out_norm, &tcfg, &sparsity, tcfg.seed,
+    );
+    let pred = predict_dataset(&dev, &val, &in_norm, &out_norm);
+    print_metrics(
+        "Метрики на validation",
+        &evaluate(&pred, &val.outputs),
+        &evaluate_per_output(&pred, &val.outputs),
+    );
+    if let Some(threshold) = sparsity.as_ref().and_then(|s| s.prune) {
+        let ft = sparsity.as_ref().map_or(10, |s| s.finetune_epochs);
+        run_kan_prune(
+            &dev,
+            &train,
+            Some(&val),
+            &in_norm,
+            &out_norm,
+            &tcfg,
+            threshold,
+            ft,
+        );
+    }
+    if f.has("kan-compact") {
+        run_kan_compact(&mut dev, Some(&val), &in_norm, &out_norm);
+    }
+    if f.has("diagnose") {
+        run_diagnostics(
+            &nc, &in_specs, n_outputs, &train, &val, &in_norm, &out_norm, &dev, bb,
+        );
+    }
+
+    // --- Финал: переобучение на train+validation и единственный замер на test.
+    println!("\n=== ФИНАЛЬНАЯ МОДЕЛЬ (train + validation, seed {DEFAULT_FINAL_INIT_SEED}) ===");
+    let pool = prepared.search.all();
+    let (fin_in_norm, fin_out_norm) = fit_normalizers(&pool, &in_specs);
+    // Финальный seed фиксирует всю стохастику обучения: и веса, и
+    // порядок батчей. Иначе provenance обещал бы меньше, чем реально
+    // определяет final_init_seed.
+    let mut final_tcfg = tcfg.clone();
+    final_tcfg.seed = DEFAULT_FINAL_INIT_SEED;
+    let mut model = build_and_train(
+        &nc,
+        &in_specs,
+        n_outputs,
+        &pool,
+        &fin_in_norm,
+        &fin_out_norm,
+        &final_tcfg,
+        &sparsity,
+        DEFAULT_FINAL_INIT_SEED,
+    );
+    if let Some(threshold) = sparsity.as_ref().and_then(|s| s.prune) {
+        let ft = sparsity.as_ref().map_or(10, |s| s.finetune_epochs);
+        run_kan_prune(
+            &model,
+            &pool,
+            None,
+            &fin_in_norm,
+            &fin_out_norm,
+            &final_tcfg,
+            threshold,
+            ft,
+        );
+    }
+    if f.has("kan-compact") {
+        run_kan_compact(&mut model, None, &fin_in_norm, &fin_out_norm);
+    }
+    if f.has("kan-symbolic") {
+        run_kan_symbolic(&model, &pool, &pool, &fin_in_norm, &fin_out_norm);
+    }
+
+    let final_eval = prepared
+        .test
+        .evaluate(
+            |inputs| {
+                let ds =
+                    NumericDataset::new(inputs.clone(), Array2::zeros((inputs.nrows(), n_outputs)));
+                predict_dataset(&model, &ds, &fin_in_norm, &fin_out_norm)
+            },
+            DEFAULT_FINAL_INIT_SEED,
+        )
+        .unwrap_or_else(|e| fail(&e));
+    print_metrics(
+        &format!(
+            "Метрики на test ({} строк, единственный замер)",
+            final_eval.origin.test_rows
+        ),
+        &final_eval.metrics,
+        &final_eval.per_output,
+    );
+
+    if let Some(path) = save_path {
+        save_and_verify(
+            path,
+            &nc,
+            &in_specs,
+            n_outputs,
+            &model,
+            &fin_in_norm,
+            &fin_out_norm,
+            &pool,
+        );
+    }
+}
+
 fn run_numeric(args: &[String]) {
     let f =
         Flags::parse(&args[2..], NUMERIC_FLAGS, NUMERIC_BOOL_FLAGS).unwrap_or_else(|e| fail(&e));
     let name = f.pos(0).unwrap_or("sum");
-    let epochs = resolve_epochs(&f);
-    let save_path = f.get("model").or_else(|| f.pos(2));
-    // Конфиг строим сразу — битый флаг падает до любой работы.
-    let nc = numeric_config_from(&f).unwrap_or_else(|e| fail(&e));
-    let tcfg = train_config_from(&f, epochs).unwrap_or_else(|e| fail(&e));
 
     let bb = match blackbox::by_name(name) {
         Some(bb) => bb,
@@ -607,60 +768,11 @@ fn run_numeric(args: &[String]) {
         bb.n_outputs
     );
 
-    let data = bb.generate(2000, 0);
-    let (train, test) = data.split(0.8, 1);
+    // Данные генерируются фиксированным data_seed: --seed меняет только
+    // инициализацию модели и порядок батчей.
+    let data = bb.generate(2000, DEFAULT_DATA_SEED);
     let in_specs = vec![FeatureSpec::Continuous; bb.n_inputs()];
-    let in_norm = Normalizer::fit(&train.inputs, &in_specs);
-    let out_norm = Normalizer::fit(&train.outputs, &Normalizer::all_continuous(bb.n_outputs));
-
-    print_config(&nc, &tcfg);
-    let sparsity = kan_sparsity_from(&f, &nc).unwrap_or_else(|e| fail(&e));
-    validate_kan_symbolic(&f, &nc).unwrap_or_else(|e| fail(&e));
-
-    set_init_seed(tcfg.seed); // воспроизводимая инициализация
-    let mut model = nc.build(&in_specs, bb.n_outputs);
-    apply_kan_l1(&model, &sparsity);
-    report_and_eval(&model, &train, &test, &in_norm, &out_norm, &tcfg);
-    if let Some(threshold) = sparsity.as_ref().and_then(|s| s.prune) {
-        let ft = sparsity.as_ref().map_or(10, |s| s.finetune_epochs);
-        run_kan_prune(
-            &model, &train, &test, &in_norm, &out_norm, &tcfg, threshold, ft,
-        );
-    }
-    if f.has("kan-compact") {
-        run_kan_compact(&mut model, &test, &in_norm, &out_norm);
-    }
-    if f.has("kan-symbolic") {
-        run_kan_symbolic(&model, &train, &test, &in_norm, &out_norm);
-    }
-
-    if let Some(path) = save_path {
-        save_and_verify(
-            path,
-            &nc,
-            &in_specs,
-            bb.n_outputs,
-            &model,
-            &in_norm,
-            &out_norm,
-            &train,
-            &test,
-        );
-    }
-
-    if f.has("diagnose") {
-        run_diagnostics(
-            &nc,
-            &in_specs,
-            bb.n_outputs,
-            &train,
-            &test,
-            &in_norm,
-            &out_norm,
-            &model,
-            Some(&bb),
-        );
-    }
+    run_numeric_flow(&f, data, in_specs, Some(&bb));
 }
 
 fn run_numeric_file(args: &[String]) {
@@ -673,11 +785,6 @@ fn run_numeric_file(args: &[String]) {
             std::process::exit(1);
         }
     };
-    let epochs = resolve_epochs(&f);
-    let save_path = f.get("model").or_else(|| f.pos(2));
-    // Конфиг строим сразу — битый флаг падает до любой работы.
-    let nc = numeric_config_from(&f).unwrap_or_else(|e| fail(&e));
-    let tcfg = train_config_from(&f, epochs).unwrap_or_else(|e| fail(&e));
 
     let (data, in_specs) = match read_numeric_tnum(path) {
         Ok(v) => v,
@@ -686,50 +793,13 @@ fn run_numeric_file(args: &[String]) {
             std::process::exit(1);
         }
     };
-    let n_outputs = data.outputs.ncols();
     println!(
         "Датасет: {path} ({} строк, {} вход -> {} выход)",
         data.len(),
         data.inputs.ncols(),
-        n_outputs
+        data.outputs.ncols()
     );
-
-    let (train, test) = data.split(0.8, 1);
-    let in_norm = Normalizer::fit(&train.inputs, &in_specs);
-    let out_norm = Normalizer::fit(&train.outputs, &Normalizer::all_continuous(n_outputs));
-
-    print_config(&nc, &tcfg);
-    let sparsity = kan_sparsity_from(&f, &nc).unwrap_or_else(|e| fail(&e));
-    validate_kan_symbolic(&f, &nc).unwrap_or_else(|e| fail(&e));
-
-    set_init_seed(tcfg.seed); // воспроизводимая инициализация
-    let mut model = nc.build(&in_specs, n_outputs);
-    apply_kan_l1(&model, &sparsity);
-    report_and_eval(&model, &train, &test, &in_norm, &out_norm, &tcfg);
-    if let Some(threshold) = sparsity.as_ref().and_then(|s| s.prune) {
-        let ft = sparsity.as_ref().map_or(10, |s| s.finetune_epochs);
-        run_kan_prune(
-            &model, &train, &test, &in_norm, &out_norm, &tcfg, threshold, ft,
-        );
-    }
-    if f.has("kan-compact") {
-        run_kan_compact(&mut model, &test, &in_norm, &out_norm);
-    }
-    if f.has("kan-symbolic") {
-        run_kan_symbolic(&model, &train, &test, &in_norm, &out_norm);
-    }
-
-    if let Some(path) = save_path {
-        save_and_verify(
-            path, &nc, &in_specs, n_outputs, &model, &in_norm, &out_norm, &train, &test,
-        );
-    }
-
-    if f.has("diagnose") {
-        run_diagnostics(
-            &nc, &in_specs, n_outputs, &train, &test, &in_norm, &out_norm, &model, None,
-        );
-    }
+    run_numeric_flow(&f, data, in_specs, None);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -741,12 +811,11 @@ fn save_and_verify(
     model: &NumericModel,
     in_norm: &Normalizer,
     out_norm: &Normalizer,
-    train: &NumericDataset,
-    test: &NumericDataset,
+    pool: &NumericDataset,
 ) {
-    // Калибровка (выборка сырых train-строк) едет в checkpoint: symbolic
+    // Калибровка (выборка сырых обучающих строк) едет в checkpoint: symbolic
     // extraction остаётся доступной после загрузки .bin.
-    let calibration = calibration_sample(&train.inputs, 256);
+    let calibration = calibration_sample(&pool.inputs, 256);
     save_numeric(
         path,
         nc,
@@ -758,12 +827,17 @@ fn save_and_verify(
         Some(&calibration),
     )
     .expect("сохранение модели");
+    // Проверка целостности файла, а не качества: test уже потрачен, поэтому
+    // сравниваем предсказания загруженной модели с исходной на тех же данных.
     let (loaded, in2, out2) = load_numeric(path).expect("загрузка модели");
-    let m2 = evaluate_surrogate(&loaded, test, &in2, &out2);
-    println!(
-        "\nМодель сохранена в {path}; R² после загрузки = {:.5}",
-        m2.r2
-    );
+    let before = predict_dataset(model, pool, in_norm, out_norm);
+    let after = predict_dataset(&loaded, pool, &in2, &out2);
+    let max_diff = before
+        .iter()
+        .zip(after.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    println!("\nМодель сохранена в {path}; макс. расхождение после загрузки = {max_diff:.3e}");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -772,13 +846,15 @@ fn run_diagnostics(
     specs: &[FeatureSpec],
     n_outputs: usize,
     train: &NumericDataset,
-    test: &NumericDataset,
+    val: &NumericDataset,
     in_norm: &Normalizer,
     out_norm: &Normalizer,
     model: &NumericModel,
     bb: Option<&blackbox::BlackBox>,
 ) {
-    println!("\n=== ДИАГНОСТИКА ===");
+    // Диагностика — часть принятия решений, поэтому смотрит на validation:
+    // счёт экстраполяции и формы остатка по test означали бы подглядывание.
+    println!("\n=== ДИАГНОСТИКА (на validation) ===");
 
     // 1. Ёмкость: overfit маленького подмножества train.
     let subset = train.gather(&(0..train.len().min(48)).collect::<Vec<_>>());
@@ -796,16 +872,16 @@ fn run_diagnostics(
         }
     );
 
-    // 2. Покрытие: экстраполяция на test.
-    let rr = diagnostics::range_report(in_norm, &test.inputs);
+    // 2. Покрытие: экстраполяция на validation.
+    let rr = diagnostics::range_report(in_norm, &val.inputs);
     println!(
-        "Экстраполяция: {} из {} test-строк вне обученного диапазона",
+        "Экстраполяция: {} из {} validation-строк вне обученного диапазона",
         rr.rows_out, rr.total
     );
 
     // 3. Форма остатка по входным признакам.
-    let pred = predict_dataset(model, test, in_norm, out_norm);
-    let res = diagnostics::residual_diagnostics(&test.inputs, &pred, &test.outputs);
+    let pred = predict_dataset(model, val, in_norm, out_norm);
+    let res = diagnostics::residual_diagnostics(&val.inputs, &pred, &val.outputs);
     println!("Остаток по входным признакам:");
     for (j, d) in res.iter().enumerate() {
         println!(
@@ -957,23 +1033,20 @@ fn run_epoch_sweep_cmd(args: &[String]) {
     }
     let out_dir = f.get("out-dir").unwrap_or("runs").to_string();
 
-    let (train, test) = data.split(0.8, 1);
-    let in_norm = Normalizer::fit(&train.inputs, &specs);
-    let out_norm = Normalizer::fit(&train.outputs, &Normalizer::all_continuous(n_out));
+    let prepared = SplitPlan::default()
+        .prepare(&data)
+        .unwrap_or_else(|e| fail(&e));
     let nc = numeric_config_from(&f).unwrap_or_else(|e| fail(&e));
     let max_e = milestones.iter().copied().max().unwrap_or(1);
     let base_tcfg = train_config_from(&f, max_e).unwrap_or_else(|e| fail(&e));
 
     println!(
-        "Epoch-sweep {path}: эпохи {milestones:?}, {} train / {} test",
-        train.len(),
-        test.len()
+        "Epoch-sweep {path}: эпохи {milestones:?}, {} строк в поиске, test ({} строк) не трогаем",
+        prepared.search.len(),
+        prepared.test.len()
     );
     let rows = epoch_sweep::run_epoch_sweep(
-        &train,
-        &test,
-        &in_norm,
-        &out_norm,
+        &prepared.search,
         &nc,
         &specs,
         n_out,
@@ -981,7 +1054,7 @@ fn run_epoch_sweep_cmd(args: &[String]) {
         &milestones,
     );
 
-    println!("\nepochs  train_loss     RMSE       MAE      rel.err     R²");
+    println!("\nepochs  train_loss     RMSE       MAE      rel.err     R² (validation)");
     for r in &rows {
         println!(
             "{:>6}  {:>10.5}  {:>9.5}  {:>9.5}  {:>7.2}%  {:>8.5}",
@@ -1227,14 +1300,22 @@ fn run_sweep(args: &[String]) {
     let never = std::sync::atomic::AtomicBool::new(false);
     let result = sweep_core::run_blackbox_sweep(name, &axes, &never, |row| {
         println!(
-            "  done: {} -> R²={:.5}±{:.5}",
-            row.label, row.r2_mean, row.r2_std
+            "  done [{}]: {} -> R²={:.5}±{:.5}",
+            epoch_sweep::source_label(row.source),
+            row.label,
+            row.r2_mean,
+            row.r2_std
         );
     })
     .unwrap_or_else(|e| fail(&e));
 
     // Ранжируем по среднему R² (рекомендация — первая строка).
-    println!("\n=== РАНЖИРОВАНИЕ (по среднему R²; rel — справочно) ===");
+    let source = result
+        .rows
+        .first()
+        .map(|row| epoch_sweep::source_label(row.source))
+        .unwrap_or_else(|| "validation".to_string());
+    println!("\n=== РАНЖИРОВАНИЕ ({source}; по среднему R²; rel — справочно) ===");
     for (i, r) in result.rows.iter().enumerate() {
         let mark = if i == 0 { "*" } else { " " };
         println!(

@@ -1,5 +1,4 @@
-//! egui-приложение (PlanUI §3). UI-M4: Train-панель с конфигом, живой кривой
-//! loss и кооперативной отменой. Прочие вкладки — заглушки (M5+).
+//! egui-приложение: формы обучения, поиска, прогноза и диагностики.
 //! UI только рендерит и общается с worker каналами; ML-состояние — в worker.
 
 use super::messages::{
@@ -1494,12 +1493,13 @@ impl App {
         if let Some(m) = &self.metrics {
             ui.separator();
             ui.label(format!(
-                "RMSE={:.5}   MAE={:.5}   rel.error={:.2}%   R²={:.5}",
+                "validation: RMSE={:.5}   MAE={:.5}   rel.error={:.2}%   R²={:.5}",
                 m.rmse,
                 m.mae,
                 m.rel_error * 100.0,
                 m.r2
             ));
+            ui.label("Test отложен и в этой сессии не открывается.");
         }
     }
 
@@ -1705,7 +1705,7 @@ impl App {
             .show(ui, |ui| {
                 match (&result.formula_metrics, result.kan_r2) {
                     (Some(metrics), Some(kan_r2)) => {
-                        ui.label("R² формул на test");
+                        ui.label("R² формул на validation");
                         ui.label(format!("{:.5} (KAN: {kan_r2:.5})", metrics.r2));
                         ui.end_row();
                         ui.label("Ошибка формул");
@@ -1718,7 +1718,7 @@ impl App {
                     }
                     _ => {
                         ui.label("Test-метрики");
-                        ui.label("недоступны: модель из checkpoint-а (нет test-набора)");
+                        ui.label("недоступны: модель из checkpoint-а (нет validation-набора)");
                         ui.end_row();
                     }
                 }
@@ -1802,7 +1802,7 @@ impl App {
                 "  → underfit: ёмкость или кодирование значений (value encoder / Fourier)"
             });
             ui.label(format!(
-                "Экстраполяция: {} из {} test-строк вне обученного диапазона",
+                "Экстраполяция: {} из {} validation-строк вне обученного диапазона",
                 d.extrapolation_rows, d.extrapolation_total
             ));
 
@@ -1970,8 +1970,9 @@ impl App {
                 .first()
                 .map(|r| (r.choice.epochs, r.choice.final_epochs))
                 .unwrap_or((0, 0));
+            let source = epoch_sweep::source_label(self.optimize_rows[0].source);
             ui.label(format!(
-                "Ранжирование: {} (поиск на {search_epochs} эпох; Apply -> {final_epochs})",
+                "Ранжирование: {}; метрики {source} (поиск на {search_epochs} эпох; Apply -> {final_epochs})",
                 objective_label(self.optimize_form.objective())
             ));
             egui::ScrollArea::vertical()
@@ -2099,6 +2100,10 @@ impl App {
 
         if !self.sweep_rows.is_empty() {
             ui.separator();
+            ui.label(format!(
+                "Источник метрик: {}",
+                epoch_sweep::source_label(self.sweep_rows[0].source)
+            ));
             egui::ScrollArea::vertical()
                 .max_height(320.0)
                 .show(ui, |ui| {

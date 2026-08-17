@@ -9,7 +9,7 @@
 //! поэтому отдельный модуль задаёт границу API.
 
 use crate::data::NumericDataset;
-use crate::metrics::{evaluate, evaluate_per_output, EvalSource, Metrics};
+use crate::metrics::{evaluate, evaluate_per_output, EvalSource, Metrics, RunOrigin};
 use ndarray::Array2;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -274,6 +274,19 @@ impl SearchPool {
     /// перед единственным замером на test.
     pub fn all(&self) -> NumericDataset {
         self.pool.gather(&(0..self.pool.len()).collect::<Vec<_>>())
+    }
+
+    /// Происхождение прогона на fold `i`. Номер fold проставляет pool, а не
+    /// потребитель: у holdout он обязан быть `None`, у CV — `Some(i)`, и
+    /// `aggregate_runs` это проверяет.
+    pub fn run_origin(&self, fold: usize, init_seed: u64) -> RunOrigin {
+        RunOrigin {
+            fold: match self.source {
+                EvalSource::Validation => None,
+                _ => Some(fold),
+            },
+            init_seed,
+        }
     }
 }
 
@@ -549,6 +562,53 @@ mod tests {
         assert_eq!(f.origin.test_rows, 15);
         assert_eq!(f.origin.plan, plan);
         assert_eq!(f.source(), EvalSource::Test);
+    }
+
+    #[test]
+    fn final_eval_reacts_to_test_targets() {
+        let data = labeled(100);
+        let plan = SplitPlan::default();
+        let prepared = plan.prepare(&data).unwrap();
+        let mut test_labels = BTreeSet::new();
+        let baseline = prepared
+            .test
+            .evaluate(
+                |inputs| {
+                    Array2::from_shape_fn((inputs.nrows(), 1), |(i, _)| {
+                        let label = (inputs[[i, 0]] / 10.0).round();
+                        test_labels.insert(label as i64);
+                        label
+                    })
+                },
+                DEFAULT_FINAL_INIT_SEED,
+            )
+            .unwrap();
+        assert!((baseline.metrics.r2 - 1.0).abs() < 1e-6);
+
+        let mut poisoned = NumericDataset::new(data.inputs.clone(), data.outputs.clone());
+        for i in 0..poisoned.len() {
+            if test_labels.contains(&((poisoned.inputs[[i, 0]] / 10.0).round() as i64)) {
+                poisoned.outputs[[i, 0]] += 1_000.0;
+            }
+        }
+        let changed = plan
+            .prepare(&poisoned)
+            .unwrap()
+            .test
+            .evaluate(
+                |inputs| {
+                    Array2::from_shape_fn((inputs.nrows(), 1), |(i, _)| {
+                        (inputs[[i, 0]] / 10.0).round()
+                    })
+                },
+                DEFAULT_FINAL_INIT_SEED,
+            )
+            .unwrap();
+
+        assert!(
+            (changed.metrics.r2 - baseline.metrics.r2).abs() > 1e-3,
+            "подмена test-targets должна менять FinalEval"
+        );
     }
 
     #[test]
