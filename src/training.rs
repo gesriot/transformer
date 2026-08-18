@@ -11,7 +11,9 @@
 
 use crate::data::{Normalizer, NumericDataset};
 use crate::init::set_init_seed;
-use crate::metrics::{evaluate, evaluate_per_output, EvalSource, Metrics};
+use crate::metrics::{
+    aggregate_runs, evaluate, evaluate_per_output, ConfigEval, EvalSource, Metrics, RunEval,
+};
 use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
 use crate::schema::ModelSchema;
 use crate::split::{FinalEval, SearchPool, SplitPlan};
@@ -239,6 +241,312 @@ pub struct TrainingOutcome {
     /// Единственный замер на test: `None`, если фазу не запрашивали либо запуск
     /// отменён до оценки.
     pub final_eval: Option<FinalEval>,
+}
+
+// --- поиск конфигурации ---
+
+/// Что оптимизирует поиск.
+///
+/// По умолчанию worst-output R²: aggregate умеет скрыть полностью проваленный
+/// выход, а у задачи с несколькими выходами это ровно то, что важно заметить.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchObjective {
+    #[default]
+    WorstOutputR2,
+    AggregateR2,
+    MeanOutputR2,
+    Nrmse,
+}
+
+impl SearchObjective {
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchObjective::WorstOutputR2 => "worst-output R²",
+            SearchObjective::AggregateR2 => "aggregate R²",
+            SearchObjective::MeanOutputR2 => "mean-output R²",
+            SearchObjective::Nrmse => "aggregate nRMSE",
+        }
+    }
+
+    /// Чем больше, тем лучше — включая nRMSE, который для этого меняет знак.
+    pub fn score(self, eval: &ConfigEval, runs: &[RunEval]) -> f32 {
+        let per_output_r2 = || eval.per_output_mean.iter().map(|m| m.r2);
+        match self {
+            SearchObjective::AggregateR2 => eval.mean.r2,
+            SearchObjective::WorstOutputR2 => per_output_r2().fold(f32::INFINITY, f32::min),
+            SearchObjective::MeanOutputR2 => {
+                let values: Vec<f32> = per_output_r2().collect();
+                values.iter().sum::<f32>() / values.len().max(1) as f32
+            }
+            // nRMSE — нелинейное преобразование R², поэтому считается по каждому
+            // прогону до усреднения, а не из уже среднего R².
+            SearchObjective::Nrmse => {
+                -runs
+                    .iter()
+                    .map(|run| (1.0 - run.metrics.r2).max(0.0).sqrt())
+                    .sum::<f32>()
+                    / runs.len().max(1) as f32
+            }
+        }
+    }
+}
+
+/// План поиска: по каким seed повторять каждую конфигурацию и что оптимизировать.
+///
+/// Данные и разбиение сюда не входят: они приходят готовыми, а `seeds` меняет
+/// только инициализацию (см. [`crate::split`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SearchPlan {
+    pub seeds: Vec<u64>,
+    pub objective: SearchObjective,
+}
+
+impl Default for SearchPlan {
+    fn default() -> Self {
+        Self {
+            seeds: vec![0],
+            objective: SearchObjective::default(),
+        }
+    }
+}
+
+impl SearchPlan {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.seeds.is_empty() {
+            return Err("seeds: пустой список".to_string());
+        }
+        let unique: std::collections::BTreeSet<u64> = self.seeds.iter().copied().collect();
+        if unique.len() != self.seeds.len() {
+            return Err("seeds: повторяющиеся значения".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Стоимость поиска — считается ДО запуска, чтобы её можно было показать.
+///
+/// Пользователю важнее понимать цену операции, чем название пресета: «600
+/// прогонов по 40 эпох» останавливает вовремя, «Тщательно» — нет.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchCost {
+    pub configs: usize,
+    pub seeds: usize,
+    pub folds: usize,
+    pub runs: usize,
+    /// Верхняя граница эпох на прогон: ранняя остановка может её сократить.
+    pub max_epochs: usize,
+    /// Верхняя граница суммы эпох с учётом длины каждого кандидата. Это не
+    /// обязательно `runs × max_epochs`: кандидаты могут иметь разный бюджет.
+    epochs_upper_bound: usize,
+}
+
+impl SearchCost {
+    pub fn new(configs: usize, seeds: usize, folds: usize, max_epochs: usize) -> Self {
+        let runs = configs.saturating_mul(seeds).saturating_mul(folds);
+        Self {
+            configs,
+            seeds,
+            folds,
+            runs,
+            max_epochs,
+            epochs_upper_bound: runs.saturating_mul(max_epochs),
+        }
+    }
+
+    fn with_epochs_upper_bound(
+        configs: usize,
+        seeds: usize,
+        folds: usize,
+        max_epochs: usize,
+        epochs_upper_bound: usize,
+    ) -> Self {
+        let mut cost = Self::new(configs, seeds, folds, max_epochs);
+        cost.epochs_upper_bound = epochs_upper_bound;
+        cost
+    }
+
+    /// Оценка сверху по числу обучающих эпох во всём поиске.
+    pub fn epochs_upper_bound(&self) -> usize {
+        self.epochs_upper_bound
+    }
+
+    pub fn describe(&self) -> String {
+        let folds = if self.folds > 1 {
+            format!(" × {} folds", self.folds)
+        } else {
+            String::new()
+        };
+        let configs = russian_count(self.configs, "конфигурация", "конфигурации", "конфигураций");
+        let runs = russian_count(self.runs, "прогон", "прогона", "прогонов");
+        let per_run_epochs = russian_epochs(self.max_epochs);
+        let total_epochs = russian_epochs(self.epochs_upper_bound());
+        format!(
+            "{configs} × {} seed{folds} = {runs}, до {per_run_epochs} на прогон (не более {total_epochs} всего)",
+            self.seeds
+        )
+    }
+}
+
+fn russian_count(n: usize, one: &str, few: &str, many: &str) -> String {
+    let form = if (11..=14).contains(&(n % 100)) {
+        many
+    } else {
+        match n % 10 {
+            1 => one,
+            2..=4 => few,
+            _ => many,
+        }
+    };
+    format!("{n} {form}")
+}
+
+fn russian_epochs(n: usize) -> String {
+    let form = if n % 10 == 1 && n % 100 != 11 {
+        "эпохи"
+    } else {
+        "эпох"
+    };
+    format!("{n} {form}")
+}
+
+/// Кандидат поиска: подпись для отчёта и конфигурация запуска.
+pub struct SearchCandidate {
+    pub label: String,
+    pub setup: TrainingSetup,
+}
+
+/// Результат по одной конфигурации.
+pub struct SearchRow {
+    /// Позиция кандидата в исходном списке: ранжирование меняет порядок, а
+    /// вызывающему нужно вернуться к своим данным о конфигурации.
+    pub candidate: usize,
+    pub label: String,
+    pub eval: ConfigEval,
+    pub runs: Vec<RunEval>,
+    pub score: f32,
+}
+
+pub struct SearchResults {
+    pub rows: Vec<SearchRow>,
+    pub cost: SearchCost,
+    pub cancelled: bool,
+}
+
+/// Перебрать кандидатов на подготовленном pool и отранжировать их.
+///
+/// Test сюда не попадает физически: [`SearchPool`] его не содержит. Каждый
+/// кандидат обучается на всех seed и всех folds, свёртка — через
+/// [`aggregate_runs`] (folds внутри seed, затем seeds).
+pub fn search(
+    dataset: &Dataset,
+    pool: &SearchPool,
+    candidates: &[SearchCandidate],
+    plan: &SearchPlan,
+    cancel: &AtomicBool,
+    on_row: &mut dyn FnMut(&SearchRow),
+) -> Result<SearchResults, String> {
+    plan.validate()?;
+    if candidates.is_empty() {
+        return Err("поиск без кандидатов".to_string());
+    }
+    // Проверяем всю работу до первого дорогостоящего запуска: ошибка во втором
+    // кандидате не должна обнаруживаться после обучения первого.
+    for (index, candidate) in candidates.iter().enumerate() {
+        candidate
+            .setup
+            .validate()
+            .map_err(|error| format!("кандидат {index} ('{}'): {error}", candidate.label))?;
+    }
+    let cost = search_cost(candidates, plan, pool.n_folds());
+
+    let mut rows: Vec<SearchRow> = Vec::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(finish(rows, cost, true));
+        }
+
+        let mut runs = Vec::new();
+        for &seed in &plan.seeds {
+            for fold in 0..pool.n_folds() {
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(finish(rows, cost, true));
+                }
+                let trained = train_candidate(
+                    dataset,
+                    pool,
+                    fold,
+                    &candidate.setup,
+                    seed,
+                    cancel,
+                    &mut |_| {},
+                    &mut |_| {},
+                )?;
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(finish(rows, cost, true));
+                }
+                let (_, val) = pool.fold(fold)?;
+                let (metrics, per_output) = evaluate_on(&trained, &val);
+                runs.push(RunEval {
+                    metrics,
+                    per_output,
+                    origin: pool.run_origin(fold, seed),
+                });
+            }
+        }
+
+        let eval = aggregate_runs(&runs, &plan.seeds, pool.source())?;
+        let row = SearchRow {
+            candidate: index,
+            label: candidate.label.clone(),
+            score: plan.objective.score(&eval, &runs),
+            eval,
+            runs,
+        };
+        on_row(&row);
+        rows.push(row);
+    }
+
+    Ok(finish(rows, cost, false))
+}
+
+/// Стоимость поиска по кандидатам и плану.
+pub fn search_cost(candidates: &[SearchCandidate], plan: &SearchPlan, folds: usize) -> SearchCost {
+    let epochs_per_seed_fold = candidates.iter().fold(0usize, |total, candidate| {
+        total.saturating_add(candidate.setup.train.epochs)
+    });
+    SearchCost::with_epochs_upper_bound(
+        candidates.len(),
+        plan.seeds.len(),
+        folds,
+        candidates
+            .iter()
+            .map(|c| c.setup.train.epochs)
+            .max()
+            .unwrap_or(0),
+        epochs_per_seed_fold
+            .saturating_mul(plan.seeds.len())
+            .saturating_mul(folds),
+    )
+}
+
+pub(crate) fn compare_scores_desc(a: f32, b: f32) -> std::cmp::Ordering {
+    match (a.is_finite(), b.is_finite()) {
+        (true, true) => b.total_cmp(&a),
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn finish(mut rows: Vec<SearchRow>, cost: SearchCost, cancelled: bool) -> SearchResults {
+    // Разошедшийся кандидат остаётся виден в отчёте, но NaN/inf не может
+    // случайно оказаться рекомендацией из-за `partial_cmp(None)`.
+    rows.sort_by(|a, b| compare_scores_desc(a.score, b.score));
+    SearchResults {
+        rows,
+        cost,
+        cancelled,
+    }
 }
 
 /// Обучить одного кандидата на fold `fold` и снять историю.
@@ -499,6 +807,7 @@ mod tests {
     use crate::blackbox;
     use crate::config::ModelConfig;
     use crate::encoders::ValueEncoderConfig;
+    use crate::metrics::{ConfigOrigin, RunOrigin};
     use crate::numeric_model::ModelKind;
     use crate::split::DEFAULT_FINAL_INIT_SEED;
     use crate::train::LrSchedule;
@@ -527,6 +836,206 @@ mod tests {
                 schedule: LrSchedule::Constant,
             },
         )
+    }
+
+    fn candidate(label: &str, epochs: usize) -> SearchCandidate {
+        SearchCandidate {
+            label: label.to_string(),
+            setup: setup(epochs),
+        }
+    }
+
+    #[test]
+    fn cost_counts_runs_and_epochs_before_launch() {
+        let cost = SearchCost::new(6, 2, 5, 40);
+        assert_eq!(cost.runs, 60);
+        assert_eq!(cost.epochs_upper_bound(), 2400);
+        let text = cost.describe();
+        assert!(text.contains("6 конфигураций"), "{text}");
+        assert!(text.contains("× 5 folds"), "{text}");
+        assert!(text.contains("60 прогонов"), "{text}");
+
+        // У holdout про folds не пишем — это шум.
+        let holdout = SearchCost::new(3, 1, 1, 10).describe();
+        assert!(!holdout.contains("folds"));
+        assert!(SearchCost::new(1, 1, 1, 1)
+            .describe()
+            .contains("до 1 эпохи на прогон"));
+    }
+
+    #[test]
+    fn cost_comes_from_candidates_and_plan() {
+        let candidates = vec![candidate("a", 10), candidate("b", 25)];
+        let plan = SearchPlan {
+            seeds: vec![0, 1, 2],
+            objective: SearchObjective::default(),
+        };
+        let cost = search_cost(&candidates, &plan, 4);
+        assert_eq!(cost.configs, 2);
+        assert_eq!(cost.seeds, 3);
+        assert_eq!(cost.folds, 4);
+        assert_eq!(cost.runs, 24);
+        // Верхняя граница — по самому длинному кандидату.
+        assert_eq!(cost.max_epochs, 25);
+        // Но сумма учитывает реальную длину обоих кандидатов, а не считает
+        // короткий как 25 эпох: (10 + 25) × 3 seeds × 4 folds.
+        assert_eq!(cost.epochs_upper_bound(), 420);
+        assert!(cost.describe().starts_with("2 конфигурации"));
+    }
+
+    #[test]
+    fn default_objective_is_worst_output_r2() {
+        assert_eq!(
+            SearchPlan::default().objective,
+            SearchObjective::WorstOutputR2
+        );
+        assert_eq!(SearchPlan::default().seeds, vec![0]);
+    }
+
+    #[test]
+    fn plan_rejects_empty_or_duplicate_seeds() {
+        let bad = SearchPlan {
+            seeds: vec![],
+            objective: SearchObjective::default(),
+        };
+        assert!(bad.validate().is_err());
+        let dup = SearchPlan {
+            seeds: vec![0, 0],
+            objective: SearchObjective::default(),
+        };
+        assert!(dup.validate().unwrap_err().contains("повторя"));
+    }
+
+    /// Худший выход не должен теряться в среднем: это и есть причина, по
+    /// которой worst-output R² выбран целью по умолчанию.
+    #[test]
+    fn objective_scores_differ_on_a_failed_output() {
+        let good = Metrics {
+            rmse: 0.0,
+            mae: 0.0,
+            rel_error: 0.0,
+            r2: 1.0,
+        };
+        let bad = Metrics {
+            r2: -1.0,
+            ..good.clone()
+        };
+        let eval = ConfigEval {
+            mean: good.clone(),
+            per_output_mean: vec![good.clone(), bad],
+            r2_std_seeds: 0.0,
+            r2_std_folds: 0.0,
+            origin: ConfigOrigin {
+                init_seeds: vec![0],
+                folds: 1,
+                source: EvalSource::Validation,
+            },
+        };
+        let runs = [RunEval {
+            metrics: good.clone(),
+            per_output: vec![good],
+            origin: RunOrigin {
+                fold: None,
+                init_seed: 0,
+            },
+        }];
+        assert_eq!(SearchObjective::AggregateR2.score(&eval, &runs), 1.0);
+        assert_eq!(SearchObjective::WorstOutputR2.score(&eval, &runs), -1.0);
+        assert_eq!(SearchObjective::MeanOutputR2.score(&eval, &runs), 0.0);
+    }
+
+    #[test]
+    fn search_ranks_candidates_and_reports_cost() {
+        let ds = dataset(120);
+        let never = AtomicBool::new(false);
+        let prepared = SplitPlan::default().prepare(ds.data()).unwrap();
+        // Один кандидат учится дольше — на простом sum он должен выиграть.
+        let candidates = vec![candidate("короткий", 1), candidate("длинный", 12)];
+        let mut seen = Vec::new();
+        let results = search(
+            &ds,
+            &prepared.search,
+            &candidates,
+            &SearchPlan::default(),
+            &never,
+            &mut |row| seen.push(row.label.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(results.cost.configs, 2);
+        assert_eq!(results.cost.runs, 2);
+        assert_eq!(results.cost.max_epochs, 12);
+        assert!(!results.cancelled);
+        // Callback видит кандидатов в исходном порядке, результат — по счёту.
+        assert_eq!(seen, vec!["короткий", "длинный"]);
+        assert_eq!(results.rows[0].label, "длинный");
+        assert!(results.rows[0].score >= results.rows[1].score);
+        // Индекс кандидата переживает ранжирование.
+        assert_eq!(results.rows[0].candidate, 1);
+    }
+
+    #[test]
+    fn search_rejects_empty_input_and_respects_cancel() {
+        let ds = dataset(120);
+        let never = AtomicBool::new(false);
+        let prepared = SplitPlan::default().prepare(ds.data()).unwrap();
+        assert!(search(
+            &ds,
+            &prepared.search,
+            &[],
+            &SearchPlan::default(),
+            &never,
+            &mut |_| {}
+        )
+        .is_err());
+
+        let cancelled = AtomicBool::new(true);
+        let results = search(
+            &ds,
+            &prepared.search,
+            &[candidate("a", 2)],
+            &SearchPlan::default(),
+            &cancelled,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(results.cancelled);
+        assert!(results.rows.is_empty());
+    }
+
+    #[test]
+    fn search_validates_every_candidate_before_training() {
+        let ds = dataset(120);
+        let never = AtomicBool::new(false);
+        let prepared = SplitPlan::default().prepare(ds.data()).unwrap();
+        let mut invalid = candidate("сломанный", 1);
+        invalid.setup.train.epochs = 0;
+        let mut completed = 0;
+        let error = search(
+            &ds,
+            &prepared.search,
+            &[candidate("дорогой", 10), invalid],
+            &SearchPlan::default(),
+            &never,
+            &mut |_| completed += 1,
+        )
+        .err()
+        .expect("невалидный кандидат должен остановить поиск");
+
+        assert_eq!(completed, 0, "ни один кандидат не должен обучаться");
+        assert!(error.contains("сломанный"), "{error}");
+    }
+
+    #[test]
+    fn non_finite_search_scores_are_ranked_last() {
+        use std::cmp::Ordering;
+
+        assert_eq!(compare_scores_desc(0.5, f32::NAN), Ordering::Less);
+        assert_eq!(compare_scores_desc(f32::INFINITY, 0.5), Ordering::Greater);
+        assert_eq!(
+            compare_scores_desc(f32::NAN, f32::NEG_INFINITY),
+            Ordering::Equal
+        );
     }
 
     #[test]

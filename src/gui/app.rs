@@ -13,7 +13,7 @@ use crate::markup::{analyze_roles, DraftType, RoleReport, SchemaDraft, Severity,
 use crate::metrics::Metrics;
 use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
 use crate::schema::{ColumnRole, ColumnType, ModelSchema};
-use crate::sweep::{self, SweepAxes, SweepChoice, SweepObjective, SweepRow};
+use crate::sweep::{self, SearchBudget, SweepAxes, SweepChoice, SweepObjective, SweepRow};
 use crate::table::Table;
 use crate::tnum::{infer_prepare_spec_from_path, parse_categorical, Delimiter, PrepareSpec};
 use crate::train::{validate_train, LrSchedule, TextTrainConfig, TrainConfig};
@@ -254,7 +254,7 @@ impl SweepForm {
 
 struct OptimizeForm {
     file_path: String,
-    preset: usize,    // 0 quick, 1 balanced, 2 deep
+    preset: usize,    // 0 quick, 1 balanced, 2 thorough
     objective: usize, // 0 worst, 1 aggregate, 2 mean, 3 nrmse
     include_mlp: bool,
     include_transformer: bool,
@@ -285,6 +285,14 @@ impl OptimizeForm {
     }
 
     /// Оси сетки из пресета (без требования файла) — для оценки размера в UI.
+    fn budget(&self) -> SearchBudget {
+        match self.preset {
+            1 => SearchBudget::Balanced,
+            2 => SearchBudget::Thorough,
+            _ => SearchBudget::Quick,
+        }
+    }
+
     fn axes(&self) -> Result<SweepAxes, String> {
         let mut model_kinds = Vec::new();
         if self.include_transformer {
@@ -299,78 +307,9 @@ impl OptimizeForm {
         if model_kinds.is_empty() {
             return Err("выберите хотя бы одну архитектуру (transformer/mlp/kan)".to_string());
         }
-
-        let axes = match self.preset {
-            1 => SweepAxes {
-                model_kinds,
-                seeds: vec![0],
-                d_models: vec![64, 96],
-                layers: vec![2, 3],
-                d_ffs: vec![128, 384],
-                lrs: vec![1e-3],
-                value_encoders: vec![ValueEncoderKind::Linear, ValueEncoderKind::Mlp],
-                fourier_scales: vec![2.0],
-                fourier_bands: 6,
-                mlp_widths: vec![128, 256],
-                mlp_layers: vec![3, 4],
-                kan_widths: vec![16, 32],
-                kan_layers: vec![2],
-                kan_grids: vec![8, 16],
-                schedules: vec![LrSchedule::WarmupCosine {
-                    warmup_frac: 0.1,
-                    min_lr_ratio: 0.1,
-                }],
-                epochs: 40,
-                final_epochs: 80,
-                batch_size: 64,
-            },
-            2 => SweepAxes {
-                model_kinds,
-                seeds: vec![0, 1],
-                d_models: vec![64, 96, 128],
-                layers: vec![2, 3],
-                d_ffs: vec![128, 256, 384],
-                lrs: vec![1e-3],
-                value_encoders: vec![ValueEncoderKind::Linear, ValueEncoderKind::Mlp],
-                fourier_scales: vec![2.0],
-                fourier_bands: 6,
-                mlp_widths: vec![128, 256, 512],
-                mlp_layers: vec![3, 4],
-                kan_widths: vec![16, 32],
-                kan_layers: vec![2, 3],
-                kan_grids: vec![8, 16, 32],
-                schedules: vec![LrSchedule::WarmupCosine {
-                    warmup_frac: 0.1,
-                    min_lr_ratio: 0.1,
-                }],
-                epochs: 40,
-                final_epochs: 80,
-                batch_size: 64,
-            },
-            _ => SweepAxes {
-                model_kinds,
-                seeds: vec![0],
-                d_models: vec![64],
-                layers: vec![2],
-                d_ffs: vec![128],
-                lrs: vec![1e-3],
-                value_encoders: vec![ValueEncoderKind::Linear, ValueEncoderKind::Mlp],
-                fourier_scales: vec![2.0],
-                fourier_bands: 6,
-                mlp_widths: vec![128, 256],
-                mlp_layers: vec![3],
-                kan_widths: vec![16],
-                kan_layers: vec![2],
-                kan_grids: vec![8, 16],
-                schedules: vec![LrSchedule::WarmupCosine {
-                    warmup_frac: 0.1,
-                    min_lr_ratio: 0.1,
-                }],
-                epochs: 25,
-                final_epochs: 60,
-                batch_size: 64,
-            },
-        };
+        // Сетки бюджетов живут в ядре: раньше они были только здесь, и CLI не
+        // мог запустить тот же поиск, что и кнопка в интерфейсе.
+        let axes = SweepAxes::for_budget(self.budget(), model_kinds);
         sweep::validate_axes(&axes)?;
         Ok(axes)
     }
@@ -755,7 +694,7 @@ fn objective_label(objective: SweepObjective) -> &'static str {
 fn objective_display_score(objective: SweepObjective, row: &SweepRow) -> f32 {
     match objective {
         SweepObjective::Nrmse => row.nrmse_mean,
-        _ => objective.score(row),
+        _ => sweep::row_score(objective, row),
     }
 }
 
@@ -1154,11 +1093,7 @@ impl App {
                 }
                 Event::SweepRow { row } => {
                     self.sweep_rows.push(row);
-                    self.sweep_rows.sort_by(|a, b| {
-                        b.r2_mean
-                            .partial_cmp(&a.r2_mean)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    sweep::sort_rows(&mut self.sweep_rows, SweepObjective::default());
                     if let Some((total_configs, _)) = self.sweep_total {
                         self.status =
                             format!("sweep: {}/{total_configs} конфигов", self.sweep_rows.len());
@@ -1320,12 +1255,7 @@ impl App {
 
     fn sort_optimize_rows(&mut self) {
         let objective = self.optimize_form.objective();
-        self.optimize_rows.sort_by(|a, b| {
-            objective
-                .score(b)
-                .partial_cmp(&objective.score(a))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        sweep::sort_rows(&mut self.optimize_rows, objective);
     }
 
     fn open_table(&mut self, path: String, has_header: bool) {
@@ -2350,13 +2280,20 @@ impl App {
         });
 
         ui.horizontal(|ui| {
-            ui.label("preset");
+            ui.label("бюджет");
             egui::ComboBox::from_id_salt("optimize_preset")
-                .selected_text(["Quick", "Balanced", "Deep"][self.optimize_form.preset])
+                .selected_text(self.optimize_form.budget().label())
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.optimize_form.preset, 0, "Quick");
-                    ui.selectable_value(&mut self.optimize_form.preset, 1, "Balanced");
-                    ui.selectable_value(&mut self.optimize_form.preset, 2, "Deep");
+                    for (index, budget) in [
+                        SearchBudget::Quick,
+                        SearchBudget::Balanced,
+                        SearchBudget::Thorough,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        ui.selectable_value(&mut self.optimize_form.preset, index, budget.label());
+                    }
                 });
             ui.label("objective");
             egui::ComboBox::from_id_salt("optimize_objective")
@@ -2373,24 +2310,23 @@ impl App {
             ui.checkbox(&mut self.optimize_form.include_mlp, "mlp");
             ui.checkbox(&mut self.optimize_form.include_kan, "kan");
         });
-        ui.label(match self.optimize_form.preset {
-            1 => "Balanced: средняя сетка, поиск на 40 эпохах, один seed.",
-            2 => "Deep: широкая сетка, поиск на 40 эпохах, два seed (устойчивость выбора).",
-            _ => "Quick: короткий поиск на 25 эпохах – быстро сравнить transformer/MLP/KAN.",
-        });
+        ui.label(format!(
+            "{}: {}",
+            self.optimize_form.budget().label(),
+            self.optimize_form.budget().hint()
+        ));
         ui.label(
             "Optimize только ищет конфиг. Финальное обучение делает Train \
              после «Apply best» (на полном бюджете эпох).",
         );
         // Оценка размера до запуска — чтобы случайно не словить долгий прогон.
-        if let Ok((cfgs, runs)) = self
+        // Цена операции показывается до запуска: она понятнее названия бюджета.
+        if let Ok(cost) = self
             .optimize_form
             .axes()
-            .and_then(|a| sweep::sweep_size(&a))
+            .and_then(|a| sweep::sweep_cost(&a, 1))
         {
-            ui.label(format!(
-                "Оценка: {cfgs} конфигов, {runs} прогонов (на реальных данных трансформер ~минуту/прогон)"
-            ));
+            ui.label(format!("Оценка: {}", cost.describe()));
         }
         self.sort_optimize_rows();
 
@@ -2549,6 +2485,16 @@ impl App {
                 ui.end_row();
             });
 
+        // «Своя сетка» уже представлена этими полями. Стоимость должна быть
+        // видна до запуска так же, как у готовых бюджетов Optimize.
+        if let Ok(cost) = self
+            .sweep_form
+            .build()
+            .and_then(|(_, axes)| sweep::sweep_cost(&axes, 1))
+        {
+            ui.label(format!("Оценка: {}", cost.describe()));
+        }
+
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
@@ -2597,11 +2543,12 @@ impl App {
                 .max_height(320.0)
                 .show(ui, |ui| {
                     egui::Grid::new("sweep_rows")
-                        .num_columns(6)
+                        .num_columns(7)
                         .striped(true)
                         .show(ui, |ui| {
                             ui.label("#");
-                            ui.label("R²");
+                            ui.label("worst R²");
+                            ui.label("aggregate R²");
                             ui.label("std");
                             ui.label("aggr nRMSE");
                             ui.label("rel");
@@ -2610,6 +2557,7 @@ impl App {
                             for (i, row) in self.sweep_rows.iter().enumerate() {
                                 let mark = if i == 0 { "*" } else { "" };
                                 ui.label(format!("{mark}{}", i + 1));
+                                ui.label(format!("{:.5}", row.worst_output_r2_mean));
                                 ui.label(format!("{:.5}", row.r2_mean));
                                 ui.label(format!("{:.5}", row.r2_std));
                                 ui.label(format!("{:.5}", row.nrmse_mean));

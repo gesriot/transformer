@@ -1,20 +1,24 @@
 //! Sweep по конфигам численной surrogate-модели.
 //!
 //! Общий движок для CLI `sweep` и GUI Sweep-панели: строит декартову сетку
-//! конфигов, валидирует их, обучает на синтетическом blackbox и ранжирует строки
-//! по среднему R2. UI получает строки через callback без парсинга stdout.
+//! конфигов и превращает результат общего поиска в прежние `SweepRow`. По
+//! умолчанию ранжирование идёт по худшему выходу; UI получает строки через
+//! callback без парсинга stdout.
 
 use crate::blackbox;
 use crate::config::ModelConfig;
 use crate::encoders::{ValueEncoderConfig, ValueEncoderKind};
-use crate::metrics::{aggregate_runs, ConfigEval, EvalSource, RunEval};
+use crate::metrics::{ConfigEval, EvalSource, RunEval};
 use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
 use crate::schema::ModelSchema;
 use crate::split::{SearchPool, SplitPlan, DEFAULT_DATA_SEED};
 use crate::train::{validate_train, LrSchedule, TrainConfig};
-use crate::training::{evaluate_on, train_candidate, Dataset, TrainingSetup};
+use crate::training::{
+    compare_scores_desc, search, search_cost, Dataset, SearchCandidate, SearchCost, SearchPlan,
+    SearchRow, TrainingSetup,
+};
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 #[derive(Clone)]
 pub struct SweepAxes {
@@ -38,6 +42,113 @@ pub struct SweepAxes {
     /// Рекомендуемые эпохи финального обучения (переносятся в Train при Apply).
     pub final_epochs: usize,
     pub batch_size: usize,
+}
+
+/// Бюджет поиска: сколько мы готовы потратить.
+///
+/// Это именно бюджет, а не «уровень качества»: рядом всегда показывается
+/// [`SearchCost`], потому что понимать цену операции важнее, чем помнить, что
+/// означает название пресета.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchBudget {
+    /// Быстро сравнить архитектуры между собой.
+    #[default]
+    Quick,
+    /// Средняя сетка, один seed.
+    Balanced,
+    /// Широкая сетка и два seed — устойчивость выбора.
+    Thorough,
+}
+
+impl SearchBudget {
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchBudget::Quick => "Быстро",
+            SearchBudget::Balanced => "Сбалансированно",
+            SearchBudget::Thorough => "Тщательно",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            SearchBudget::Quick => "короткий поиск: быстро сравнить выбранные архитектуры",
+            SearchBudget::Balanced => "средняя сетка, один seed",
+            SearchBudget::Thorough => "широкая сетка, два seed — устойчивость выбора",
+        }
+    }
+}
+
+impl SweepAxes {
+    /// Сетка по бюджету. Раньше эти три набора жили внутри GUI, поэтому CLI не
+    /// мог запустить тот же поиск, что и кнопка в интерфейсе.
+    pub fn for_budget(budget: SearchBudget, model_kinds: Vec<ModelKind>) -> Self {
+        let schedules = vec![LrSchedule::WarmupCosine {
+            warmup_frac: 0.1,
+            min_lr_ratio: 0.1,
+        }];
+        match budget {
+            SearchBudget::Quick => Self {
+                model_kinds,
+                seeds: vec![0],
+                d_models: vec![64],
+                layers: vec![2],
+                d_ffs: vec![128],
+                lrs: vec![1e-3],
+                value_encoders: vec![ValueEncoderKind::Linear, ValueEncoderKind::Mlp],
+                fourier_scales: vec![2.0],
+                fourier_bands: 6,
+                mlp_widths: vec![128, 256],
+                mlp_layers: vec![3],
+                kan_widths: vec![16],
+                kan_layers: vec![2],
+                kan_grids: vec![8, 16],
+                schedules,
+                epochs: 25,
+                final_epochs: 60,
+                batch_size: 64,
+            },
+            SearchBudget::Balanced => Self {
+                model_kinds,
+                seeds: vec![0],
+                d_models: vec![64, 96],
+                layers: vec![2, 3],
+                d_ffs: vec![128, 384],
+                lrs: vec![1e-3],
+                value_encoders: vec![ValueEncoderKind::Linear, ValueEncoderKind::Mlp],
+                fourier_scales: vec![2.0],
+                fourier_bands: 6,
+                mlp_widths: vec![128, 256],
+                mlp_layers: vec![3, 4],
+                kan_widths: vec![16, 32],
+                kan_layers: vec![2],
+                kan_grids: vec![8, 16],
+                schedules,
+                epochs: 40,
+                final_epochs: 80,
+                batch_size: 64,
+            },
+            SearchBudget::Thorough => Self {
+                model_kinds,
+                seeds: vec![0, 1],
+                d_models: vec![64, 96, 128],
+                layers: vec![2, 3],
+                d_ffs: vec![128, 256, 384],
+                lrs: vec![1e-3],
+                value_encoders: vec![ValueEncoderKind::Linear, ValueEncoderKind::Mlp],
+                fourier_scales: vec![2.0],
+                fourier_bands: 6,
+                mlp_widths: vec![128, 256, 512],
+                mlp_layers: vec![3, 4],
+                kan_widths: vec![16, 32],
+                kan_layers: vec![2, 3],
+                kan_grids: vec![8, 16, 32],
+                schedules,
+                epochs: 40,
+                final_epochs: 80,
+                batch_size: 64,
+            },
+        }
+    }
 }
 
 impl Default for SweepAxes {
@@ -120,23 +231,17 @@ struct Candidate {
     choice: SweepChoice,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SweepObjective {
-    #[default]
-    AggregateR2,
-    WorstOutputR2,
-    MeanOutputR2,
-    Nrmse,
-}
+/// Цель ранжирования живёт в ядре: поиск и отображение должны означать одно и
+/// то же.
+pub use crate::training::SearchObjective as SweepObjective;
 
-impl SweepObjective {
-    pub fn score(self, row: &SweepRow) -> f32 {
-        match self {
-            SweepObjective::AggregateR2 => row.r2_mean,
-            SweepObjective::WorstOutputR2 => row.worst_output_r2_mean,
-            SweepObjective::MeanOutputR2 => row.mean_output_r2_mean,
-            SweepObjective::Nrmse => -row.nrmse_mean,
-        }
+/// Счёт уже построенной строки — для сортировки таблицы в интерфейсе.
+pub fn row_score(objective: SweepObjective, row: &SweepRow) -> f32 {
+    match objective {
+        SweepObjective::AggregateR2 => row.r2_mean,
+        SweepObjective::WorstOutputR2 => row.worst_output_r2_mean,
+        SweepObjective::MeanOutputR2 => row.mean_output_r2_mean,
+        SweepObjective::Nrmse => -row.nrmse_mean,
     }
 }
 
@@ -499,22 +604,20 @@ fn build_candidates(axes: &SweepAxes) -> Result<Vec<Candidate>, String> {
     Ok(configs)
 }
 
+/// Совместимость: пара (конфигураций, прогонов) для старых адаптеров.
 pub fn sweep_size(axes: &SweepAxes) -> Result<(usize, usize), String> {
-    let configs = build_candidates(axes)?;
-    Ok((configs.len(), configs.len() * axes.seeds.len()))
+    let cost = sweep_cost(axes, 1)?;
+    Ok((cost.configs, cost.runs))
 }
 
 fn mean(xs: &[f32]) -> f32 {
     xs.iter().sum::<f32>() / xs.len().max(1) as f32
 }
 
-fn sort_rows(rows: &mut [SweepRow], objective: SweepObjective) {
-    rows.sort_by(|a, b| {
-        objective
-            .score(b)
-            .partial_cmp(&objective.score(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+/// Пересортировать готовые строки — ядро ранжирует сам, это для интерфейса и
+/// тестов ранжирования.
+pub fn sort_rows(rows: &mut [SweepRow], objective: SweepObjective) {
+    rows.sort_by(|a, b| compare_scores_desc(row_score(objective, a), row_score(objective, b)));
 }
 
 /// Строка ранжирования из агрегата. `r2_std` — разброс по init_seed (свёртка
@@ -555,6 +658,50 @@ fn row_from_config_eval(
 /// Для каждого кандидата: все init_seed × все folds; нормализаторы строятся по
 /// train КАЖДОГО fold, метрики снимаются на его validation. Свёртка — через
 /// [`aggregate_runs`] (folds внутри seed, затем seeds).
+/// Кандидаты сетки как список для ядра поиска.
+fn search_candidates(axes: &SweepAxes) -> Result<(Vec<SearchCandidate>, Vec<Candidate>), String> {
+    let configs = build_candidates(axes)?;
+    let candidates = configs
+        .iter()
+        .map(|c| SearchCandidate {
+            label: c.label.clone(),
+            setup: TrainingSetup::new(
+                c.nc.clone(),
+                TrainConfig {
+                    epochs: axes.epochs,
+                    batch_size: axes.batch_size,
+                    lr: c.lr,
+                    seed: 0, // seed прогона задаёт план поиска
+                    schedule: c.schedule,
+                },
+            ),
+        })
+        .collect();
+    Ok((candidates, configs))
+}
+
+/// Стоимость поиска до запуска: сколько конфигураций, прогонов и эпох.
+///
+/// Число folds передаётся отдельно, потому что оценку показывают ДО чтения
+/// файла и разбиения: у holdout это 1, у K-fold — k.
+pub fn sweep_cost(axes: &SweepAxes, folds: usize) -> Result<SearchCost, String> {
+    let (candidates, _) = search_candidates(axes)?;
+    Ok(search_cost(
+        &candidates,
+        &plan_from(axes, SweepObjective::default()),
+        folds,
+    ))
+}
+
+fn plan_from(axes: &SweepAxes, objective: SweepObjective) -> SearchPlan {
+    SearchPlan {
+        seeds: axes.seeds.clone(),
+        objective,
+    }
+}
+
+/// Перебор сетки — адаптер над общей операцией поиска: сетку и подписи строит
+/// он, а обучение, свёртку и ранжирование выполняет ядро.
 pub fn run_sweep<F>(
     dataset: &Dataset,
     pool: &SearchPool,
@@ -566,82 +713,32 @@ pub fn run_sweep<F>(
 where
     F: FnMut(&SweepRow),
 {
-    let configs = build_candidates(axes)?;
-    let total_configs = configs.len();
-    let total_runs = total_configs * axes.seeds.len() * pool.n_folds();
-    let mut rows = Vec::new();
+    let (candidates, configs) = search_candidates(axes)?;
+    let plan = plan_from(axes, objective);
+    let results = search(dataset, pool, &candidates, &plan, cancel, &mut |row| {
+        on_row(&row_from_search(row, &configs));
+    })?;
 
-    let cancelled_result = |rows: &mut Vec<SweepRow>| {
-        sort_rows(rows, objective);
-        SweepResult {
-            rows: std::mem::take(rows),
-            total_configs,
-            total_runs,
-            cancelled: true,
-        }
-    };
-
-    for candidate in configs {
-        if cancel.load(Ordering::Relaxed) {
-            return Ok(cancelled_result(&mut rows));
-        }
-
-        let mut runs = Vec::new();
-        for &seed in &axes.seeds {
-            for fold in 0..pool.n_folds() {
-                if cancel.load(Ordering::Relaxed) {
-                    return Ok(cancelled_result(&mut rows));
-                }
-
-                // Обучение — через общее ядро: нормализаторы по train fold,
-                // метрики на его validation, без собственной копии цикла.
-                let setup = TrainingSetup::new(
-                    candidate.nc.clone(),
-                    TrainConfig {
-                        epochs: axes.epochs,
-                        batch_size: axes.batch_size,
-                        lr: candidate.lr,
-                        seed,
-                        schedule: candidate.schedule,
-                    },
-                );
-                let trained = train_candidate(
-                    dataset,
-                    pool,
-                    fold,
-                    &setup,
-                    seed,
-                    cancel,
-                    &mut |_| {},
-                    &mut |_| {},
-                )?;
-                if cancel.load(Ordering::Relaxed) {
-                    return Ok(cancelled_result(&mut rows));
-                }
-
-                let (_, val) = pool.fold(fold)?;
-                let (metrics, per_output) = evaluate_on(&trained, &val);
-                runs.push(RunEval {
-                    metrics,
-                    per_output,
-                    origin: pool.run_origin(fold, seed),
-                });
-            }
-        }
-
-        let agg = aggregate_runs(&runs, &axes.seeds, pool.source())?;
-        let row = row_from_config_eval(candidate.label, candidate.choice, &agg, &runs);
-        on_row(&row);
-        rows.push(row);
-    }
-
-    sort_rows(&mut rows, objective);
+    let rows: Vec<SweepRow> = results
+        .rows
+        .iter()
+        .map(|row| row_from_search(row, &configs))
+        .collect();
     Ok(SweepResult {
         rows,
-        total_configs,
-        total_runs,
-        cancelled: false,
+        total_configs: results.cost.configs,
+        total_runs: results.cost.runs,
+        cancelled: results.cancelled,
     })
+}
+
+fn row_from_search(row: &SearchRow, configs: &[Candidate]) -> SweepRow {
+    row_from_config_eval(
+        row.label.clone(),
+        configs[row.candidate].choice.clone(),
+        &row.eval,
+        &row.runs,
+    )
 }
 
 /// Поиск на встроенном чёрном ящике (демо). Данные генерируются ОДИН РАЗ с
@@ -659,7 +756,7 @@ where
     run_blackbox_sweep_with_objective(
         blackbox_name,
         axes,
-        SweepObjective::AggregateR2,
+        SweepObjective::default(),
         cancel,
         on_row,
     )
@@ -688,10 +785,72 @@ mod tests {
     use super::*;
     use crate::data::NumericDataset;
     use crate::encoders::FeatureSpec;
-    use crate::metrics::RunOrigin;
+    use crate::metrics::{aggregate_runs, RunOrigin};
     use crate::train::fit_normalizers;
     use ndarray::Array2;
     use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn budgets_grow_and_cost_is_known_before_launch() {
+        let kinds = vec![ModelKind::Mlp, ModelKind::Kan];
+        let quick = sweep_cost(
+            &SweepAxes::for_budget(SearchBudget::Quick, kinds.clone()),
+            1,
+        )
+        .unwrap();
+        let balanced = sweep_cost(
+            &SweepAxes::for_budget(SearchBudget::Balanced, kinds.clone()),
+            1,
+        )
+        .unwrap();
+        let thorough =
+            sweep_cost(&SweepAxes::for_budget(SearchBudget::Thorough, kinds), 1).unwrap();
+
+        assert!(quick.configs < balanced.configs);
+        assert!(balanced.configs < thorough.configs);
+        // «Тщательно» — два seed, поэтому прогонов вдвое больше конфигураций.
+        assert_eq!(thorough.seeds, 2);
+        assert_eq!(thorough.runs, thorough.configs * 2);
+        assert!(quick.epochs_upper_bound() < thorough.epochs_upper_bound());
+
+        // K-fold умножает стоимость на число folds.
+        let five = sweep_cost(
+            &SweepAxes::for_budget(SearchBudget::Quick, vec![ModelKind::Mlp]),
+            5,
+        )
+        .unwrap();
+        let one = sweep_cost(
+            &SweepAxes::for_budget(SearchBudget::Quick, vec![ModelKind::Mlp]),
+            1,
+        )
+        .unwrap();
+        assert_eq!(five.runs, one.runs * 5);
+    }
+
+    #[test]
+    fn budget_grid_covers_only_requested_architectures() {
+        let axes = SweepAxes::for_budget(SearchBudget::Quick, vec![ModelKind::Kan]);
+        assert!(validate_axes(&axes).is_ok());
+        assert_eq!(axes.model_kinds, vec![ModelKind::Kan]);
+        let cancel = AtomicBool::new(false);
+        let bb = blackbox::by_name("sum").unwrap();
+        let data = bb.generate(64, 0);
+        let specs = vec![FeatureSpec::Continuous; bb.n_inputs()];
+        let dataset = dataset_of(&data, &specs);
+        let prepared = SplitPlan::default().prepare(dataset.data()).unwrap();
+        let mut small = axes.clone();
+        small.epochs = 1;
+        let result = run_sweep(
+            &dataset,
+            &prepared.search,
+            &small,
+            SweepObjective::default(),
+            &cancel,
+            |_| {},
+        )
+        .unwrap();
+        assert!(result.rows.iter().all(|r| r.choice.kind == ModelKind::Kan));
+    }
 
     #[test]
     fn validate_rejects_empty_axes() {

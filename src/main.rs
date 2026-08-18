@@ -1392,38 +1392,35 @@ fn run_sweep(args: &[String]) {
         final_epochs: epochs,
         batch_size: batch,
     };
-    let (total_configs, total_runs) = sweep_core::sweep_size(&axes).unwrap_or_else(|e| fail(&e));
-
-    println!(
-        "Sweep {name}: {} конфигов × {} seed = {} прогонов\n",
-        total_configs,
-        axes.seeds.len(),
-        total_runs
-    );
+    // Цена операции — до запуска: она понятнее, чем название набора осей.
+    let cost = sweep_core::sweep_cost(&axes, 1).unwrap_or_else(|e| fail(&e));
+    println!("Sweep {name}: {}\n", cost.describe());
 
     let never = std::sync::atomic::AtomicBool::new(false);
     let result = sweep_core::run_blackbox_sweep(name, &axes, &never, |row| {
         println!(
-            "  done [{}]: {} -> R²={:.5}±{:.5}",
+            "  done [{}]: {} -> worst R²={:.5}, aggregate R²={:.5}±{:.5}",
             epoch_sweep::source_label(row.source),
             row.label,
+            row.worst_output_r2_mean,
             row.r2_mean,
             row.r2_std
         );
     })
     .unwrap_or_else(|e| fail(&e));
 
-    // Ранжируем по среднему R² (рекомендация — первая строка).
+    // Рекомендация — первая строка, по worst-output R² по умолчанию.
     let source = result
         .rows
         .first()
         .map(|row| epoch_sweep::source_label(row.source))
         .unwrap_or_else(|| "validation".to_string());
-    println!("\n=== РАНЖИРОВАНИЕ ({source}; по среднему R²; rel — справочно) ===");
+    println!("\n=== РАНЖИРОВАНИЕ ({source}; по worst-output R²; rel — справочно) ===");
     for (i, r) in result.rows.iter().enumerate() {
         let mark = if i == 0 { "*" } else { " " };
         println!(
-            "{mark} R²={:.5}±{:.5}  nRMSE={:.5}  rel={:.1}%  | {}",
+            "{mark} worst R²={:.5}  aggregate R²={:.5}±{:.5}  nRMSE={:.5}  rel={:.1}%  | {}",
+            r.worst_output_r2_mean,
             r.r2_mean,
             r.r2_std,
             r.nrmse_mean,
