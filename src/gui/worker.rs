@@ -7,14 +7,13 @@
 
 use super::messages::{
     Command, DatasetOrigin, DiagnosticsResult, Event, KanModelInfo, KanSymbolicInfo, KanWeakEdge,
-    PreparedData,
+    PreparedData, ValidationOrigin,
 };
 use crate::batch_predict::{read_prediction_xlsx, write_prediction_xlsx};
 use crate::blackbox;
 use crate::config::ModelConfig;
 use crate::data::{Normalizer, NumericDataset, OutOfRange, TextDataset};
 use crate::encoders::FeatureSpec;
-use crate::epoch_sweep::{self, EpochRow};
 use crate::generate::generate;
 use crate::init::set_init_seed;
 use crate::markup::TableProfile;
@@ -35,7 +34,9 @@ use crate::train::{
     evaluate_surrogate, predict_dataset, train_text_cb, validate_train, TextTrainConfig,
     TrainConfig,
 };
-use crate::training::{refit, run_training, Dataset, TrainedModel, TrainingSetup};
+use crate::training::{
+    evaluate_on, refit, run_training, Dataset, EvalSchedule, TrainedModel, TrainingSetup,
+};
 use eframe::egui;
 use ndarray::{Array2, Ix2};
 use rand::rngs::StdRng;
@@ -146,6 +147,7 @@ fn worker_loop(
                 split,
                 nc,
                 tcfg,
+                eval,
                 final_phase,
             } => {
                 let origin = data.origin.clone();
@@ -154,6 +156,7 @@ fn worker_loop(
                     split,
                     &nc,
                     &tcfg,
+                    eval,
                     final_phase,
                     &evt_tx,
                     &ctx,
@@ -169,6 +172,7 @@ fn worker_loop(
                                 &loaded.model,
                                 loaded.diag.is_some() || loaded.calibration.is_some(),
                             ),
+                            keep_evaluation: true,
                         });
                         current = Some(loaded);
                         ctx.request_repaint();
@@ -192,6 +196,7 @@ fn worker_loop(
                                 &loaded.model,
                                 loaded.diag.is_some() || loaded.calibration.is_some(),
                             ),
+                            keep_evaluation: false,
                         });
                         current = Some(loaded);
                         let _ = evt_tx.send(Event::Status("модель загружена".to_string()));
@@ -425,36 +430,6 @@ fn worker_loop(
                     }
                 }
                 ctx.request_repaint();
-            }
-            Command::EpochSweep {
-                data,
-                split,
-                nc,
-                base_tcfg,
-                milestones,
-                target_r2,
-                min_gain,
-                plateau_min,
-            } => {
-                match run_epoch_sweep(
-                    &data,
-                    split,
-                    &nc,
-                    &base_tcfg,
-                    &milestones,
-                    target_r2,
-                    min_gain,
-                    plateau_min,
-                    &evt_tx,
-                    &ctx,
-                    &cancel,
-                ) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        let _ = evt_tx.send(Event::Error(e));
-                        ctx.request_repaint();
-                    }
-                }
             }
             Command::Shutdown => break,
         }
@@ -859,68 +834,6 @@ fn prepare_tnum(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_epoch_sweep(
-    prepared: &PreparedData,
-    split: SplitPlan,
-    nc: &NumericConfig,
-    base_tcfg: &TrainConfig,
-    milestones: &[usize],
-    target_r2: f32,
-    min_gain: f32,
-    plateau_min: f32,
-    evt_tx: &Sender<Event>,
-    ctx: &egui::Context,
-    cancel: &AtomicBool,
-) -> Result<(), String> {
-    validate_numeric(nc)?;
-    validate_train(base_tcfg.lr, base_tcfg.batch_size)?;
-    if milestones.is_empty() || milestones.contains(&0) {
-        return Err("epochs: список должен быть непустым и > 0".to_string());
-    }
-    if !target_r2.is_finite() {
-        return Err("target-r2 должен быть конечным".to_string());
-    }
-    if !min_gain.is_finite() || min_gain < 0.0 {
-        return Err("min-r2-gain должен быть конечным и >= 0".to_string());
-    }
-    if !plateau_min.is_finite() {
-        return Err("plateau-min-r2 должен быть конечным".to_string());
-    }
-
-    let dataset = Dataset::new(clone_data(prepared), prepared.schema.clone())?;
-    let splits = split.prepare(dataset.data())?;
-    let mut points: Vec<usize> = milestones.iter().copied().filter(|&e| e > 0).collect();
-    points.sort_unstable();
-    points.dedup();
-
-    let _ = evt_tx.send(Event::EpochSweepStarted {
-        total_points: points.len(),
-    });
-    ctx.request_repaint();
-
-    let mut on_row = |row: EpochRow| {
-        let _ = evt_tx.send(Event::EpochSweepRow { row });
-        ctx.request_repaint();
-    };
-    let rows = epoch_sweep::run_epoch_sweep_cb(
-        &dataset,
-        &splits.search,
-        nc,
-        base_tcfg,
-        &points,
-        cancel,
-        &mut on_row,
-    )?;
-    let recommendation = epoch_sweep::recommended_stop(&rows, target_r2, min_gain, plateau_min);
-    let _ = evt_tx.send(Event::EpochSweepDone {
-        rows,
-        recommendation,
-        cancelled: cancel.load(Ordering::Relaxed),
-    });
-    ctx.request_repaint();
-    Ok(())
-}
-
 /// Копия данных для `Dataset`: активный набор живёт в сессии под `Arc`, а ядру
 /// нужен владеющий экземпляр.
 fn clone_data(prepared: &PreparedData) -> NumericDataset {
@@ -996,6 +909,7 @@ fn train_numeric(
     split: SplitPlan,
     nc: &NumericConfig,
     tcfg: &TrainConfig,
+    eval: EvalSchedule,
     final_phase: bool,
     evt_tx: &Sender<Event>,
     ctx: &egui::Context,
@@ -1021,91 +935,96 @@ fn train_numeric(
     });
     ctx.request_repaint();
 
-    let setup = TrainingSetup::new(nc.clone(), tcfg.clone());
+    let mut setup = TrainingSetup::new(nc.clone(), tcfg.clone());
+    setup.eval = eval;
     // Ручной запуск заканчивается development-моделью. После поиска выбор уже
     // сделан, поэтому финальный запуск сразу делает refit на всём pool — в том
     // числе при K-fold — и только затем один раз открывает test.
-    let (trained, metrics, final_eval, diag_train, diag_eval, eval_label) = if final_phase {
-        let pool = Arc::new(split.prepare(dataset.data())?.search.all());
-        let outcome = refit(
-            &dataset,
-            split,
-            &setup,
-            DEFAULT_FINAL_INIT_SEED,
-            cancel,
-            &mut |phase, point| {
-                let _ = evt_tx.send(Event::Epoch {
-                    phase,
-                    epoch: point.epoch,
-                    loss: point.train_loss,
+    let (trained, metrics, per_output, final_eval, diag_train, diag_eval, eval_label) =
+        if final_phase {
+            let pool = Arc::new(split.prepare(dataset.data())?.search.all());
+            let outcome = refit(
+                &dataset,
+                split,
+                &setup,
+                DEFAULT_FINAL_INIT_SEED,
+                cancel,
+                &mut |phase, point| {
+                    let _ = evt_tx.send(Event::Epoch {
+                        phase,
+                        epoch: point.epoch,
+                        loss: point.train_loss,
+                        val_r2: point.val.as_ref().map(|m| m.r2),
+                    });
+                    ctx.request_repaint();
+                },
+                &mut |_, _| {},
+                &mut |_, _, _, _| {},
+            )?;
+            let Some(trained) = outcome.model else {
+                let _ = evt_tx.send(Event::TrainDone {
+                    metrics: None,
+                    per_output: None,
+                    validation_origin: None,
+                    final_eval: None,
+                    cancelled: true,
                 });
                 ctx.request_repaint();
-            },
-            &mut |_, _| {},
-            &mut |_, _, _, _| {},
-        )?;
-        let Some(trained) = outcome.model else {
-            let _ = evt_tx.send(Event::TrainDone {
-                metrics: None,
-                final_eval: None,
-                cancelled: true,
-            });
-            ctx.request_repaint();
-            return Ok(None);
+                return Ok(None);
+            };
+            (
+                trained,
+                None,
+                None,
+                outcome.eval,
+                Arc::clone(&pool),
+                pool,
+                "train+validation",
+            )
+        } else {
+            let outcome = run_training(
+                &dataset,
+                split,
+                &setup,
+                false,
+                DEFAULT_FINAL_INIT_SEED,
+                cancel,
+                &mut |phase, point| {
+                    let _ = evt_tx.send(Event::Epoch {
+                        phase,
+                        epoch: point.epoch,
+                        loss: point.train_loss,
+                        val_r2: point.val.as_ref().map(|m| m.r2),
+                    });
+                    ctx.request_repaint();
+                },
+                &mut |_, _| {},
+                &mut |_, _, _, _| {},
+            )?;
+            if cancel.load(Ordering::Relaxed) {
+                let _ = evt_tx.send(Event::TrainDone {
+                    metrics: None,
+                    per_output: None,
+                    validation_origin: None,
+                    final_eval: None,
+                    cancelled: true,
+                });
+                ctx.request_repaint();
+                return Ok(None);
+            }
+            let splits = split.prepare(dataset.data())?;
+            let (train, val) = splits.search.fold(0)?;
+            let (metrics, per_output) = evaluate_on(&outcome.development, &val);
+            (
+                outcome.development,
+                Some(metrics),
+                Some(per_output),
+                None,
+                Arc::new(train),
+                Arc::new(val),
+                "validation",
+            )
         };
-        (
-            trained,
-            None,
-            outcome.eval,
-            Arc::clone(&pool),
-            pool,
-            "train+validation",
-        )
-    } else {
-        let outcome = run_training(
-            &dataset,
-            split,
-            &setup,
-            false,
-            DEFAULT_FINAL_INIT_SEED,
-            cancel,
-            &mut |phase, point| {
-                let _ = evt_tx.send(Event::Epoch {
-                    phase,
-                    epoch: point.epoch,
-                    loss: point.train_loss,
-                });
-                ctx.request_repaint();
-            },
-            &mut |_, _| {},
-            &mut |_, _, _, _| {},
-        )?;
-        if cancel.load(Ordering::Relaxed) {
-            let _ = evt_tx.send(Event::TrainDone {
-                metrics: None,
-                final_eval: None,
-                cancelled: true,
-            });
-            ctx.request_repaint();
-            return Ok(None);
-        }
-        let splits = split.prepare(dataset.data())?;
-        let (train, val) = splits.search.fold(0)?;
-        let metrics = evaluate_surrogate(
-            &outcome.development.model,
-            &val,
-            &outcome.development.in_norm,
-            &outcome.development.out_norm,
-        );
-        (
-            outcome.development,
-            Some(metrics),
-            None,
-            Arc::new(train),
-            Arc::new(val),
-            "validation",
-        )
-    };
     let TrainedModel {
         model,
         in_norm,
@@ -1114,6 +1033,11 @@ fn train_numeric(
     } = trained;
     let _ = evt_tx.send(Event::TrainDone {
         metrics,
+        per_output,
+        validation_origin: (!final_phase).then_some(ValidationOrigin {
+            plan: split,
+            init_seed: tcfg.seed,
+        }),
         final_eval,
         cancelled: false,
     });
@@ -1183,6 +1107,7 @@ mod tests {
             split,
             &config,
             &train,
+            EvalSchedule::Never,
             true,
             &tx,
             &egui::Context::default(),
@@ -1209,6 +1134,67 @@ mod tests {
             _ => None,
         });
         assert!(final_eval.is_some(), "refit обязан один раз измерить test");
+    }
+
+    #[test]
+    fn development_gui_training_reports_each_output() {
+        let inputs =
+            Array2::from_shape_fn((64, 2), |(row, column)| (row as f32 + column as f32) / 64.0);
+        let outputs = Array2::from_shape_fn((64, 2), |(row, column)| {
+            let x0 = inputs[[row, 0]];
+            let x1 = inputs[[row, 1]];
+            if column == 0 {
+                x0 + x1
+            } else {
+                x0 - x1
+            }
+        });
+        let prepared = PreparedData {
+            origin: DatasetOrigin::Blackbox("two-output-test".to_string()),
+            data: Arc::new(NumericDataset::new(inputs, outputs)),
+            schema: ModelSchema::synthetic(2, 2).unwrap(),
+        };
+        let config = NumericConfig {
+            kind: ModelKind::Mlp,
+            transformer: ModelConfig::default(),
+            value: ValueEncoderConfig::default(),
+            mlp_width: 4,
+            mlp_layers: 1,
+            kan: KanConfig::default(),
+        };
+        let train = TrainConfig {
+            epochs: 1,
+            batch_size: 16,
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel();
+
+        train_numeric(
+            &prepared,
+            SplitPlan::default(),
+            &config,
+            &train,
+            EvalSchedule::Never,
+            false,
+            &tx,
+            &egui::Context::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .expect("development-модель");
+
+        let per_output = rx.try_iter().find_map(|event| match event {
+            Event::TrainDone {
+                per_output,
+                cancelled,
+                ..
+            } => {
+                assert!(!cancelled);
+                per_output
+            }
+            _ => None,
+        });
+        assert_eq!(per_output.expect("поколоночные метрики").len(), 2);
     }
 
     #[test]

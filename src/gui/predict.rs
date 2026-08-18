@@ -34,7 +34,7 @@ impl App {
     }
 
     pub(super) fn ui_predict(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Predict");
+        ui.heading("Прогноз");
         if ui.button("Загрузить модель (.bin)…").clicked() {
             if let Some(p) = rfd::FileDialog::new()
                 .add_filter("bin", &["bin"])
@@ -48,7 +48,7 @@ impl App {
         let info = self.model_info.clone();
         match info {
             None => {
-                ui.label("Обучите модель (вкладка Train) или загрузите .bin.");
+                ui.label("Обучите модель в разделе «Обучение» или загрузите .bin.");
             }
             Some(info) => {
                 let (n_in, n_out) = (info.schema.n_inputs(), info.schema.n_outputs());
@@ -90,7 +90,7 @@ impl App {
                         }
                     });
                 if ui
-                    .add_enabled(!self.busy(), egui::Button::new("Predict"))
+                    .add_enabled(!self.busy(), egui::Button::new("Рассчитать"))
                     .clicked()
                 {
                     self.worker
@@ -125,7 +125,7 @@ impl App {
                 }
 
                 ui.separator();
-                ui.label("Пакетный Predict из Excel");
+                ui.label("Пакетный прогноз из Excel");
                 ui.label(format!(
                     "Ожидается первый лист с колонками x0..x{} и y0..y{}; y-колонки будут перезаписаны.",
                     n_in.saturating_sub(1),

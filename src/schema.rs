@@ -359,6 +359,72 @@ impl ModelSchema {
         self.inputs.iter().map(Column::feature_spec).collect()
     }
 
+    /// Совместима ли модель с этим набором данных.
+    ///
+    /// Сравниваются имена, порядок, типы и подписи уровней — всё, что влияет на
+    /// смысл числа в тензоре. Единицы измерения НЕ сравниваются: это подпись
+    /// для отчётов, и модель от неё не зависит.
+    ///
+    /// Причина несовместимости возвращается текстом: «не подходит» без
+    /// объяснения заставляет угадывать, что именно разошлось.
+    pub fn compatibility_with(&self, data: &ModelSchema) -> Result<(), String> {
+        fn compare(
+            singular: &str,
+            plural: &str,
+            model: &[Column],
+            data: &[Column],
+        ) -> Result<(), String> {
+            if model.len() != data.len() {
+                return Err(format!(
+                    "{plural}: у модели {}, у данных {}",
+                    model.len(),
+                    data.len()
+                ));
+            }
+            for (i, (m, d)) in model.iter().zip(data.iter()).enumerate() {
+                if m.name() != d.name() {
+                    return Err(format!(
+                        "{singular} {}: модель ждёт '{}', в данных '{}'",
+                        i + 1,
+                        m.name(),
+                        d.name()
+                    ));
+                }
+                match (m.ty(), d.ty()) {
+                    (ColumnType::Numeric, ColumnType::Numeric) => {}
+                    (
+                        ColumnType::Categorical { levels: ml },
+                        ColumnType::Categorical { levels: dl },
+                    ) => {
+                        if ml != dl {
+                            return Err(format!(
+                                "{singular} '{}': уровни категории различаются ({} против {})",
+                                m.name(),
+                                ml.join(", "),
+                                dl.join(", ")
+                            ));
+                        }
+                    }
+                    (ColumnType::Numeric, ColumnType::Categorical { .. }) => {
+                        return Err(format!(
+                            "{singular} '{}': у модели число, в данных категория",
+                            m.name()
+                        ))
+                    }
+                    (ColumnType::Categorical { .. }, ColumnType::Numeric) => {
+                        return Err(format!(
+                            "{singular} '{}': у модели категория, в данных число",
+                            m.name()
+                        ))
+                    }
+                }
+            }
+            Ok(())
+        }
+        compare("вход", "входов", &self.inputs, &data.inputs)?;
+        compare("выход", "выходов", &self.outputs, &data.outputs)
+    }
+
     /// Схема обязана совпадать с формой данных: несовпадение означает, что
     /// разметка и файл разъехались.
     pub fn check_dims(&self, n_inputs: usize, n_outputs: usize) -> Result<(), String> {
@@ -524,6 +590,82 @@ mod tests {
         assert!(ModelSchema::new(vec![output("y")], vec![output("z")]).is_err());
         assert!(ModelSchema::new(vec![input("x")], vec![input("w")]).is_err());
         assert!(ModelSchema::new(vec![ignored("x")], vec![output("y")]).is_err());
+    }
+
+    #[test]
+    fn compatibility_ignores_units_but_not_meaning() {
+        let model = ModelSchema::new(
+            vec![input("temperature").with_unit("°C"), material()],
+            vec![output("moisture")],
+        )
+        .unwrap();
+
+        // Единицы — подпись для отчётов: модель от них не зависит.
+        let other_units = ModelSchema::new(
+            vec![input("temperature").with_unit("K"), material()],
+            vec![output("moisture").with_unit("%")],
+        )
+        .unwrap();
+        assert!(model.compatibility_with(&other_units).is_ok());
+
+        // Имя входа другое — данные описывают другую величину.
+        let renamed =
+            ModelSchema::new(vec![input("temp"), material()], vec![output("moisture")]).unwrap();
+        let err = model.compatibility_with(&renamed).unwrap_err();
+        assert!(
+            err.contains("'temperature'") && err.contains("'temp'"),
+            "{err}"
+        );
+
+        // Порядок входов важен: это порядок колонок тензора.
+        let swapped = ModelSchema::new(
+            vec![material(), input("temperature")],
+            vec![output("moisture")],
+        )
+        .unwrap();
+        assert!(model.compatibility_with(&swapped).is_err());
+
+        // Число входов.
+        let narrow =
+            ModelSchema::new(vec![input("temperature")], vec![output("moisture")]).unwrap();
+        let err = model.compatibility_with(&narrow).unwrap_err();
+        assert!(err.contains("входов"), "{err}");
+
+        // Тип колонки.
+        let numeric_material = ModelSchema::new(
+            vec![input("temperature"), input("material")],
+            vec![output("moisture")],
+        )
+        .unwrap();
+        let err = model.compatibility_with(&numeric_material).unwrap_err();
+        assert!(err.contains("категория"), "{err}");
+
+        // Выходы имеют ту же смысловую проверку, что и входы.
+        let renamed_output = ModelSchema::new(
+            vec![input("temperature"), material()],
+            vec![output("humidity")],
+        )
+        .unwrap();
+        let err = model.compatibility_with(&renamed_output).unwrap_err();
+        assert!(err.contains("выход 1") && err.contains("humidity"), "{err}");
+    }
+
+    #[test]
+    fn compatibility_compares_category_levels() {
+        let model = ModelSchema::new(vec![material()], vec![output("y")]).unwrap();
+        let other_levels = ModelSchema::new(
+            vec![Column::categorical(
+                "material",
+                ColumnRole::Input,
+                vec!["sand".into(), "clay".into()],
+            )
+            .unwrap()],
+            vec![output("y")],
+        )
+        .unwrap();
+        let err = model.compatibility_with(&other_levels).unwrap_err();
+        assert!(err.contains("уровни категории"), "{err}");
+        assert!(model.compatibility_with(&model.clone()).is_ok());
     }
 
     #[test]

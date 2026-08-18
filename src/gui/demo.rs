@@ -2,7 +2,8 @@
 //! в основной навигации ей не место — она остаётся примером архитектуры.
 
 use super::messages::Command;
-use super::session::App;
+use super::messages::DatasetOrigin;
+use super::session::{App, Section, BLACKBOXES};
 use crate::config::ModelConfig;
 use crate::train::TextTrainConfig;
 use eframe::egui;
@@ -94,8 +95,32 @@ impl TextForm {
 }
 
 impl App {
-    pub(super) fn ui_text(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Text");
+    /// Раздел «Демо»: встроенные задачи и char-LM. К рабочему сценарию не
+    /// относятся и живут отдельно, чтобы не выглядеть его частью.
+    pub(super) fn ui_demo(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Демо");
+        ui.label(
+            "Встроенные задачи — источник данных для проверки самого приложения, \
+             а не рабочий сценарий.",
+        );
+        ui.horizontal(|ui| {
+            ui.label("Открыть как данные:");
+            for &name in BLACKBOXES {
+                if ui
+                    .add_enabled(!self.busy(), egui::Button::new(name))
+                    .clicked()
+                {
+                    self.open_dataset(DatasetOrigin::Blackbox(name.to_string()));
+                    self.section = Section::Data;
+                }
+            }
+        });
+        ui.separator();
+        self.ui_text(ui);
+    }
+
+    fn ui_text(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Char-level LM");
 
         ui.horizontal(|ui| {
             if ui.button("Выбрать .txt…").clicked() {
@@ -156,7 +181,7 @@ impl App {
 
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!self.busy(), egui::Button::new("Train text"))
+                .add_enabled(!self.busy(), egui::Button::new("Обучить text-модель"))
                 .clicked()
             {
                 match self.text_form.build() {
@@ -172,7 +197,7 @@ impl App {
                 }
             }
             if ui
-                .add_enabled(self.text_training, egui::Button::new("Cancel"))
+                .add_enabled(self.text_training, egui::Button::new("Отмена"))
                 .clicked()
             {
                 self.worker.request_cancel();

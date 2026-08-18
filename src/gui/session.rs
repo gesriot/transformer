@@ -8,14 +8,14 @@ use super::data::{MarkupState, PrepareForm};
 use super::demo::TextForm;
 use super::messages::{
     Command, DatasetOrigin, DiagnosticsResult, Event, KanModelInfo, KanSymbolicInfo, PreparedData,
+    ValidationOrigin,
 };
-use super::model::ModelInfo;
-use super::train::{CustomSearchForm, EpochSweepForm, OptimizeForm, TrainForm, TrainingMode};
+use super::model::{ModelInfo, ModelView};
+use super::train::{CustomSearchForm, SearchForm, TrainForm, TrainingMode};
 use super::worker::Worker;
 use crate::data::OutOfRange;
 use crate::encoders::ValueEncoderKind;
-use crate::epoch_sweep::EpochRow;
-use crate::markup::TableProfile;
+use crate::markup::{Message, TableProfile};
 use crate::metrics::Metrics;
 use crate::split::{FinalEval, SplitPlan};
 use crate::sweep::{self, SweepChoice, SweepRow};
@@ -24,15 +24,29 @@ use crate::training::Phase;
 use eframe::egui;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Tab {
-    Train,
+/// Разделы окна. Их пять, и они соответствуют шагам работы, а не командам:
+/// открыть данные, обучить, разобраться с моделью, посчитать прогноз.
+///
+/// «Демо» стоит особняком: встроенные задачи и char-LM к рабочему сценарию не
+/// относятся и держатся отдельно, чтобы не выглядеть его частью.
+pub(super) enum Section {
+    Data,
+    Training,
+    Model,
     Predict,
-    KanCurves,
-    KanFormulas,
-    Diagnose,
-    Text,
-    Prepare,
-    EpochSweep,
+    Demo,
+}
+
+impl Section {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Section::Data => "Данные",
+            Section::Training => "Обучение",
+            Section::Model => "Модель",
+            Section::Predict => "Прогноз",
+            Section::Demo => "Демо",
+        }
+    }
 }
 
 /// Одно сообщение на все экраны: данные общие, значит и текст общий.
@@ -50,12 +64,47 @@ pub(super) struct ActiveDataset {
     pub(super) prepared: PreparedData,
     /// Профиль есть только у таблиц: `.tnum` и чёрный ящик уже размечены.
     pub(super) profile: Option<TableProfile>,
+    /// Замечания, зависящие от подтверждённых ролей: например, аффинные
+    /// зависимости между входами. `TableProfile` их не содержит.
+    pub(super) role_messages: Vec<Message>,
     /// План разбиения — свойство набора данных, а не отдельного запуска.
     pub(super) split: SplitPlan,
     /// Как читалась таблица: «Разметить заново» должно открыть её так же.
     pub(super) table_has_header: bool,
     /// Номер набора в сессии: по нему видно, что данные сменились.
     pub(super) revision: u64,
+}
+
+pub(super) fn model_kind_label(kind: crate::numeric_model::ModelKind) -> &'static str {
+    match kind {
+        crate::numeric_model::ModelKind::Transformer => "transformer",
+        crate::numeric_model::ModelKind::Mlp => "mlp",
+        crate::numeric_model::ModelKind::Kan => "kan",
+    }
+}
+
+pub(super) fn split_plan_label(plan: SplitPlan) -> String {
+    match plan {
+        SplitPlan::Holdout {
+            train_frac,
+            val_frac,
+            split_seed,
+        } => format!(
+            "holdout {:.0}/{:.0}/{:.0}, split seed {split_seed}",
+            train_frac * 100.0,
+            val_frac * 100.0,
+            (1.0 - train_frac - val_frac) * 100.0
+        ),
+        SplitPlan::KFold {
+            k,
+            folds_seed,
+            test_frac,
+            test_seed,
+        } => format!(
+            "{k}-fold, test {:.0}%, folds seed {folds_seed}, test seed {test_seed}",
+            test_frac * 100.0
+        ),
+    }
 }
 
 impl ActiveDataset {
@@ -68,34 +117,63 @@ impl ActiveDataset {
         Self {
             prepared,
             profile,
+            role_messages: Vec::new(),
             split: SplitPlan::default(),
             table_has_header,
             revision,
         }
     }
 
+    pub(super) fn with_role_messages(mut self, messages: Vec<Message>) -> Self {
+        self.role_messages = messages;
+        self
+    }
+
     /// Строка для шапки: что открыто и какой оно формы.
     pub(super) fn summary(&self) -> String {
         let schema = &self.prepared.schema;
         format!(
-            "{} · {} строк · {} вход → {} выход",
+            "{} · {} строк · {} вход → {} выход · {}",
             self.prepared.origin.short_name(),
             self.prepared.data.len(),
             schema.n_inputs(),
-            schema.n_outputs()
+            schema.n_outputs(),
+            self.split_summary()
         )
+    }
+
+    /// Короткое, но проверяемое описание протокола для постоянной шапки.
+    pub(super) fn split_summary(&self) -> String {
+        let rows = self.prepared.data.len();
+        match self.split {
+            SplitPlan::Holdout {
+                train_frac,
+                val_frac,
+                ..
+            } => {
+                let train = (rows as f32 * train_frac).round() as usize;
+                let validation = (rows as f32 * val_frac).round() as usize;
+                let test = rows.saturating_sub(train + validation);
+                format!("holdout {train}/{validation}/{test}")
+            }
+            SplitPlan::KFold { k, test_frac, .. } => {
+                let test = (rows as f32 * test_frac).round() as usize;
+                let pool = rows.saturating_sub(test);
+                format!("{k}-fold по {pool} строкам + test {test}")
+            }
+        }
     }
 
     /// Сколько замечаний к качеству данных нашёл профиль. У `.tnum` и чёрного
     /// ящика профиля нет — там и предупреждать не о чем.
     pub(super) fn data_notes(&self) -> usize {
-        self.profile.as_ref().map_or(0, |p| p.messages().len())
+        self.profile.as_ref().map_or(0, |p| p.messages().len()) + self.role_messages.len()
     }
 }
 
 pub struct App {
     pub(super) worker: Worker,
-    pub(super) tab: Tab,
+    pub(super) section: Section,
     pub(super) status: String,
     pub(super) form: TrainForm,
     /// Активный набор данных сессии; `None` — данные ещё не открыты.
@@ -108,11 +186,18 @@ pub struct App {
     /// Loss development-фазы и финального refit хранятся отдельно: обе фазы
     /// начинают нумерацию эпох с единицы.
     pub(super) loss_curve: Vec<[f64; 2]>,
+    /// R² на validation по эпохам: кривая обучения вместо отдельного сценария.
+    pub(super) val_curve: Vec<[f64; 2]>,
+    /// Как часто снимать validation во время обучения (0 — не снимать).
+    pub(super) eval_every: usize,
     pub(super) final_loss_curve: Vec<[f64; 2]>,
     pub(super) metrics: Option<Metrics>,
+    pub(super) metrics_per_output: Option<Vec<Metrics>>,
+    pub(super) validation_origin: Option<ValidationOrigin>,
     pub(super) train_parameter_count: Option<usize>,
     // Predict (UI-M5)
     pub(super) model_info: Option<ModelInfo>,
+    pub(super) model_view: ModelView,
     /// Worker читает и профилирует таблицу. Пока ответ не пришёл, нельзя
     /// запустить действие со старым активным набором.
     pub(super) table_opening: bool,
@@ -134,7 +219,7 @@ pub struct App {
     // Diagnose (UI-M6)
     pub(super) diagnostics: Option<DiagnosticsResult>,
     // Общие настройки и результаты поиска
-    pub(super) optimize_form: OptimizeForm,
+    pub(super) search_form: SearchForm,
     pub(super) search_rows: Vec<SweepRow>,
     pub(super) search_total: Option<(usize, usize)>,
     pub(super) search_cancelled: bool,
@@ -156,21 +241,15 @@ pub struct App {
     pub(super) text_ready: bool,
     pub(super) text_vocab_size: Option<usize>,
     pub(super) generated_text: String,
-    // Prepare / Epoch-sweep (UI-M8)
+    // Совместимая явная конвертация в .tnum внутри раздела «Данные».
     pub(super) prepare_form: PrepareForm,
-    pub(super) epoch_form: EpochSweepForm,
-    pub(super) epoch_sweeping: bool,
-    pub(super) epoch_rows: Vec<EpochRow>,
-    pub(super) epoch_total: Option<usize>,
-    pub(super) epoch_recommendation: Option<(usize, String)>,
-    pub(super) epoch_cancelled: bool,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         Self {
             worker: Worker::spawn(cc.egui_ctx.clone()),
-            tab: Tab::Train,
+            section: Section::Data,
             status: "–".to_string(),
             form: TrainForm::default(),
             dataset: None,
@@ -179,10 +258,15 @@ impl App {
             training: false,
             searching: false,
             loss_curve: Vec::new(),
+            val_curve: Vec::new(),
+            eval_every: 5,
             final_loss_curve: Vec::new(),
             metrics: None,
+            metrics_per_output: None,
+            validation_origin: None,
             train_parameter_count: None,
             model_info: None,
+            model_view: ModelView::Summary,
             table_opening: false,
             markup: None,
             predict_inputs: Vec::new(),
@@ -197,7 +281,7 @@ impl App {
             kan_symbolic: None,
             kan_symbolic_pending: false,
             diagnostics: None,
-            optimize_form: OptimizeForm::default(),
+            search_form: SearchForm::default(),
             search_rows: Vec::new(),
             search_total: None,
             search_cancelled: false,
@@ -213,12 +297,6 @@ impl App {
             text_vocab_size: None,
             generated_text: String::new(),
             prepare_form: PrepareForm::default(),
-            epoch_form: EpochSweepForm::default(),
-            epoch_sweeping: false,
-            epoch_rows: Vec::new(),
-            epoch_total: None,
-            epoch_recommendation: None,
-            epoch_cancelled: false,
         }
     }
 
@@ -230,7 +308,6 @@ impl App {
                     self.training = false;
                     self.searching = false;
                     self.text_training = false;
-                    self.epoch_sweeping = false;
                     self.batch_predicting = false;
                     self.kan_symbolic_pending = false;
                     self.table_opening = false;
@@ -243,29 +320,53 @@ impl App {
                 } => {
                     self.training = true;
                     self.loss_curve.clear();
+                    self.val_curve.clear();
                     self.final_loss_curve.clear();
-                    self.metrics = None;
-                    self.final_eval = None;
                     self.train_parameter_count = Some(parameter_count);
                     self.status =
                         format!("обучение: 0/{total_epochs} эпох, {parameter_count} параметров");
                 }
-                Event::Epoch { phase, epoch, loss } => {
+                Event::Epoch {
+                    phase,
+                    epoch,
+                    loss,
+                    val_r2,
+                } => {
                     let (curve, label) = match phase {
                         Phase::Development => (&mut self.loss_curve, "development"),
                         Phase::Final => (&mut self.final_loss_curve, "финальное обучение"),
                     };
                     curve.push([epoch as f64, loss as f64]);
-                    self.status = format!("{label}: эпоха {epoch}, loss {loss:.5}");
+                    // Кривая validation снимается только в точках расписания и
+                    // только в фазе разработки: финальная фаза validation не
+                    // измеряет — она на ней училась.
+                    if let (Phase::Development, Some(r2)) = (phase, val_r2) {
+                        self.val_curve.push([epoch as f64, r2 as f64]);
+                    }
+                    self.status = match val_r2 {
+                        Some(r2) => {
+                            format!("{label}: эпоха {epoch}, loss {loss:.5}, validation R² {r2:.5}")
+                        }
+                        None => format!("{label}: эпоха {epoch}, loss {loss:.5}"),
+                    };
                 }
                 Event::TrainDone {
                     metrics,
+                    per_output,
+                    validation_origin,
                     final_eval,
                     cancelled,
                 } => {
                     self.training = false;
-                    self.metrics = metrics;
-                    self.final_eval = final_eval;
+                    // До успешного завершения активной остаётся прежняя
+                    // модель worker-а, поэтому отмена не должна стирать её
+                    // метрики из шапки.
+                    if !cancelled {
+                        self.metrics = metrics;
+                        self.metrics_per_output = per_output;
+                        self.validation_origin = validation_origin;
+                        self.final_eval = final_eval;
+                    }
                     self.status = if cancelled {
                         "обучение отменено".to_string()
                     } else if self.final_eval.is_some() {
@@ -305,8 +406,22 @@ impl App {
                     source,
                     parameter_count,
                     kan,
+                    keep_evaluation,
                 } => {
                     let n_inputs = schema.n_inputs();
+                    if !keep_evaluation {
+                        // Checkpoint не хранит протокол оценки. Оставить здесь
+                        // числа предыдущей модели означало бы приписать их
+                        // только что загруженной.
+                        self.metrics = None;
+                        self.metrics_per_output = None;
+                        self.validation_origin = None;
+                        self.final_eval = None;
+                        self.loss_curve.clear();
+                        self.val_curve.clear();
+                        self.final_loss_curve.clear();
+                        self.train_parameter_count = None;
+                    }
                     self.model_info = Some(ModelInfo {
                         schema,
                         kind,
@@ -323,6 +438,7 @@ impl App {
                     self.kan_curve.clear();
                     self.kan_symbolic = None;
                     self.kan_symbolic_pending = false;
+                    self.diagnostics = None;
                     self.request_kan_curve();
                     self.status = "модель готова к предсказанию".to_string();
                 }
@@ -449,35 +565,6 @@ impl App {
                         "записано {output}: {rows} строк, {n_inputs} вход -> {n_outputs} выход"
                     );
                 }
-                Event::EpochSweepStarted { total_points } => {
-                    self.epoch_sweeping = true;
-                    self.epoch_rows.clear();
-                    self.epoch_total = Some(total_points);
-                    self.epoch_recommendation = None;
-                    self.epoch_cancelled = false;
-                    self.status = format!("epoch-sweep: 0/{total_points}");
-                }
-                Event::EpochSweepRow { row } => {
-                    self.epoch_rows.push(row);
-                    if let Some(total) = self.epoch_total {
-                        self.status = format!("epoch-sweep: {}/{total}", self.epoch_rows.len());
-                    }
-                }
-                Event::EpochSweepDone {
-                    rows,
-                    recommendation,
-                    cancelled,
-                } => {
-                    self.epoch_sweeping = false;
-                    self.epoch_rows = rows;
-                    self.epoch_recommendation = recommendation;
-                    self.epoch_cancelled = cancelled;
-                    self.status = if cancelled {
-                        "epoch-sweep отменён".to_string()
-                    } else {
-                        "epoch-sweep завершён".to_string()
-                    };
-                }
             }
         }
     }
@@ -486,7 +573,6 @@ impl App {
         self.training
             || self.searching
             || self.text_training
-            || self.epoch_sweeping
             || self.batch_predicting
             || self.kan_symbolic_pending
             || self.table_opening
@@ -494,9 +580,9 @@ impl App {
             || self.markup.is_some()
     }
 
-    /// Полоса активного набора данных. Её рисует каждый экран обучения: пока
-    /// разделы не объединены, это единственное место выбора данных.
-    pub(super) fn ui_dataset_bar(&mut self, ui: &mut egui::Ui) {
+    /// Постоянная шапка: что открыто и что обучено. Видна из любого раздела,
+    /// потому что оба объекта — общие для всей сессии.
+    pub(super) fn ui_header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("Данные:");
             match &self.dataset {
@@ -504,7 +590,7 @@ impl App {
                     ui.label(active.summary());
                     let notes = active.data_notes();
                     if notes > 0 {
-                        ui.label(format!("· замечаний к данным: {notes}"));
+                        ui.label(format!("· замечаний: {notes}"));
                     }
                 }
                 None => {
@@ -513,18 +599,44 @@ impl App {
             }
         });
         ui.horizontal(|ui| {
+            ui.label("Модель:");
+            match &self.model_info {
+                Some(info) => {
+                    ui.label(format!("{} · {}", model_kind_label(info.kind), info.source));
+                    if let Some(final_eval) = &self.final_eval {
+                        ui.label(format!("· test R² {:.3}", final_eval.metrics.r2));
+                    } else if let Some(metrics) = &self.metrics {
+                        ui.label(format!("· validation R² {:.3}", metrics.r2));
+                    }
+                    // Модель и данные могли разойтись: причина важнее самого
+                    // факта несовместимости.
+                    if let Some(reason) = self.schema_mismatch() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(200, 120, 0),
+                            format!("⚠ не подходит к данным: {reason}"),
+                        );
+                    }
+                }
+                None => {
+                    ui.label("не обучена");
+                }
+            }
+        });
+    }
+
+    /// Почему активная модель не подходит к активным данным. `None` — подходит
+    /// либо сравнивать нечего.
+    pub(super) fn schema_mismatch(&self) -> Option<String> {
+        let model = self.model_info.as_ref()?;
+        let data = self.dataset.as_ref()?;
+        model.schema.compatibility_with(&data.prepared.schema).err()
+    }
+
+    /// Действия выбора активного набора. Они живут только в разделе «Данные»;
+    /// остальные разделы видят результат в постоянной шапке.
+    pub(super) fn ui_dataset_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
             let idle = !self.busy();
-            ui.add_enabled_ui(idle, |ui| {
-                egui::ComboBox::from_id_salt("dataset_blackbox")
-                    .selected_text("Чёрный ящик…")
-                    .show_ui(ui, |ui| {
-                        for &name in BLACKBOXES {
-                            if ui.selectable_label(false, name).clicked() {
-                                self.open_dataset(DatasetOrigin::Blackbox(name.to_string()));
-                            }
-                        }
-                    });
-            });
             if ui
                 .add_enabled(idle, egui::Button::new("Открыть .tnum…"))
                 .clicked()
@@ -572,11 +684,15 @@ impl App {
 
     /// Активные данные и их план разбиения для команды worker-у.
     ///
-    /// `None` — данные не открыты: экран сам решает, что показать.
-    pub(super) fn active_data(&self) -> Option<(PreparedData, SplitPlan)> {
-        self.dataset
+    /// Ошибка — данные не открыты либо выбранный план нельзя применить к их
+    /// числу строк.
+    pub(super) fn active_data(&self) -> Result<(PreparedData, SplitPlan), String> {
+        let active = self
+            .dataset
             .as_ref()
-            .map(|active| (active.prepared.clone(), active.split))
+            .ok_or_else(|| NO_DATASET.to_string())?;
+        active.split.validate(active.prepared.data.len())?;
+        Ok((active.prepared.clone(), active.split))
     }
 
     /// Номер для следующего набора данных: ревизии не переиспользуются, иначе
@@ -586,15 +702,15 @@ impl App {
         self.dataset_revision
     }
 
-    /// Сменить активный набор. Результаты поиска и финальный замер относятся
-    /// к старым данным, поэтому очищаются. Сама модель остаётся доступной.
+    /// Сменить активный набор. Результаты поиска относятся к старым данным и
+    /// очищаются. Сама модель и её метрики остаются доступны: шапка отдельно
+    /// покажет, совместима ли она с новым набором.
     pub(super) fn set_dataset(&mut self, dataset: ActiveDataset) {
         self.dataset = Some(dataset);
         self.search_rows.clear();
         self.search_total = None;
         self.search_stamp = None;
         self.search_selected = None;
-        self.final_eval = None;
     }
 
     pub(super) fn open_dataset(&mut self, origin: DatasetOrigin) {
@@ -604,7 +720,7 @@ impl App {
     }
 
     pub(super) fn sort_search_rows(&mut self) {
-        let objective = self.optimize_form.objective();
+        let objective = self.search_form.objective();
         sweep::sort_rows(&mut self.search_rows, objective);
     }
 
@@ -663,82 +779,8 @@ impl App {
                 self.form.min_lr_ratio = min_lr_ratio;
             }
         }
-        self.tab = Tab::Train;
+        self.section = Section::Training;
         self.status = "выбранная конфигурация перенесена в ручной режим".to_string();
-    }
-
-    /// Переносит выбранную конфигурацию в Epoch-sweep, чтобы подобрать число
-    /// эпох. Search-бюджет не переносим — задаём список для
-    /// прохода.
-    pub(super) fn apply_choice_to_epoch_sweep(&mut self, choice: &SweepChoice) {
-        self.epoch_form.kind = choice.kind;
-        self.epoch_form.kan_width = choice.kan.width;
-        self.epoch_form.kan_layers = choice.kan.layers;
-        self.epoch_form.kan_grid = choice.kan.grid;
-        self.epoch_form.d_model = choice.d_model;
-        self.epoch_form.heads = choice.heads;
-        self.epoch_form.layers = choice.layers;
-        self.epoch_form.d_ff = choice.d_ff;
-        self.epoch_form.venc = match choice.value.kind {
-            ValueEncoderKind::Linear => 0,
-            ValueEncoderKind::Mlp => 1,
-            ValueEncoderKind::Fourier => 2,
-        };
-        self.epoch_form.fourier_bands = choice.value.fourier_bands;
-        self.epoch_form.fourier_scale = choice.value.fourier_scale;
-        self.epoch_form.mlp_width = choice.mlp_width;
-        self.epoch_form.mlp_layers = choice.mlp_layers;
-        self.epoch_form.lr = choice.lr;
-        self.epoch_form.batch = choice.batch_size;
-        self.epoch_form.seed = choice.seed;
-        match choice.schedule {
-            LrSchedule::Constant => {
-                self.epoch_form.warmup_cosine = false;
-            }
-            LrSchedule::WarmupCosine {
-                warmup_frac,
-                min_lr_ratio,
-            } => {
-                self.epoch_form.warmup_cosine = true;
-                self.epoch_form.warmup = warmup_frac;
-                self.epoch_form.min_lr_ratio = min_lr_ratio;
-            }
-        }
-        self.epoch_form.epochs = "20,40,60,80,120".to_string();
-        self.epoch_rows.clear();
-        self.epoch_total = None;
-        self.epoch_recommendation = None;
-        self.epoch_cancelled = false;
-        self.tab = Tab::EpochSweep;
-        self.status = "конфиг перенесён в Epoch-sweep – запусти подбор эпох".to_string();
-    }
-
-    /// Переносит текущий конфиг Epoch-sweep и рекомендованное число эпох в
-    /// ручной режим.
-    pub(super) fn apply_epoch_form_to_train(&mut self, epochs: usize) {
-        let f = &self.epoch_form;
-        self.form.kind = f.kind;
-        self.form.d_model = f.d_model;
-        self.form.heads = f.heads;
-        self.form.layers = f.layers;
-        self.form.d_ff = f.d_ff;
-        self.form.venc = f.venc;
-        self.form.fourier_bands = f.fourier_bands;
-        self.form.fourier_scale = f.fourier_scale;
-        self.form.mlp_width = f.mlp_width;
-        self.form.mlp_layers = f.mlp_layers;
-        self.form.kan_width = f.kan_width;
-        self.form.kan_layers = f.kan_layers;
-        self.form.kan_grid = f.kan_grid;
-        self.form.lr = f.lr;
-        self.form.batch = f.batch;
-        self.form.seed = f.seed;
-        self.form.warmup_cosine = f.warmup_cosine;
-        self.form.warmup = f.warmup;
-        self.form.min_lr_ratio = f.min_lr_ratio;
-        self.form.epochs = epochs;
-        self.tab = Tab::Train;
-        self.status = format!("конфиг и {epochs} эпох применены во вкладке Train");
     }
 }
 
@@ -749,15 +791,20 @@ impl eframe::App for App {
 
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Train, "Train");
-                ui.selectable_value(&mut self.tab, Tab::Predict, "Predict");
-                ui.selectable_value(&mut self.tab, Tab::KanCurves, "KAN curves");
-                ui.selectable_value(&mut self.tab, Tab::KanFormulas, "KAN formulas");
-                ui.selectable_value(&mut self.tab, Tab::Diagnose, "Diagnose");
-                ui.selectable_value(&mut self.tab, Tab::Text, "Text");
-                ui.selectable_value(&mut self.tab, Tab::Prepare, "Prepare");
-                ui.selectable_value(&mut self.tab, Tab::EpochSweep, "Epoch-sweep");
+                for section in [
+                    Section::Data,
+                    Section::Training,
+                    Section::Model,
+                    Section::Predict,
+                    Section::Demo,
+                ] {
+                    ui.selectable_value(&mut self.section, section, section.label());
+                }
             });
+        });
+
+        egui::TopBottomPanel::top("session_header").show(ctx, |ui| {
+            self.ui_header(ui);
         });
 
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -770,15 +817,12 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .show(ui, |ui| match self.tab {
-                    Tab::Train => self.ui_train(ui),
-                    Tab::Predict => self.ui_predict(ui),
-                    Tab::KanCurves => self.ui_kan_curves(ui),
-                    Tab::KanFormulas => self.ui_kan_formulas(ui),
-                    Tab::Diagnose => self.ui_diagnose(ui),
-                    Tab::Text => self.ui_text(ui),
-                    Tab::Prepare => self.ui_prepare(ui),
-                    Tab::EpochSweep => self.ui_epoch_sweep(ui),
+                .show(ui, |ui| match self.section {
+                    Section::Data => self.ui_data(ui),
+                    Section::Training => self.ui_train(ui),
+                    Section::Model => self.ui_model(ui),
+                    Section::Predict => self.ui_predict(ui),
+                    Section::Demo => self.ui_demo(ui),
                 });
         });
     }
@@ -827,9 +871,19 @@ mod tests {
 
     #[test]
     fn summary_describes_the_active_dataset() {
-        let text = active(1).summary();
+        let mut dataset = active(1);
+        let text = dataset.summary();
         assert!(text.contains("чёрный ящик: sum"), "{text}");
         assert!(text.contains("16 строк"), "{text}");
         assert!(text.contains("2 вход → 1 выход"), "{text}");
+        assert!(text.contains("holdout 11/2/3"), "{text}");
+
+        dataset.split = SplitPlan::KFold {
+            k: 5,
+            folds_seed: 1,
+            test_frac: 0.25,
+            test_seed: 2,
+        };
+        assert_eq!(dataset.split_summary(), "5-fold по 12 строкам + test 4");
     }
 }

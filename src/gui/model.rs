@@ -1,8 +1,8 @@
 //! Экран модели: кривые рёбер KAN, формулы и диагностика.
 
 use super::messages::Command;
-use super::session::App;
-use super::session::KAN_CURVE_SAMPLES;
+use super::session::{split_plan_label, App, KAN_CURVE_SAMPLES};
+use crate::metrics::Metrics;
 use crate::numeric_model::ModelKind;
 use crate::schema::ModelSchema;
 use eframe::egui;
@@ -44,7 +44,114 @@ impl ModelInfo {
     }
 }
 
+/// Подразделы раздела «Модель».
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ModelView {
+    Summary,
+    KanCurves,
+    KanFormulas,
+    Diagnose,
+}
+
+impl ModelView {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            ModelView::Summary => "Итоги",
+            ModelView::KanCurves => "Кривые KAN",
+            ModelView::KanFormulas => "Формулы",
+            ModelView::Diagnose => "Диагностика",
+        }
+    }
+}
+
 impl App {
+    /// Раздел «Модель»: всё, что можно узнать про обученную модель.
+    pub(super) fn ui_model(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Модель");
+        ui.horizontal(|ui| {
+            for view in [
+                ModelView::Summary,
+                ModelView::KanCurves,
+                ModelView::KanFormulas,
+                ModelView::Diagnose,
+            ] {
+                ui.selectable_value(&mut self.model_view, view, view.label());
+            }
+        });
+        ui.separator();
+        match self.model_view {
+            ModelView::Summary => self.ui_model_summary(ui),
+            ModelView::KanCurves => self.ui_kan_curves(ui),
+            ModelView::KanFormulas => self.ui_kan_formulas(ui),
+            ModelView::Diagnose => self.ui_diagnose(ui),
+        }
+    }
+
+    /// Итоги: происхождение модели, метрики и единственный замер на test.
+    fn ui_model_summary(&mut self, ui: &mut egui::Ui) {
+        let Some(info) = &self.model_info else {
+            ui.label("Модель ещё не обучена и не загружена.");
+            return;
+        };
+        ui.label(format!("Источник: {}", info.source));
+        ui.label(format!("Параметров: {}", info.parameter_count));
+        ui.label(format!("Входы: {}", info.schema.input_names().join(", ")));
+        ui.label(format!("Выходы: {}", info.schema.output_names().join(", ")));
+        if let Some(warning) = info.categorical_warning() {
+            ui.colored_label(egui::Color32::from_rgb(200, 120, 0), warning);
+        }
+        if let Some(reason) = self.schema_mismatch() {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 0),
+                format!("Не подходит к активным данным: {reason}"),
+            );
+        }
+        ui.separator();
+        if let Some(metrics) = &self.metrics {
+            show_metrics(
+                ui,
+                "validation",
+                metrics,
+                self.metrics_per_output.as_deref(),
+                info.schema.outputs(),
+            );
+            if let Some(origin) = self.validation_origin {
+                ui.label(format!(
+                    "Протокол: {}; init seed {}",
+                    split_plan_label(origin.plan),
+                    origin.init_seed
+                ));
+            }
+        }
+        if let Some(final_eval) = &self.final_eval {
+            show_metrics(
+                ui,
+                &format!(
+                    "test ({} строк, единственный замер)",
+                    final_eval.origin.test_rows
+                ),
+                &final_eval.metrics,
+                Some(&final_eval.per_output),
+                info.schema.outputs(),
+            );
+            ui.label(format!(
+                "Протокол: {}; final init seed {}",
+                split_plan_label(final_eval.origin.plan),
+                final_eval.origin.final_init_seed
+            ));
+        } else if self.metrics.is_some() {
+            ui.label("Test отложен: его открывает только финальное обучение.");
+        } else {
+            ui.label("Checkpoint не хранит метрики: они появятся после обучения в этой сессии.");
+        }
+        if ui
+            .add_enabled(!self.busy(), egui::Button::new("Сохранить модель…"))
+            .clicked()
+        {
+            self.save_model_dialog();
+        }
+    }
+
     pub(super) fn request_kan_curve(&mut self) {
         let Some((n_inputs, n_outputs)) = self
             .kan_info
@@ -281,9 +388,9 @@ impl App {
     }
 
     pub(super) fn ui_diagnose(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Diagnose");
+        ui.heading("Диагностика");
         if self.model_info.is_none() {
-            ui.label("Обучите модель (вкладка Train) – диагностика по её данным.");
+            ui.label("Обучите модель в разделе «Обучение» — диагностика использует её данные.");
             return;
         }
         if ui.button("Запустить диагностику").clicked() {
@@ -346,4 +453,42 @@ impl App {
             }
         }
     }
+}
+
+fn show_metrics(
+    ui: &mut egui::Ui,
+    label: &str,
+    aggregate: &Metrics,
+    per_output: Option<&[Metrics]>,
+    outputs: &[crate::schema::Column],
+) {
+    ui.label(format!(
+        "{label}: RMSE={:.5}   MAE={:.5}   rel.error={:.2}%   R²={:.5}",
+        aggregate.rmse,
+        aggregate.mae,
+        aggregate.rel_error * 100.0,
+        aggregate.r2
+    ));
+    let Some(per_output) = per_output else {
+        return;
+    };
+    egui::Grid::new(format!("{label}_per_output_metrics"))
+        .num_columns(5)
+        .striped(true)
+        .show(ui, |ui| {
+            ui.label("выход");
+            ui.label("RMSE");
+            ui.label("MAE");
+            ui.label("rel.error");
+            ui.label("R²");
+            ui.end_row();
+            for (column, metrics) in outputs.iter().zip(per_output) {
+                ui.label(column.display_name());
+                ui.label(format!("{:.5}", metrics.rmse));
+                ui.label(format!("{:.5}", metrics.mae));
+                ui.label(format!("{:.2}%", metrics.rel_error * 100.0));
+                ui.label(format!("{:.5}", metrics.r2));
+                ui.end_row();
+            }
+        });
 }

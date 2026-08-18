@@ -2,14 +2,15 @@
 
 use super::messages::Command;
 use super::model::ModelInfo;
-use super::session::{App, NO_DATASET};
+use super::session::App;
 use crate::config::ModelConfig;
 use crate::encoders::{ValueEncoderConfig, ValueEncoderKind};
-use crate::epoch_sweep::{self};
+use crate::epoch_sweep;
 use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
 use crate::split::DEFAULT_FINAL_INIT_SEED;
 use crate::sweep::{self, SearchBudget, SweepAxes, SweepChoice, SweepObjective, SweepRow};
 use crate::train::{validate_train, LrSchedule, TrainConfig};
+use crate::training::{recommended_epoch, EvalSchedule};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
@@ -212,14 +213,14 @@ impl CustomSearchForm {
     }
 }
 
-pub(super) struct OptimizeForm {
+pub(super) struct SearchForm {
     pub(super) objective: usize, // 0 worst, 1 aggregate, 2 mean, 3 nrmse
     pub(super) include_mlp: bool,
     pub(super) include_transformer: bool,
     pub(super) include_kan: bool,
 }
 
-impl Default for OptimizeForm {
+impl Default for SearchForm {
     fn default() -> Self {
         Self {
             objective: 0,
@@ -230,7 +231,7 @@ impl Default for OptimizeForm {
     }
 }
 
-impl OptimizeForm {
+impl SearchForm {
     pub(super) fn objective(&self) -> SweepObjective {
         match self.objective {
             1 => SweepObjective::AggregateR2,
@@ -266,154 +267,6 @@ impl OptimizeForm {
         let axes = SweepAxes::for_budget(budget, model_kinds);
         sweep::validate_axes(&axes)?;
         Ok(axes)
-    }
-}
-
-pub(super) struct EpochSweepForm {
-    pub(super) epochs: String,
-    pub(super) target_r2: f32,
-    pub(super) min_gain: f32,
-    pub(super) plateau_min: f32,
-    pub(super) kind: ModelKind,
-    pub(super) d_model: usize,
-    pub(super) heads: usize,
-    pub(super) layers: usize,
-    pub(super) d_ff: usize,
-    pub(super) venc: usize,
-    pub(super) fourier_bands: usize,
-    pub(super) fourier_scale: f32,
-    pub(super) mlp_width: usize,
-    pub(super) mlp_layers: usize,
-    pub(super) kan_width: usize,
-    pub(super) kan_layers: usize,
-    pub(super) kan_grid: usize,
-    pub(super) lr: f32,
-    pub(super) batch: usize,
-    pub(super) seed: u64,
-    pub(super) warmup_cosine: bool,
-    pub(super) warmup: f32,
-    pub(super) min_lr_ratio: f32,
-}
-
-pub(super) struct EpochSweepRequest {
-    pub(super) nc: NumericConfig,
-    pub(super) base_tcfg: TrainConfig,
-    pub(super) milestones: Vec<usize>,
-    pub(super) target_r2: f32,
-    pub(super) min_gain: f32,
-    pub(super) plateau_min: f32,
-}
-
-impl Default for EpochSweepForm {
-    fn default() -> Self {
-        Self {
-            epochs: "1,2,5,10,20,40".to_string(),
-            target_r2: 0.95,
-            min_gain: 0.02,
-            plateau_min: 0.80,
-            kind: ModelKind::Transformer,
-            d_model: 32,
-            heads: 4,
-            layers: 2,
-            d_ff: 64,
-            venc: 0,
-            fourier_bands: 6,
-            fourier_scale: 8.0,
-            mlp_width: 128,
-            mlp_layers: 3,
-            kan_width: 16,
-            kan_layers: 2,
-            kan_grid: 8,
-            lr: 1e-3,
-            batch: 64,
-            seed: 0,
-            warmup_cosine: false,
-            warmup: 0.1,
-            min_lr_ratio: 0.1,
-        }
-    }
-}
-
-impl EpochSweepForm {
-    pub(super) fn build(&self) -> Result<EpochSweepRequest, String> {
-        let milestones = parse_csv_usize(&self.epochs, "epochs")?;
-        if milestones.is_empty() || milestones.contains(&0) {
-            return Err("epochs: список должен быть непустым и > 0".to_string());
-        }
-        if !self.target_r2.is_finite() {
-            return Err("target-r2 должен быть конечным".to_string());
-        }
-        if !self.min_gain.is_finite() || self.min_gain < 0.0 {
-            return Err("min-r2-gain должен быть конечным и >= 0".to_string());
-        }
-        if !self.plateau_min.is_finite() {
-            return Err("plateau-min-r2 должен быть конечным".to_string());
-        }
-
-        let value = ValueEncoderConfig {
-            kind: match self.kind {
-                ModelKind::Transformer => match self.venc {
-                    0 => ValueEncoderKind::Linear,
-                    1 => ValueEncoderKind::Mlp,
-                    _ => ValueEncoderKind::Fourier,
-                },
-                ModelKind::Mlp | ModelKind::Kan => ValueEncoderKind::Linear,
-            },
-            fourier_bands: self.fourier_bands,
-            fourier_scale: self.fourier_scale,
-        };
-        let nc = NumericConfig {
-            kind: self.kind,
-            transformer: ModelConfig {
-                d_model: self.d_model,
-                n_heads: self.heads,
-                n_enc_layers: self.layers,
-                n_dec_layers: self.layers,
-                d_ff: self.d_ff,
-                ln_eps: 1e-5,
-            },
-            value,
-            mlp_width: self.mlp_width,
-            mlp_layers: self.mlp_layers,
-            kan: KanConfig {
-                width: self.kan_width,
-                layers: self.kan_layers,
-                grid: self.kan_grid,
-            },
-        };
-        validate_numeric(&nc)?;
-
-        let schedule = if self.warmup_cosine {
-            if !(0.0..1.0).contains(&self.warmup) {
-                return Err("warmup должен быть в [0, 1)".to_string());
-            }
-            if !(0.0..=1.0).contains(&self.min_lr_ratio) {
-                return Err("min-lr-ratio должен быть в [0, 1]".to_string());
-            }
-            LrSchedule::WarmupCosine {
-                warmup_frac: self.warmup,
-                min_lr_ratio: self.min_lr_ratio,
-            }
-        } else {
-            LrSchedule::Constant
-        };
-        let max_epoch = milestones.iter().copied().max().unwrap_or(1);
-        let tcfg = TrainConfig {
-            epochs: max_epoch,
-            batch_size: self.batch,
-            lr: self.lr,
-            seed: self.seed,
-            schedule,
-        };
-        validate_train(tcfg.lr, tcfg.batch_size)?;
-        Ok(EpochSweepRequest {
-            nc,
-            base_tcfg: tcfg,
-            milestones,
-            target_r2: self.target_r2,
-            min_gain: self.min_gain,
-            plateau_min: self.plateau_min,
-        })
     }
 }
 
@@ -503,7 +356,12 @@ impl App {
     pub(super) fn ui_train(&mut self, ui: &mut egui::Ui) {
         ui.heading("Обучение");
 
-        self.ui_dataset_bar(ui);
+        if self.dataset.is_none() {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 0),
+                "Сначала откройте набор в разделе «Данные».",
+            );
+        }
 
         ui.separator();
         ui.horizontal(|ui| {
@@ -538,6 +396,28 @@ impl App {
         self.ui_training_output(ui);
     }
 
+    /// Рекомендованная точка остановки по собранной кривой validation.
+    fn recommended_epochs(&self) -> Option<(usize, String)> {
+        recommended_epoch(
+            self.val_curve
+                .iter()
+                .map(|point| (point[0] as usize, point[1] as f32)),
+            0.95,
+            0.02,
+            0.80,
+        )
+    }
+
+    /// Расписание замеров validation по эпохам: кривая обучения — настройка
+    /// обычного обучения, а не отдельный сценарий.
+    fn eval_schedule(&self) -> EvalSchedule {
+        if self.eval_every == 0 {
+            EvalSchedule::Never
+        } else {
+            EvalSchedule::Every(self.eval_every)
+        }
+    }
+
     /// Ручная конфигурация: та же сетка гиперпараметров, что и раньше.
     fn ui_single_config(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -550,21 +430,21 @@ impl App {
         egui::Grid::new("cfg_grid").num_columns(2).show(ui, |ui| {
             match self.form.kind {
                 ModelKind::Mlp => {
-                    ui.label("mlp width");
+                    ui.label("ширина MLP");
                     ui.add(egui::DragValue::new(&mut self.form.mlp_width).range(1..=2048));
                     ui.end_row();
-                    ui.label("mlp layers");
+                    ui.label("слоёв MLP");
                     ui.add(egui::DragValue::new(&mut self.form.mlp_layers).range(1..=12));
                     ui.end_row();
                 }
                 ModelKind::Kan => {
-                    ui.label("kan width");
+                    ui.label("ширина KAN");
                     ui.add(egui::DragValue::new(&mut self.form.kan_width).range(1..=2048));
                     ui.end_row();
-                    ui.label("kan layers");
+                    ui.label("слоёв KAN");
                     ui.add(egui::DragValue::new(&mut self.form.kan_layers).range(1..=12));
                     ui.end_row();
-                    ui.label("kan grid");
+                    ui.label("сетка KAN");
                     ui.add(egui::DragValue::new(&mut self.form.kan_grid).range(2..=128));
                     ui.end_row();
                 }
@@ -575,7 +455,7 @@ impl App {
                     ui.label("heads");
                     ui.add(egui::DragValue::new(&mut self.form.heads).range(1..=32));
                     ui.end_row();
-                    ui.label("layers");
+                    ui.label("слоёв");
                     ui.add(egui::DragValue::new(&mut self.form.layers).range(1..=12));
                     ui.end_row();
                     ui.label("d_ff");
@@ -611,10 +491,10 @@ impl App {
                     .speed(1e-4),
             );
             ui.end_row();
-            ui.label("batch");
+            ui.label("размер пакета");
             ui.add(egui::DragValue::new(&mut self.form.batch).range(1..=8192));
             ui.end_row();
-            ui.label("epochs");
+            ui.label("эпохи");
             ui.add(egui::DragValue::new(&mut self.form.epochs).range(1..=100000));
             ui.end_row();
             ui.label("seed");
@@ -622,6 +502,16 @@ impl App {
             ui.end_row();
         });
 
+        self.eval_every = self.eval_every.min(self.form.epochs);
+        ui.horizontal(|ui| {
+            ui.label("validation каждые");
+            ui.add(egui::DragValue::new(&mut self.eval_every).range(0..=self.form.epochs));
+            ui.label(if self.eval_every == 0 {
+                "эпох (0 — не измерять по ходу)"
+            } else {
+                "эпох"
+            });
+        });
         ui.checkbox(&mut self.form.warmup_cosine, "scheduler: warmup-cosine");
         if self.form.warmup_cosine {
             ui.horizontal(|ui| {
@@ -641,13 +531,24 @@ impl App {
         }
 
         ui.separator();
+        let kfold = self
+            .dataset
+            .as_ref()
+            .is_some_and(|dataset| matches!(dataset.split, crate::split::SplitPlan::KFold { .. }));
+        if kfold {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 0),
+                "Одна development-модель не может представлять K-fold-оценку. Используйте «Авто» \
+                 или «Свою сетку», затем обучите выбранную конфигурацию финально.",
+            );
+        }
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!self.busy(), egui::Button::new("Обучить"))
+                .add_enabled(!self.busy() && !kfold, egui::Button::new("Обучить"))
                 .clicked()
             {
                 match (self.form.build(), self.active_data()) {
-                    (Ok((nc, tcfg)), Some((data, split))) => {
+                    (Ok((nc, tcfg)), Ok((data, split))) => {
                         self.train_parameter_count = None;
                         self.worker.reset_cancel();
                         self.worker.send(Command::TrainNumeric {
@@ -655,12 +556,12 @@ impl App {
                             split,
                             nc,
                             tcfg,
+                            eval: self.eval_schedule(),
                             // Ручной запуск — фаза разработки: test не трогаем.
                             final_phase: false,
                         });
                     }
-                    (Ok(_), None) => self.status = NO_DATASET.to_string(),
-                    (Err(e), _) => self.status = format!("Ошибка: {e}"),
+                    (Err(e), _) | (_, Err(e)) => self.status = format!("Ошибка: {e}"),
                 }
             }
             if ui
@@ -700,7 +601,7 @@ impl App {
             }
         });
         ui.label(format!("{}: {}", budget.label(), budget.hint()));
-        self.ui_search_common(ui, self.optimize_form.axes(budget));
+        self.ui_search_common(ui, self.search_form.axes(budget));
     }
 
     /// Своя сетка: форма редактируется свободно, оси собираются перед запуском.
@@ -740,7 +641,7 @@ impl App {
                 ui.end_row();
             });
         let axes = self
-            .optimize_form
+            .search_form
             .model_kinds()
             .and_then(|kinds| self.custom_form.build(kinds));
         self.ui_search_common(ui, axes);
@@ -748,22 +649,22 @@ impl App {
 
     /// Общая часть обоих режимов поиска: архитектуры, цель, цена и запуск.
     fn ui_search_common(&mut self, ui: &mut egui::Ui, axes: Result<SweepAxes, String>) {
-        let objective_before = self.optimize_form.objective;
+        let objective_before = self.search_form.objective;
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.optimize_form.include_transformer, "transformer");
-            ui.checkbox(&mut self.optimize_form.include_mlp, "mlp");
-            ui.checkbox(&mut self.optimize_form.include_kan, "kan");
+            ui.checkbox(&mut self.search_form.include_transformer, "transformer");
+            ui.checkbox(&mut self.search_form.include_mlp, "mlp");
+            ui.checkbox(&mut self.search_form.include_kan, "kan");
             ui.label("цель:");
             egui::ComboBox::from_id_salt("search_objective")
-                .selected_text(objective_label(self.optimize_form.objective()))
+                .selected_text(objective_label(self.search_form.objective()))
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.optimize_form.objective, 0, "worst-output R²");
-                    ui.selectable_value(&mut self.optimize_form.objective, 1, "aggregate R²");
-                    ui.selectable_value(&mut self.optimize_form.objective, 2, "mean-output R²");
-                    ui.selectable_value(&mut self.optimize_form.objective, 3, "aggregate nRMSE");
+                    ui.selectable_value(&mut self.search_form.objective, 0, "worst-output R²");
+                    ui.selectable_value(&mut self.search_form.objective, 1, "aggregate R²");
+                    ui.selectable_value(&mut self.search_form.objective, 2, "mean-output R²");
+                    ui.selectable_value(&mut self.search_form.objective, 3, "aggregate nRMSE");
                 });
         });
-        if self.optimize_form.objective != objective_before {
+        if self.search_form.objective != objective_before {
             self.sort_search_rows();
             self.search_selected = None;
         }
@@ -793,7 +694,7 @@ impl App {
                 .clicked()
             {
                 match (axes, self.active_data()) {
-                    (Ok(axes), Some((data, split))) => {
+                    (Ok(axes), Ok((data, split))) => {
                         self.worker.reset_cancel();
                         // Отпечаток фиксируется в момент отправки команды, а не
                         // когда worker успеет ответить SearchStarted.
@@ -807,11 +708,10 @@ impl App {
                             data,
                             split,
                             axes,
-                            objective: self.optimize_form.objective(),
+                            objective: self.search_form.objective(),
                         });
                     }
-                    (Ok(_), None) => self.status = NO_DATASET.to_string(),
-                    (Err(e), _) => self.status = format!("Ошибка: {e}"),
+                    (Err(e), _) | (_, Err(e)) => self.status = format!("Ошибка: {e}"),
                 }
             }
             if ui
@@ -854,10 +754,10 @@ impl App {
         let source = epoch_sweep::source_label(self.search_rows[0].source);
         ui.label(format!(
             "Ранжирование: {}; метрики {source}",
-            objective_label(self.optimize_form.objective())
+            objective_label(self.search_form.objective())
         ));
 
-        let objective = self.optimize_form.objective();
+        let objective = self.search_form.objective();
         let mut selected = self.search_selected;
         egui::ScrollArea::vertical()
             .max_height(300.0)
@@ -937,17 +837,6 @@ impl App {
                     self.mode = TrainingMode::Single;
                 }
             }
-            if ui
-                .add_enabled(
-                    chosen.is_some() && !self.busy(),
-                    egui::Button::new("Подобрать эпохи"),
-                )
-                .clicked()
-            {
-                if let Some(choice) = &chosen {
-                    self.apply_choice_to_epoch_sweep(choice);
-                }
-            }
         });
     }
 
@@ -957,9 +846,12 @@ impl App {
     /// `final_init_seed`: выбирать seed по результату поиска значит подбирать
     /// его по тем же данным.
     fn train_final_from_choice(&mut self, choice: &SweepChoice) {
-        let Some((data, split)) = self.active_data() else {
-            self.status = NO_DATASET.to_string();
-            return;
+        let (data, split) = match self.active_data() {
+            Ok(active) => active,
+            Err(error) => {
+                self.status = format!("Ошибка: {error}");
+                return;
+            }
         };
         let nc = NumericConfig {
             kind: choice.kind,
@@ -996,6 +888,9 @@ impl App {
             split,
             nc,
             tcfg,
+            // Refit учится на train+validation, поэтому validation-кривой у
+            // него быть не может. Число эпох уже выбрано поиском.
+            eval: EvalSchedule::Never,
             final_phase: true,
         });
     }
@@ -1017,6 +912,17 @@ impl App {
                     pui.line(Line::new(final_refit).name("final train+validation loss"));
                 }
             });
+        }
+        if !self.val_curve.is_empty() {
+            // Кривая по эпохам — то, ради чего раньше был отдельный сценарий.
+            let points = PlotPoints::from(self.val_curve.clone());
+            let recommendation = self.recommended_epochs();
+            Plot::new("val_plot")
+                .height(200.0)
+                .show(ui, |pui| pui.line(Line::new(points).name("validation R²")));
+            if let Some((epochs, why)) = recommendation {
+                ui.label(format!("Рекомендованная остановка: {epochs} эпох ({why})"));
+            }
         }
         if let Some(m) = &self.metrics {
             ui.separator();
@@ -1051,263 +957,6 @@ impl App {
             ui.colored_label(egui::Color32::from_rgb(200, 120, 0), warning);
         }
     }
-
-    pub(super) fn ui_epoch_sweep(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Epoch-sweep");
-        self.ui_dataset_bar(ui);
-        ui.horizontal(|ui| {
-            ui.label("Модель:");
-            ui.selectable_value(
-                &mut self.epoch_form.kind,
-                ModelKind::Transformer,
-                "transformer",
-            );
-            ui.selectable_value(&mut self.epoch_form.kind, ModelKind::Mlp, "mlp");
-            ui.selectable_value(&mut self.epoch_form.kind, ModelKind::Kan, "kan");
-        });
-        egui::Grid::new("epoch_cfg")
-            .num_columns(2)
-            .spacing([12.0, 6.0])
-            .show(ui, |ui| {
-                match self.epoch_form.kind {
-                    ModelKind::Mlp => {
-                        ui.label("mlp width");
-                        ui.add(
-                            egui::DragValue::new(&mut self.epoch_form.mlp_width).range(1..=2048),
-                        );
-                        ui.end_row();
-                        ui.label("mlp layers");
-                        ui.add(egui::DragValue::new(&mut self.epoch_form.mlp_layers).range(1..=12));
-                        ui.end_row();
-                    }
-                    ModelKind::Kan => {
-                        ui.label("kan width");
-                        ui.add(
-                            egui::DragValue::new(&mut self.epoch_form.kan_width).range(1..=2048),
-                        );
-                        ui.end_row();
-                        ui.label("kan layers");
-                        ui.add(egui::DragValue::new(&mut self.epoch_form.kan_layers).range(1..=12));
-                        ui.end_row();
-                        ui.label("kan grid");
-                        ui.add(egui::DragValue::new(&mut self.epoch_form.kan_grid).range(2..=128));
-                        ui.end_row();
-                    }
-                    ModelKind::Transformer => {
-                        ui.label("d_model");
-                        ui.add(egui::DragValue::new(&mut self.epoch_form.d_model).range(1..=1024));
-                        ui.end_row();
-                        ui.label("heads");
-                        ui.add(egui::DragValue::new(&mut self.epoch_form.heads).range(1..=32));
-                        ui.end_row();
-                        ui.label("layers");
-                        ui.add(egui::DragValue::new(&mut self.epoch_form.layers).range(1..=12));
-                        ui.end_row();
-                        ui.label("d_ff");
-                        ui.add(egui::DragValue::new(&mut self.epoch_form.d_ff).range(1..=4096));
-                        ui.end_row();
-                        ui.label("value-encoder");
-                        egui::ComboBox::from_id_salt("epoch_venc")
-                            .selected_text(["linear", "mlp", "fourier"][self.epoch_form.venc])
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.epoch_form.venc, 0, "linear");
-                                ui.selectable_value(&mut self.epoch_form.venc, 1, "mlp");
-                                ui.selectable_value(&mut self.epoch_form.venc, 2, "fourier");
-                            });
-                        ui.end_row();
-                        if self.epoch_form.venc == 2 {
-                            ui.label("fourier bands");
-                            ui.add(
-                                egui::DragValue::new(&mut self.epoch_form.fourier_bands)
-                                    .range(1..=64),
-                            );
-                            ui.end_row();
-                            ui.label("fourier scale");
-                            ui.add(
-                                egui::DragValue::new(&mut self.epoch_form.fourier_scale)
-                                    .range(0.1..=128.0)
-                                    .speed(0.1),
-                            );
-                            ui.end_row();
-                        }
-                    }
-                }
-                ui.label("epochs");
-                ui.text_edit_singleline(&mut self.epoch_form.epochs);
-                ui.end_row();
-                ui.label("lr");
-                ui.add(
-                    egui::DragValue::new(&mut self.epoch_form.lr)
-                        .range(1e-6..=1.0)
-                        .speed(1e-4),
-                );
-                ui.end_row();
-                ui.label("batch");
-                ui.add(egui::DragValue::new(&mut self.epoch_form.batch).range(1..=8192));
-                ui.end_row();
-                ui.label("seed");
-                ui.add(egui::DragValue::new(&mut self.epoch_form.seed));
-                ui.end_row();
-                ui.label("target-r2");
-                ui.add(
-                    egui::DragValue::new(&mut self.epoch_form.target_r2)
-                        .range(-10.0..=1.0)
-                        .speed(0.01),
-                );
-                ui.end_row();
-                ui.label("min-r2-gain");
-                ui.add(
-                    egui::DragValue::new(&mut self.epoch_form.min_gain)
-                        .range(0.0..=1.0)
-                        .speed(0.01),
-                );
-                ui.end_row();
-                ui.label("plateau-min-r2");
-                ui.add(
-                    egui::DragValue::new(&mut self.epoch_form.plateau_min)
-                        .range(-10.0..=1.0)
-                        .speed(0.01),
-                );
-                ui.end_row();
-            });
-        ui.checkbox(
-            &mut self.epoch_form.warmup_cosine,
-            "scheduler: warmup-cosine",
-        );
-        if self.epoch_form.warmup_cosine {
-            ui.horizontal(|ui| {
-                ui.label("warmup");
-                ui.add(
-                    egui::DragValue::new(&mut self.epoch_form.warmup)
-                        .range(0.0..=0.99)
-                        .speed(0.01),
-                );
-                ui.label("min-lr-ratio");
-                ui.add(
-                    egui::DragValue::new(&mut self.epoch_form.min_lr_ratio)
-                        .range(0.0..=1.0)
-                        .speed(0.01),
-                );
-            });
-        }
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!self.busy(), egui::Button::new("Run"))
-                .clicked()
-            {
-                match (self.epoch_form.build(), self.active_data()) {
-                    (Ok(req), Some((data, split))) => {
-                        self.worker.reset_cancel();
-                        self.worker.send(Command::EpochSweep {
-                            data,
-                            split,
-                            nc: req.nc,
-                            base_tcfg: req.base_tcfg,
-                            milestones: req.milestones,
-                            target_r2: req.target_r2,
-                            min_gain: req.min_gain,
-                            plateau_min: req.plateau_min,
-                        });
-                    }
-                    (Ok(_), None) => self.status = NO_DATASET.to_string(),
-                    (Err(e), _) => self.status = format!("Ошибка: {e}"),
-                }
-            }
-            if ui
-                .add_enabled(self.epoch_sweeping, egui::Button::new("Cancel"))
-                .clicked()
-            {
-                self.worker.request_cancel();
-                self.status = "отмена epoch-sweep…".to_string();
-            }
-            if ui
-                .add_enabled(!self.epoch_rows.is_empty(), egui::Button::new("Save CSV"))
-                .clicked()
-            {
-                if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("csv", &["csv"])
-                    .save_file()
-                {
-                    match std::fs::write(&p, epoch_sweep::rows_to_csv(&self.epoch_rows)) {
-                        Ok(()) => self.status = format!("CSV: {}", p.display()),
-                        Err(e) => self.status = format!("Ошибка: запись CSV: {e}"),
-                    }
-                }
-            }
-            let recommended = self.epoch_recommendation.as_ref().map(|(e, _)| *e);
-            if ui
-                .add_enabled(
-                    recommended.is_some() && !self.epoch_sweeping,
-                    egui::Button::new("Apply recommended to Train"),
-                )
-                .on_hover_text("Перенести конфиг и рекомендованное число эпох в Train")
-                .clicked()
-            {
-                if let Some(epochs) = recommended {
-                    self.apply_epoch_form_to_train(epochs);
-                }
-            }
-        });
-        if let Some(total) = self.epoch_total {
-            ui.label(format!("точек: {total}; готово: {}", self.epoch_rows.len()));
-        }
-        if let Some((epoch, why)) = &self.epoch_recommendation {
-            ui.label(format!("Рекомендованная остановка: {epoch} эпох ({why})"));
-        }
-        if self.epoch_cancelled {
-            ui.colored_label(
-                egui::Color32::from_rgb(200, 120, 0),
-                "Epoch-sweep отменён; показаны завершённые точки.",
-            );
-        }
-        if !self.epoch_rows.is_empty() {
-            let r2_points = PlotPoints::from(
-                self.epoch_rows
-                    .iter()
-                    .map(|r| [r.epochs as f64, r.r2 as f64])
-                    .collect::<Vec<_>>(),
-            );
-            let loss_points = PlotPoints::from(
-                self.epoch_rows
-                    .iter()
-                    .map(|r| [r.epochs as f64, r.train_loss as f64])
-                    .collect::<Vec<_>>(),
-            );
-            Plot::new("epoch_sweep_plot")
-                .height(260.0)
-                .include_y(0.0)
-                .include_y(1.0)
-                .show(ui, |pui| {
-                    pui.line(Line::new(r2_points).name("R²"));
-                    pui.line(Line::new(loss_points).name("train loss"));
-                });
-            egui::ScrollArea::vertical()
-                .max_height(260.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("epoch_rows")
-                        .num_columns(6)
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.label("epochs");
-                            ui.label("loss");
-                            ui.label("RMSE");
-                            ui.label("MAE");
-                            ui.label("rel");
-                            ui.label("R²");
-                            ui.end_row();
-                            for row in &self.epoch_rows {
-                                ui.label(format!("{}", row.epochs));
-                                ui.label(format!("{:.5}", row.train_loss));
-                                ui.label(format!("{:.5}", row.rmse));
-                                ui.label(format!("{:.5}", row.mae));
-                                ui.label(format!("{:.1}%", row.rel_error * 100.0));
-                                ui.label(format!("{:.5}", row.r2));
-                                ui.end_row();
-                            }
-                        });
-                });
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1331,22 +980,5 @@ mod tests {
         assert_eq!(config.kan.width, 16);
         assert_eq!(config.kan.layers, 2);
         assert_eq!(config.kan.grid, 8);
-    }
-
-    #[test]
-    fn epoch_sweep_form_builds_kan_config() {
-        let form = EpochSweepForm {
-            kind: ModelKind::Kan,
-            kan_width: 16,
-            kan_layers: 2,
-            kan_grid: 8,
-            ..Default::default()
-        };
-
-        let request = form.build().unwrap();
-        assert_eq!(request.nc.kind, ModelKind::Kan);
-        assert_eq!(request.nc.kan.width, 16);
-        assert_eq!(request.nc.kan.layers, 2);
-        assert_eq!(request.nc.kan.grid, 8);
     }
 }

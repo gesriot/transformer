@@ -63,6 +63,41 @@ pub enum EvalSchedule {
     At(Vec<usize>),
 }
 
+/// Рекомендованная точка остановки по последовательности замеров
+/// `(эпоха, R²(validation))`: сначала достижение цели, затем плато, иначе
+/// последний доступный замер.
+///
+/// Функция принимает только те данные, от которых действительно зависит
+/// решение. Поэтому GUI не приходится конструировать фиктивные строки отчёта
+/// с нулевыми RMSE/MAE, а CLI-адаптер может передать свою таблицу как пары.
+pub fn recommended_epoch(
+    points: impl IntoIterator<Item = (usize, f32)>,
+    target_r2: f32,
+    min_gain: f32,
+    plateau_min: f32,
+) -> Option<(usize, String)> {
+    let points: Vec<(usize, f32)> = points.into_iter().collect();
+    if points.is_empty() {
+        return None;
+    }
+    for &(epoch, r2) in &points {
+        if r2 >= target_r2 {
+            return Some((epoch, format!("target R²≥{target_r2}")));
+        }
+    }
+    for pair in points.windows(2) {
+        let (prev_epoch, prev_r2) = pair[0];
+        let (_, current_r2) = pair[1];
+        if prev_r2 >= plateau_min && current_r2 - prev_r2 < min_gain {
+            return Some((prev_epoch, format!("плато ΔR²<{min_gain}")));
+        }
+    }
+    Some((
+        points.last().expect("проверено выше").0,
+        "лучшее из имеющегося".to_string(),
+    ))
+}
+
 impl EvalSchedule {
     fn wants(&self, epoch: usize) -> bool {
         match self {
@@ -915,6 +950,14 @@ mod tests {
             label: label.to_string(),
             setup: setup(epochs),
         }
+    }
+
+    #[test]
+    fn recommendation_depends_only_on_validation_curve() {
+        let points = [(1, 0.50), (5, 0.82), (10, 0.83), (20, 0.96)];
+        let (epoch, reason) = recommended_epoch(points, 0.99, 0.02, 0.80).unwrap();
+        assert_eq!(epoch, 5);
+        assert!(reason.contains("плато"), "{reason}");
     }
 
     #[test]

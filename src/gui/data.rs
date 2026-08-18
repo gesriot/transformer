@@ -5,7 +5,11 @@ use super::messages::{DatasetOrigin, PreparedData};
 use super::session::{ActiveDataset, App};
 use crate::data::NumericDataset;
 use crate::markup::{analyze_roles, DraftType, RoleReport, SchemaDraft, Severity, TableProfile};
-use crate::schema::{ColumnRole, ModelSchema};
+use crate::schema::{Column, ColumnRole, ColumnType, ModelSchema};
+use crate::split::{
+    SplitPlan, DEFAULT_K, DEFAULT_SPLIT_SEED, DEFAULT_TEST_FRAC, DEFAULT_TRAIN_FRAC,
+    DEFAULT_VAL_FRAC,
+};
 use crate::table::Table;
 use crate::tnum::{infer_prepare_spec_from_path, parse_categorical, Delimiter, PrepareSpec};
 use eframe::egui;
@@ -204,7 +208,7 @@ impl App {
             return;
         };
         let mut open = true;
-        let mut applied: Option<(PreparedTable, TableProfile)> = None;
+        let mut applied: Option<(PreparedTable, TableProfile, Vec<crate::markup::Message>)> = None;
         let mut reopen: Option<(String, bool)> = None;
 
         egui::Window::new("Разметка таблицы")
@@ -365,26 +369,35 @@ impl App {
                     match state.apply() {
                         // Датасет ставим после закрытия окна: внутри замыкания
                         // `self` уже занят состоянием диалога.
-                        Ok(prepared) => applied = Some((prepared, state.profile.clone())),
+                        Ok(prepared) => {
+                            applied = Some((
+                                prepared,
+                                state.profile.clone(),
+                                state.report.messages(&state.draft),
+                            ))
+                        }
                         Err(e) => state.apply_error = Some(e),
                     }
                 }
             });
 
-        if let Some((prepared, profile)) = applied {
+        if let Some((prepared, profile, role_messages)) = applied {
             // Датасет ставим после закрытия окна: внутри замыкания `self` уже
             // занят состоянием диалога.
             let revision = self.next_revision();
-            self.set_dataset(ActiveDataset::new(
-                PreparedData {
-                    origin: DatasetOrigin::Table(prepared.path.clone()),
-                    data: Arc::clone(&prepared.data),
-                    schema: prepared.schema.clone(),
-                },
-                Some(profile),
-                prepared.has_header,
-                revision,
-            ));
+            self.set_dataset(
+                ActiveDataset::new(
+                    PreparedData {
+                        origin: DatasetOrigin::Table(prepared.path.clone()),
+                        data: Arc::clone(&prepared.data),
+                        schema: prepared.schema.clone(),
+                    },
+                    Some(profile),
+                    prepared.has_header,
+                    revision,
+                )
+                .with_role_messages(role_messages),
+            );
             self.status = "разметка применена".to_string();
             self.markup = None;
         } else if let Some((path, has_header)) = reopen {
@@ -397,8 +410,198 @@ impl App {
         }
     }
 
-    pub(super) fn ui_prepare(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Prepare");
+    /// Раздел «Данные»: что открыто, разметка и конвертация таблиц в `.tnum`.
+    pub(super) fn ui_data(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Данные");
+        self.ui_dataset_bar(ui);
+        self.ui_split_plan(ui);
+        self.ui_dataset_preview(ui);
+        if let Some(active) = &self.dataset {
+            let mut messages = active
+                .profile
+                .as_ref()
+                .map_or_else(Vec::new, TableProfile::messages);
+            messages.extend(active.role_messages.iter().cloned());
+            if !messages.is_empty() {
+                ui.separator();
+                ui.label("Замечания к таблице:");
+                for message in messages {
+                    match message.severity {
+                        Severity::Blocking => ui.colored_label(
+                            egui::Color32::from_rgb(200, 60, 60),
+                            format!("✖ {}", message.text),
+                        ),
+                        Severity::Warning => ui.colored_label(
+                            egui::Color32::from_rgb(200, 120, 0),
+                            format!("⚠ {}", message.text),
+                        ),
+                        Severity::Note => ui.label(format!("• {}", message.text)),
+                    };
+                }
+            }
+        }
+        ui.separator();
+        self.ui_prepare(ui);
+    }
+
+    /// Небольшой предпросмотр уже подтверждённого численного представления.
+    /// Категории возвращаются к подписям, чтобы пользователь не сверялся с
+    /// внутренними кодами.
+    fn ui_dataset_preview(&self, ui: &mut egui::Ui) {
+        let Some(active) = &self.dataset else {
+            return;
+        };
+        let schema = &active.prepared.schema;
+        let data = &active.prepared.data;
+        ui.separator();
+        ui.heading("Предпросмотр");
+        ui.label(format!(
+            "Первые {} из {} строк после разметки",
+            data.len().min(20),
+            data.len()
+        ));
+        egui::ScrollArea::both().max_height(300.0).show(ui, |ui| {
+            egui::Grid::new("dataset_preview")
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("#");
+                    for column in schema.inputs() {
+                        ui.label(format!("вход · {}", column.display_name()));
+                    }
+                    for column in schema.outputs() {
+                        ui.label(format!("выход · {}", column.display_name()));
+                    }
+                    ui.end_row();
+
+                    for row in 0..data.len().min(20) {
+                        ui.label((row + 1).to_string());
+                        for (column, value) in schema.inputs().iter().zip(data.inputs.row(row)) {
+                            ui.label(format_dataset_value(column, *value));
+                        }
+                        for (column, value) in schema.outputs().iter().zip(data.outputs.row(row)) {
+                            ui.label(format_dataset_value(column, *value));
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+
+    /// Стратегия оценки относится к данным, а не к отдельному запуску.
+    fn ui_split_plan(&mut self, ui: &mut egui::Ui) {
+        let Some(active) = &mut self.dataset else {
+            return;
+        };
+        ui.separator();
+        ui.heading("Разбиение");
+
+        let before = active.split;
+        let mut plan = before;
+        ui.horizontal(|ui| {
+            let holdout = matches!(plan, SplitPlan::Holdout { .. });
+            if ui.selectable_label(holdout, "Holdout").clicked() && !holdout {
+                plan = SplitPlan::default();
+            }
+            let kfold = matches!(plan, SplitPlan::KFold { .. });
+            if ui.selectable_label(kfold, "K-fold").clicked() && !kfold {
+                plan = SplitPlan::kfold_default();
+            }
+        });
+
+        match &mut plan {
+            SplitPlan::Holdout {
+                train_frac,
+                val_frac,
+                split_seed,
+            } => {
+                egui::Grid::new("holdout_split")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.label("train");
+                        ui.add(
+                            egui::DragValue::new(train_frac)
+                                .range(0.01..=0.98)
+                                .speed(0.01),
+                        );
+                        ui.end_row();
+                        ui.label("validation");
+                        ui.add(
+                            egui::DragValue::new(val_frac)
+                                .range(0.01..=0.98)
+                                .speed(0.01),
+                        );
+                        ui.end_row();
+                        ui.label("test (вычисляется)");
+                        ui.label(format!("{:.3}", 1.0 - *train_frac - *val_frac));
+                        ui.end_row();
+                        ui.label("seed разбиения");
+                        ui.add(egui::DragValue::new(split_seed));
+                        ui.end_row();
+                    });
+            }
+            SplitPlan::KFold {
+                k,
+                folds_seed,
+                test_frac,
+                test_seed,
+            } => {
+                egui::Grid::new("kfold_split")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.label("число folds");
+                        ui.add(egui::DragValue::new(k).range(2..=100));
+                        ui.end_row();
+                        ui.label("test");
+                        ui.add(
+                            egui::DragValue::new(test_frac)
+                                .range(0.01..=0.98)
+                                .speed(0.01),
+                        );
+                        ui.end_row();
+                        ui.label("seed folds");
+                        ui.add(egui::DragValue::new(folds_seed));
+                        ui.end_row();
+                        ui.label("seed test");
+                        ui.add(egui::DragValue::new(test_seed));
+                        ui.end_row();
+                    });
+            }
+        }
+
+        if ui.button("Вернуть значения по умолчанию").clicked() {
+            plan = match plan {
+                SplitPlan::Holdout { .. } => SplitPlan::Holdout {
+                    train_frac: DEFAULT_TRAIN_FRAC,
+                    val_frac: DEFAULT_VAL_FRAC,
+                    split_seed: DEFAULT_SPLIT_SEED,
+                },
+                SplitPlan::KFold { .. } => SplitPlan::KFold {
+                    k: DEFAULT_K,
+                    folds_seed: DEFAULT_SPLIT_SEED,
+                    test_frac: DEFAULT_TEST_FRAC,
+                    test_seed: DEFAULT_SPLIT_SEED,
+                },
+            };
+        }
+
+        let validation = plan.validate(active.prepared.data.len());
+        active.split = plan;
+        if let Err(error) = validation {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 60, 60),
+                format!("Разбиение невозможно: {error}"),
+            );
+        } else {
+            ui.label(format!("Итог: {}", active.split_summary()));
+        }
+        if active.split != before {
+            self.search_selected = None;
+            self.status = "план разбиения изменён; прежний поиск устарел".to_string();
+        }
+    }
+
+    fn ui_prepare(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Конвертация в .tnum");
         ui.horizontal(|ui| {
             if ui.button("Вход…").clicked() {
                 if let Some(p) = rfd::FileDialog::new()
@@ -437,10 +640,10 @@ impl App {
             .num_columns(2)
             .spacing([12.0, 6.0])
             .show(ui, |ui| {
-                ui.label("inputs");
+                ui.label("входов");
                 ui.add(egui::DragValue::new(&mut self.prepare_form.inputs).range(1..=256));
                 ui.end_row();
-                ui.label("outputs");
+                ui.label("выходов");
                 ui.add(egui::DragValue::new(&mut self.prepare_form.outputs).range(1..=256));
                 ui.end_row();
                 ui.label("delimiter");
@@ -472,6 +675,19 @@ impl App {
                 }
                 Err(e) => self.status = format!("Ошибка: {e}"),
             }
+        }
+    }
+}
+
+fn format_dataset_value(column: &Column, value: f32) -> String {
+    match column.ty() {
+        ColumnType::Numeric => format!("{value:.6}"),
+        ColumnType::Categorical { .. } => {
+            let code = value.round().max(0.0) as usize;
+            column
+                .category_level(code)
+                .map(str::to_string)
+                .unwrap_or_else(|_| format!("код {value}"))
         }
     }
 }
@@ -534,6 +750,38 @@ mod tests {
                                                               // Разбиение — свойство набора данных.
         assert_eq!(active.split, SplitPlan::default());
         assert!(active.summary().contains("2 строк"));
+        assert!(active.summary().contains("holdout"));
+    }
+
+    #[test]
+    fn confirmed_role_report_stays_with_active_dataset() {
+        let mut text = String::from("x0,x1,x2,y\n");
+        for i in 0..30 {
+            let x0 = 2.0 + i as f64;
+            let x1 = 5.0 + (i % 4) as f64;
+            text.push_str(&format!("{x0},{x1},{},{}\n", 100.0 - x0 - x1, i));
+        }
+        let state = markup(&text, Some(3));
+        let role_messages = state.report.messages(&state.draft);
+        assert!(role_messages.iter().any(|m| m.text.contains("связаны")));
+        let prepared = state.apply().unwrap();
+        let active = ActiveDataset::new(
+            PreparedData {
+                origin: DatasetOrigin::Table(prepared.path.clone()),
+                data: Arc::clone(&prepared.data),
+                schema: prepared.schema.clone(),
+            },
+            Some(state.profile.clone()),
+            prepared.has_header,
+            1,
+        )
+        .with_role_messages(role_messages);
+
+        assert!(active
+            .role_messages
+            .iter()
+            .any(|message| message.text.contains("связаны")));
+        assert!(active.data_notes() > active.profile.unwrap().messages().len());
     }
 
     #[test]

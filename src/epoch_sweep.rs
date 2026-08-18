@@ -13,7 +13,7 @@ use crate::metrics::EvalSource;
 use crate::numeric_model::NumericConfig;
 use crate::split::SearchPool;
 use crate::train::TrainConfig;
-use crate::training::{train_candidate, Dataset, EvalSchedule, TrainingSetup};
+use crate::training::{recommended_epoch, train_candidate, Dataset, EvalSchedule, TrainingSetup};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -141,24 +141,12 @@ pub fn recommended_stop(
     min_gain: f32,
     plateau_min: f32,
 ) -> Option<(usize, String)> {
-    if rows.is_empty() {
-        return None;
-    }
-    for row in rows {
-        if row.r2 >= target_r2 {
-            return Some((row.epochs, format!("target R²≥{target_r2}")));
-        }
-    }
-    for w in rows.windows(2) {
-        let (prev, cur) = (&w[0], &w[1]);
-        if prev.r2 >= plateau_min && cur.r2 - prev.r2 < min_gain {
-            return Some((prev.epochs, format!("плато ΔR²<{min_gain}")));
-        }
-    }
-    Some((
-        rows.last().unwrap().epochs,
-        "лучшее из имеющегося".to_string(),
-    ))
+    recommended_epoch(
+        rows.iter().map(|row| (row.epochs, row.r2)),
+        target_r2,
+        min_gain,
+        plateau_min,
+    )
 }
 
 /// CSV с колонкой происхождения: без неё через месяц не отличить кривую по

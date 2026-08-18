@@ -3,7 +3,6 @@
 
 use crate::config::ModelConfig;
 use crate::data::{NumericDataset, OutOfRange};
-use crate::epoch_sweep::EpochRow;
 use crate::markup::TableProfile;
 use crate::metrics::Metrics;
 use crate::numeric_model::{ModelKind, NumericConfig};
@@ -13,6 +12,7 @@ use crate::sweep::{SweepAxes, SweepObjective, SweepRow};
 use crate::table::Table;
 use crate::tnum::PrepareSpec;
 use crate::train::{TextTrainConfig, TrainConfig};
+use crate::training::EvalSchedule;
 use crate::training::Phase;
 use std::sync::Arc;
 
@@ -107,6 +107,13 @@ pub struct KanSymbolicInfo {
     pub weak_edges: Vec<KanWeakEdge>,
 }
 
+/// Происхождение итоговой validation-метрики development-модели.
+#[derive(Clone, Copy)]
+pub struct ValidationOrigin {
+    pub plan: SplitPlan,
+    pub init_seed: u64,
+}
+
 /// Команды UI -> worker.
 pub enum Command {
     /// Открыть набор данных: сгенерировать чёрный ящик или прочитать `.tnum`.
@@ -119,6 +126,9 @@ pub enum Command {
         split: SplitPlan,
         nc: NumericConfig,
         tcfg: TrainConfig,
+        /// Когда снимать метрики на validation по ходу обучения. Кривая по
+        /// эпохам — настройка обычного обучения, а не отдельный сценарий.
+        eval: EvalSchedule,
         /// Переобучить выбранную конфигурацию на train+validation и один раз
         /// открыть test. Запрашивается только для финального обучения.
         final_phase: bool,
@@ -169,16 +179,6 @@ pub enum Command {
         path: String,
         has_header: bool,
     },
-    EpochSweep {
-        data: PreparedData,
-        split: SplitPlan,
-        nc: NumericConfig,
-        base_tcfg: TrainConfig,
-        milestones: Vec<usize>,
-        target_r2: f32,
-        min_gain: f32,
-        plateau_min: f32,
-    },
     Shutdown,
 }
 
@@ -194,11 +194,16 @@ pub enum Event {
         phase: Phase,
         epoch: usize,
         loss: f32,
+        /// R² на validation — только в точках, заданных расписанием.
+        val_r2: Option<f32>,
     },
     /// Завершение обучения. У development есть validation-метрики, у refit —
     /// финальный test; отмена помечается отдельно, чтобы не смешивать случаи.
     TrainDone {
         metrics: Option<Metrics>,
+        /// Поколоночные validation-метрики development-модели.
+        per_output: Option<Vec<Metrics>>,
+        validation_origin: Option<ValidationOrigin>,
         /// Единственный замер на test: есть только у финального обучения.
         final_eval: Option<FinalEval>,
         cancelled: bool,
@@ -226,6 +231,9 @@ pub enum Event {
         source: String,
         parameter_count: usize,
         kan: Option<KanModelInfo>,
+        /// После обучения `TrainDone` уже установил метрики этой модели. При
+        /// загрузке checkpoint-а метрик в файле нет, и старые надо очистить.
+        keep_evaluation: bool,
     },
     PredictResult {
         outputs: Vec<f32>,
@@ -280,16 +288,5 @@ pub enum Event {
         rows: usize,
         n_inputs: usize,
         n_outputs: usize,
-    },
-    EpochSweepStarted {
-        total_points: usize,
-    },
-    EpochSweepRow {
-        row: EpochRow,
-    },
-    EpochSweepDone {
-        rows: Vec<EpochRow>,
-        recommendation: Option<(usize, String)>,
-        cancelled: bool,
     },
 }
