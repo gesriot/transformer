@@ -35,7 +35,7 @@ use crate::train::{
     evaluate_surrogate, predict_dataset, train_text_cb, validate_train, TextTrainConfig,
     TrainConfig,
 };
-use crate::training::{run_training, Dataset, TrainedModel, TrainingSetup};
+use crate::training::{refit, run_training, Dataset, TrainedModel, TrainingSetup};
 use eframe::egui;
 use ndarray::{Array2, Ix2};
 use rand::rngs::StdRng;
@@ -114,10 +114,11 @@ struct DiagData {
     nc: NumericConfig,
     origin: DatasetOrigin,
     in_specs: Vec<FeatureSpec>,
-    train: NumericDataset,
-    /// Validation текущей сессии. Test сюда не попадает: он отложен в
-    /// `HoldoutTest` и в GUI пока не открывается вовсе.
-    val: NumericDataset,
+    train: Arc<NumericDataset>,
+    /// Набор для остаточной диагностики и проверки формул. У development это
+    /// validation, у финальной модели — train+validation: test сюда не попадает.
+    eval: Arc<NumericDataset>,
+    eval_label: &'static str,
 }
 
 struct LoadedText {
@@ -145,9 +146,19 @@ fn worker_loop(
                 split,
                 nc,
                 tcfg,
+                final_phase,
             } => {
                 let origin = data.origin.clone();
-                match train_numeric(&data, split, &nc, &tcfg, &evt_tx, &ctx, &cancel) {
+                match train_numeric(
+                    &data,
+                    split,
+                    &nc,
+                    &tcfg,
+                    final_phase,
+                    &evt_tx,
+                    &ctx,
+                    &cancel,
+                ) {
                     Ok(Some(loaded)) => {
                         let _ = evt_tx.send(Event::ModelReady {
                             schema: loaded.schema.clone(),
@@ -315,21 +326,12 @@ fn worker_loop(
                 }
                 ctx.request_repaint();
             }
-            Command::Sweep { blackbox, axes } => {
-                match run_sweep(&blackbox, &axes, &evt_tx, &ctx, &cancel) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        let _ = evt_tx.send(Event::Error(e));
-                        ctx.request_repaint();
-                    }
-                }
-            }
-            Command::Optimize {
+            Command::Search {
                 data,
                 split,
                 axes,
                 objective,
-            } => match run_optimize(&data, split, &axes, objective, &evt_tx, &ctx, &cancel) {
+            } => match run_search(&data, split, &axes, objective, &evt_tx, &ctx, &cancel) {
                 Ok(()) => {}
                 Err(e) => {
                     let _ = evt_tx.send(Event::Error(e));
@@ -545,19 +547,20 @@ fn extract_kan_symbolic(loaded: &Loaded) -> Result<KanSymbolicInfo, String> {
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    // Метрики формул есть только у модели, обученной в этой сессии, и считаются
-    // на validation: test не открывается.
-    let (formula_metrics, kan_r2) = match &loaded.diag {
+    // Метрики формул есть только у модели, обученной в этой сессии. Test для
+    // этой вспомогательной проверки не открывается.
+    let (formula_metrics, kan_r2, evaluation_label) = match &loaded.diag {
         Some(diag) => (
             Some(evaluate(
-                &symbolic.predict(&diag.val.inputs),
-                &diag.val.outputs,
+                &symbolic.predict(&diag.eval.inputs),
+                &diag.eval.outputs,
             )),
             Some(
-                evaluate_surrogate(&loaded.model, &diag.val, &loaded.in_norm, &loaded.out_norm).r2,
+                evaluate_surrogate(&loaded.model, &diag.eval, &loaded.in_norm, &loaded.out_norm).r2,
             ),
+            Some(diag.eval_label.to_string()),
         ),
-        None => (None, None),
+        None => (None, None, None),
     };
     Ok(KanSymbolicInfo {
         formulas: symbolic.formulas(&loaded.schema)?,
@@ -565,6 +568,7 @@ fn extract_kan_symbolic(loaded: &Loaded) -> Result<KanSymbolicInfo, String> {
         mean_edge_r2,
         formula_metrics,
         kan_r2,
+        evaluation_label,
         weak_edges,
     })
 }
@@ -611,9 +615,9 @@ fn diagnose(l: &Loaded) -> Result<DiagnosticsResult, String> {
     let overfit_loss =
         crate::diagnostics::overfit_probe(&d.nc, &d.in_specs, l.n_outputs, &subset, 80);
 
-    let rr = crate::diagnostics::range_report(&l.in_norm, &d.val.inputs);
-    let pred = predict_dataset(&l.model, &d.val, &l.in_norm, &l.out_norm);
-    let res = crate::diagnostics::residual_diagnostics(&d.val.inputs, &pred, &d.val.outputs);
+    let rr = crate::diagnostics::range_report(&l.in_norm, &d.eval.inputs);
+    let pred = predict_dataset(&l.model, &d.eval, &l.in_norm, &l.out_norm);
+    let res = crate::diagnostics::residual_diagnostics(&d.eval.inputs, &pred, &d.eval.outputs);
     let residuals = res
         .iter()
         .map(|r| (r.sign_change_rate, r.tail_ratio))
@@ -630,6 +634,7 @@ fn diagnose(l: &Loaded) -> Result<DiagnosticsResult, String> {
         overfit_loss,
         extrapolation_rows: rr.rows_out,
         extrapolation_total: rr.total,
+        evaluation_label: d.eval_label.to_string(),
         residuals,
         sensitivity,
     })
@@ -678,33 +683,8 @@ fn do_predict_file(l: &Loaded, input: &str, output: &str) -> Result<(usize, usiz
     Ok((predictions.len(), extrapolation_rows))
 }
 
-fn run_sweep(
-    blackbox: &str,
-    axes: &SweepAxes,
-    evt_tx: &Sender<Event>,
-    ctx: &egui::Context,
-    cancel: &AtomicBool,
-) -> Result<(), String> {
-    let (total_configs, total_runs) = sweep::sweep_size(axes)?;
-    let _ = evt_tx.send(Event::SweepStarted {
-        total_configs,
-        total_runs,
-    });
-    ctx.request_repaint();
-
-    let result = sweep::run_blackbox_sweep(blackbox, axes, cancel, |row| {
-        let _ = evt_tx.send(Event::SweepRow { row: row.clone() });
-        ctx.request_repaint();
-    })?;
-    let _ = evt_tx.send(Event::SweepDone {
-        rows: result.rows,
-        cancelled: result.cancelled,
-    });
-    ctx.request_repaint();
-    Ok(())
-}
-
-fn run_optimize(
+/// Поиск конфигурации на активном наборе данных.
+fn run_search(
     prepared: &PreparedData,
     split: SplitPlan,
     axes: &SweepAxes,
@@ -716,17 +696,17 @@ fn run_optimize(
     let dataset = Dataset::new(clone_data(prepared), prepared.schema.clone())?;
     let splits = split.prepare(dataset.data())?;
     let (total_configs, total_runs) = sweep::sweep_size(axes)?;
-    let _ = evt_tx.send(Event::OptimizeStarted {
+    let _ = evt_tx.send(Event::SearchStarted {
         total_configs,
         total_runs,
     });
     ctx.request_repaint();
 
     let result = sweep::run_sweep(&dataset, &splits.search, axes, objective, cancel, |row| {
-        let _ = evt_tx.send(Event::OptimizeRow { row: row.clone() });
+        let _ = evt_tx.send(Event::SearchRow { row: row.clone() });
         ctx.request_repaint();
     })?;
-    let _ = evt_tx.send(Event::OptimizeDone {
+    let _ = evt_tx.send(Event::SearchDone {
         rows: result.rows,
         cancelled: result.cancelled,
     });
@@ -1010,11 +990,13 @@ fn open_table(
 
 /// Обучение в worker-потоке. Возвращает обученную модель (Rc живёт здесь) или
 /// `None` при отмене.
+#[allow(clippy::too_many_arguments)]
 fn train_numeric(
     prepared: &PreparedData,
     split: SplitPlan,
     nc: &NumericConfig,
     tcfg: &TrainConfig,
+    final_phase: bool,
     evt_tx: &Sender<Event>,
     ctx: &egui::Context,
     cancel: &AtomicBool,
@@ -1039,47 +1021,104 @@ fn train_numeric(
     });
     ctx.request_repaint();
 
-    // Test откладывается и в GUI не открывается: финальная фаза здесь не
-    // запрашивается, поэтому все числа — validation.
     let setup = TrainingSetup::new(nc.clone(), tcfg.clone());
-    let outcome = run_training(
-        &dataset,
-        split,
-        &setup,
-        false,
-        DEFAULT_FINAL_INIT_SEED,
-        cancel,
-        &mut |_, point| {
-            let _ = evt_tx.send(Event::Epoch {
-                epoch: point.epoch,
-                loss: point.train_loss,
+    // Ручной запуск заканчивается development-моделью. После поиска выбор уже
+    // сделан, поэтому финальный запуск сразу делает refit на всём pool — в том
+    // числе при K-fold — и только затем один раз открывает test.
+    let (trained, metrics, final_eval, diag_train, diag_eval, eval_label) = if final_phase {
+        let pool = Arc::new(split.prepare(dataset.data())?.search.all());
+        let outcome = refit(
+            &dataset,
+            split,
+            &setup,
+            DEFAULT_FINAL_INIT_SEED,
+            cancel,
+            &mut |phase, point| {
+                let _ = evt_tx.send(Event::Epoch {
+                    phase,
+                    epoch: point.epoch,
+                    loss: point.train_loss,
+                });
+                ctx.request_repaint();
+            },
+            &mut |_, _| {},
+            &mut |_, _, _, _| {},
+        )?;
+        let Some(trained) = outcome.model else {
+            let _ = evt_tx.send(Event::TrainDone {
+                metrics: None,
+                final_eval: None,
+                cancelled: true,
             });
             ctx.request_repaint();
-        },
-        &mut |_, _| {},
-        &mut |_, _, _, _| {},
-    )?;
-
-    if cancel.load(Ordering::Relaxed) {
-        let _ = evt_tx.send(Event::TrainDone { metrics: None });
-        ctx.request_repaint();
-        return Ok(None);
-    }
-
-    let splits = split.prepare(dataset.data())?;
-    let (train, val) = splits.search.fold(0)?;
+            return Ok(None);
+        };
+        (
+            trained,
+            None,
+            outcome.eval,
+            Arc::clone(&pool),
+            pool,
+            "train+validation",
+        )
+    } else {
+        let outcome = run_training(
+            &dataset,
+            split,
+            &setup,
+            false,
+            DEFAULT_FINAL_INIT_SEED,
+            cancel,
+            &mut |phase, point| {
+                let _ = evt_tx.send(Event::Epoch {
+                    phase,
+                    epoch: point.epoch,
+                    loss: point.train_loss,
+                });
+                ctx.request_repaint();
+            },
+            &mut |_, _| {},
+            &mut |_, _, _, _| {},
+        )?;
+        if cancel.load(Ordering::Relaxed) {
+            let _ = evt_tx.send(Event::TrainDone {
+                metrics: None,
+                final_eval: None,
+                cancelled: true,
+            });
+            ctx.request_repaint();
+            return Ok(None);
+        }
+        let splits = split.prepare(dataset.data())?;
+        let (train, val) = splits.search.fold(0)?;
+        let metrics = evaluate_surrogate(
+            &outcome.development.model,
+            &val,
+            &outcome.development.in_norm,
+            &outcome.development.out_norm,
+        );
+        (
+            outcome.development,
+            Some(metrics),
+            None,
+            Arc::new(train),
+            Arc::new(val),
+            "validation",
+        )
+    };
     let TrainedModel {
         model,
         in_norm,
         out_norm,
         ..
-    } = outcome.development;
-    let metrics = evaluate_surrogate(&model, &val, &in_norm, &out_norm);
+    } = trained;
     let _ = evt_tx.send(Event::TrainDone {
-        metrics: Some(metrics),
+        metrics,
+        final_eval,
+        cancelled: false,
     });
     ctx.request_repaint();
-    let calibration = Some(calibration_sample(&train.inputs, 256));
+    let calibration = Some(calibration_sample(&diag_train.inputs, 256));
     Ok(Some(Loaded {
         model,
         nc: nc.clone(),
@@ -1092,8 +1131,9 @@ fn train_numeric(
             nc: nc.clone(),
             origin: prepared.origin.clone(),
             in_specs,
-            train,
-            val,
+            train: diag_train,
+            eval: diag_eval,
+            eval_label,
         }),
         calibration,
     }))
@@ -1107,6 +1147,69 @@ mod tests {
     use crate::encoders::ValueEncoderConfig;
     use crate::numeric_model::{KanConfig, ModelKind};
     use crate::train::fit_normalizers;
+
+    #[test]
+    fn final_gui_training_keeps_the_refit_model() {
+        let data = blackbox::sum().generate(64, 0);
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let prepared = PreparedData {
+            origin: DatasetOrigin::Blackbox("sum".to_string()),
+            data: Arc::new(data),
+            schema: schema.clone(),
+        };
+        let split = SplitPlan::default();
+        let splits = split.prepare(prepared.data.as_ref()).unwrap();
+        let pool = splits.search.all();
+        let specs = schema.feature_specs();
+        let (expected_in_norm, expected_out_norm) = fit_normalizers(&pool, &specs);
+        let config = NumericConfig {
+            kind: ModelKind::Mlp,
+            transformer: ModelConfig::default(),
+            value: ValueEncoderConfig::default(),
+            mlp_width: 4,
+            mlp_layers: 1,
+            kan: KanConfig::default(),
+        };
+        let train = TrainConfig {
+            epochs: 1,
+            batch_size: 16,
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+
+        let loaded = train_numeric(
+            &prepared,
+            split,
+            &config,
+            &train,
+            true,
+            &tx,
+            &egui::Context::default(),
+            &cancel,
+        )
+        .unwrap()
+        .expect("финальная модель");
+
+        assert_eq!(loaded.in_norm.mean, expected_in_norm.mean);
+        assert_eq!(loaded.out_norm.mean, expected_out_norm.mean);
+        let diag = loaded.diag.expect("данные финальной модели");
+        assert_eq!(diag.eval_label, "train+validation");
+        assert_eq!(diag.train.len(), pool.len());
+        assert!(Arc::ptr_eq(&diag.train, &diag.eval));
+        let final_eval = rx.try_iter().find_map(|event| match event {
+            Event::TrainDone {
+                final_eval,
+                cancelled,
+                ..
+            } => {
+                assert!(!cancelled);
+                final_eval
+            }
+            _ => None,
+        });
+        assert!(final_eval.is_some(), "refit обязан один раз измерить test");
+    }
 
     #[test]
     fn samples_kan_edge_for_gui() {
@@ -1163,8 +1266,9 @@ mod tests {
                 nc: config,
                 origin: DatasetOrigin::Blackbox("sum".to_string()),
                 in_specs,
-                train,
-                val,
+                train: Arc::new(train),
+                eval: Arc::new(val),
+                eval_label: "validation",
             }),
             calibration: None,
         };
@@ -1176,6 +1280,7 @@ mod tests {
             .expect("после обучения validation-метрики есть");
         assert!(metrics.r2.is_finite());
         assert!(result.kan_r2.expect("R² KAN есть").is_finite());
+        assert_eq!(result.evaluation_label.as_deref(), Some("validation"));
         assert!(result.weak_edges.iter().all(|edge| edge.r2 < 0.99));
     }
 

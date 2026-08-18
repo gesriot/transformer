@@ -10,16 +10,17 @@ use super::messages::{
     Command, DatasetOrigin, DiagnosticsResult, Event, KanModelInfo, KanSymbolicInfo, PreparedData,
 };
 use super::model::ModelInfo;
-use super::train::{EpochSweepForm, OptimizeForm, SweepForm, TrainForm};
+use super::train::{CustomSearchForm, EpochSweepForm, OptimizeForm, TrainForm, TrainingMode};
 use super::worker::Worker;
 use crate::data::OutOfRange;
 use crate::encoders::ValueEncoderKind;
 use crate::epoch_sweep::EpochRow;
 use crate::markup::TableProfile;
 use crate::metrics::Metrics;
-use crate::split::SplitPlan;
-use crate::sweep::{self, SweepChoice, SweepObjective, SweepRow};
+use crate::split::{FinalEval, SplitPlan};
+use crate::sweep::{self, SweepChoice, SweepRow};
 use crate::train::LrSchedule;
+use crate::training::Phase;
 use eframe::egui;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -29,8 +30,6 @@ pub(super) enum Tab {
     KanCurves,
     KanFormulas,
     Diagnose,
-    Optimize,
-    Sweep,
     Text,
     Prepare,
     EpochSweep,
@@ -55,6 +54,8 @@ pub(super) struct ActiveDataset {
     pub(super) split: SplitPlan,
     /// Как читалась таблица: «Разметить заново» должно открыть её так же.
     pub(super) table_has_header: bool,
+    /// Номер набора в сессии: по нему видно, что данные сменились.
+    pub(super) revision: u64,
 }
 
 impl ActiveDataset {
@@ -62,12 +63,14 @@ impl ActiveDataset {
         prepared: PreparedData,
         profile: Option<TableProfile>,
         table_has_header: bool,
+        revision: u64,
     ) -> Self {
         Self {
             prepared,
             profile,
             split: SplitPlan::default(),
             table_has_header,
+            revision,
         }
     }
 
@@ -99,9 +102,13 @@ pub struct App {
     pub(super) dataset: Option<ActiveDataset>,
     /// Идёт чтение набора данных: запускать что-либо на старых данных нельзя.
     pub(super) dataset_opening: bool,
+    pub(super) dataset_revision: u64,
     pub(super) training: bool,
-    pub(super) sweeping: bool,
+    pub(super) searching: bool,
+    /// Loss development-фазы и финального refit хранятся отдельно: обе фазы
+    /// начинают нумерацию эпох с единицы.
     pub(super) loss_curve: Vec<[f64; 2]>,
+    pub(super) final_loss_curve: Vec<[f64; 2]>,
     pub(super) metrics: Option<Metrics>,
     pub(super) train_parameter_count: Option<usize>,
     // Predict (UI-M5)
@@ -126,17 +133,22 @@ pub struct App {
     pub(super) kan_symbolic_pending: bool,
     // Diagnose (UI-M6)
     pub(super) diagnostics: Option<DiagnosticsResult>,
-    // Optimize (file-based sweep)
+    // Общие настройки и результаты поиска
     pub(super) optimize_form: OptimizeForm,
-    pub(super) optimizing: bool,
-    pub(super) optimize_rows: Vec<SweepRow>,
-    pub(super) optimize_total: Option<(usize, usize)>,
-    pub(super) optimize_cancelled: bool,
-    // Sweep (UI-M6)
-    pub(super) sweep_form: SweepForm,
-    pub(super) sweep_rows: Vec<SweepRow>,
-    pub(super) sweep_total: Option<(usize, usize)>,
-    pub(super) sweep_cancelled: bool,
+    pub(super) search_rows: Vec<SweepRow>,
+    pub(super) search_total: Option<(usize, usize)>,
+    pub(super) search_cancelled: bool,
+    /// Данные и разбиение, на которых получен результат поиска. После смены
+    /// данных запускать по нему финальное обучение нельзя: строки описывают
+    /// уже другой набор.
+    pub(super) search_stamp: Option<(u64, SplitPlan)>,
+    /// Единственный замер на test — только у финального обучения.
+    pub(super) final_eval: Option<FinalEval>,
+    // Режим и ручная сетка поиска
+    pub(super) custom_form: CustomSearchForm,
+    pub(super) mode: TrainingMode,
+    /// Строка поиска, выбранная для финального обучения.
+    pub(super) search_selected: Option<usize>,
     // Text (UI-M7)
     pub(super) text_form: TextForm,
     pub(super) text_training: bool,
@@ -163,9 +175,11 @@ impl App {
             form: TrainForm::default(),
             dataset: None,
             dataset_opening: false,
+            dataset_revision: 0,
             training: false,
-            sweeping: false,
+            searching: false,
             loss_curve: Vec::new(),
+            final_loss_curve: Vec::new(),
             metrics: None,
             train_parameter_count: None,
             model_info: None,
@@ -184,14 +198,14 @@ impl App {
             kan_symbolic_pending: false,
             diagnostics: None,
             optimize_form: OptimizeForm::default(),
-            optimizing: false,
-            optimize_rows: Vec::new(),
-            optimize_total: None,
-            optimize_cancelled: false,
-            sweep_form: SweepForm::default(),
-            sweep_rows: Vec::new(),
-            sweep_total: None,
-            sweep_cancelled: false,
+            search_rows: Vec::new(),
+            search_total: None,
+            search_cancelled: false,
+            search_stamp: None,
+            final_eval: None,
+            custom_form: CustomSearchForm::default(),
+            mode: TrainingMode::Single,
+            search_selected: None,
             text_form: TextForm::default(),
             text_training: false,
             text_curve: Vec::new(),
@@ -214,8 +228,7 @@ impl App {
                 Event::Status(s) => self.status = s,
                 Event::Error(e) => {
                     self.training = false;
-                    self.sweeping = false;
-                    self.optimizing = false;
+                    self.searching = false;
                     self.text_training = false;
                     self.epoch_sweeping = false;
                     self.batch_predicting = false;
@@ -230,29 +243,42 @@ impl App {
                 } => {
                     self.training = true;
                     self.loss_curve.clear();
+                    self.final_loss_curve.clear();
                     self.metrics = None;
+                    self.final_eval = None;
                     self.train_parameter_count = Some(parameter_count);
                     self.status =
                         format!("обучение: 0/{total_epochs} эпох, {parameter_count} параметров");
                 }
-                Event::Epoch { epoch, loss } => {
-                    self.loss_curve.push([epoch as f64, loss as f64]);
-                    self.status = format!("эпоха {epoch}: loss {loss:.5}");
+                Event::Epoch { phase, epoch, loss } => {
+                    let (curve, label) = match phase {
+                        Phase::Development => (&mut self.loss_curve, "development"),
+                        Phase::Final => (&mut self.final_loss_curve, "финальное обучение"),
+                    };
+                    curve.push([epoch as f64, loss as f64]);
+                    self.status = format!("{label}: эпоха {epoch}, loss {loss:.5}");
                 }
-                Event::TrainDone { metrics } => {
+                Event::TrainDone {
+                    metrics,
+                    final_eval,
+                    cancelled,
+                } => {
                     self.training = false;
-                    match metrics {
-                        Some(m) => {
-                            self.metrics = Some(m);
-                            self.status = "обучение завершено".to_string();
-                        }
-                        None => self.status = "обучение отменено".to_string(),
-                    }
+                    self.metrics = metrics;
+                    self.final_eval = final_eval;
+                    self.status = if cancelled {
+                        "обучение отменено".to_string()
+                    } else if self.final_eval.is_some() {
+                        "финальное обучение завершено, test открыт".to_string()
+                    } else {
+                        "обучение завершено".to_string()
+                    };
                 }
                 Event::DatasetOpened { data } => {
                     self.dataset_opening = false;
                     self.status = format!("данные открыты: {}", data.origin.short_name());
-                    self.dataset = Some(ActiveDataset::new(data, None, true));
+                    let revision = self.next_revision();
+                    self.set_dataset(ActiveDataset::new(data, None, true, revision));
                 }
                 Event::TableOpened {
                     path,
@@ -343,65 +369,36 @@ impl App {
                     self.diagnostics = Some(result);
                     self.status = "диагностика готова".to_string();
                 }
-                Event::SweepStarted {
+                Event::SearchStarted {
                     total_configs,
                     total_runs,
                 } => {
-                    self.sweeping = true;
-                    self.sweep_rows.clear();
-                    self.sweep_total = Some((total_configs, total_runs));
-                    self.sweep_cancelled = false;
+                    self.searching = true;
+                    self.search_rows.clear();
+                    self.search_total = Some((total_configs, total_runs));
+                    self.search_cancelled = false;
                     self.status =
-                        format!("sweep: 0/{total_configs} конфигов ({total_runs} прогонов)");
+                        format!("поиск: 0/{total_configs} конфигураций ({total_runs} прогонов)");
                 }
-                Event::SweepRow { row } => {
-                    self.sweep_rows.push(row);
-                    sweep::sort_rows(&mut self.sweep_rows, SweepObjective::default());
-                    if let Some((total_configs, _)) = self.sweep_total {
-                        self.status =
-                            format!("sweep: {}/{total_configs} конфигов", self.sweep_rows.len());
-                    }
-                }
-                Event::SweepDone { rows, cancelled } => {
-                    self.sweeping = false;
-                    self.sweep_rows = rows;
-                    self.sweep_cancelled = cancelled;
-                    self.status = if cancelled {
-                        "sweep отменён".to_string()
-                    } else {
-                        "sweep завершён".to_string()
-                    };
-                }
-                Event::OptimizeStarted {
-                    total_configs,
-                    total_runs,
-                } => {
-                    self.optimizing = true;
-                    self.optimize_rows.clear();
-                    self.optimize_total = Some((total_configs, total_runs));
-                    self.optimize_cancelled = false;
-                    self.status =
-                        format!("optimize: 0/{total_configs} конфигов ({total_runs} прогонов)");
-                }
-                Event::OptimizeRow { row } => {
-                    self.optimize_rows.push(row);
-                    self.sort_optimize_rows();
-                    if let Some((total_configs, _)) = self.optimize_total {
+                Event::SearchRow { row } => {
+                    self.search_rows.push(row);
+                    self.sort_search_rows();
+                    if let Some((total_configs, _)) = self.search_total {
                         self.status = format!(
-                            "optimize: {}/{total_configs} конфигов",
-                            self.optimize_rows.len()
+                            "поиск: {}/{total_configs} конфигураций",
+                            self.search_rows.len()
                         );
                     }
                 }
-                Event::OptimizeDone { rows, cancelled } => {
-                    self.optimizing = false;
-                    self.optimize_rows = rows;
-                    self.sort_optimize_rows();
-                    self.optimize_cancelled = cancelled;
+                Event::SearchDone { rows, cancelled } => {
+                    self.searching = false;
+                    self.search_rows = rows;
+                    self.sort_search_rows();
+                    self.search_cancelled = cancelled;
                     self.status = if cancelled {
-                        "optimize отменён".to_string()
+                        "поиск отменён".to_string()
                     } else {
-                        "optimize завершён".to_string()
+                        "поиск завершён".to_string()
                     };
                 }
                 Event::TextStarted { total_steps } => {
@@ -487,8 +484,7 @@ impl App {
 
     pub(super) fn busy(&self) -> bool {
         self.training
-            || self.sweeping
-            || self.optimizing
+            || self.searching
             || self.text_training
             || self.epoch_sweeping
             || self.batch_predicting
@@ -583,15 +579,45 @@ impl App {
             .map(|active| (active.prepared.clone(), active.split))
     }
 
+    /// Номер для следующего набора данных: ревизии не переиспользуются, иначе
+    /// устаревший результат поиска мог бы совпасть с новым набором.
+    pub(super) fn next_revision(&mut self) -> u64 {
+        self.dataset_revision += 1;
+        self.dataset_revision
+    }
+
+    /// Сменить активный набор. Результаты поиска и финальный замер относятся
+    /// к старым данным, поэтому очищаются. Сама модель остаётся доступной.
+    pub(super) fn set_dataset(&mut self, dataset: ActiveDataset) {
+        self.dataset = Some(dataset);
+        self.search_rows.clear();
+        self.search_total = None;
+        self.search_stamp = None;
+        self.search_selected = None;
+        self.final_eval = None;
+    }
+
     pub(super) fn open_dataset(&mut self, origin: DatasetOrigin) {
         self.dataset_opening = true;
         self.status = format!("открываю {}…", origin.short_name());
         self.worker.send(Command::OpenDataset { origin });
     }
 
-    pub(super) fn sort_optimize_rows(&mut self) {
+    pub(super) fn sort_search_rows(&mut self) {
         let objective = self.optimize_form.objective();
-        sweep::sort_rows(&mut self.optimize_rows, objective);
+        sweep::sort_rows(&mut self.search_rows, objective);
+    }
+
+    /// Отпечаток активных данных: ревизия набора и план разбиения.
+    pub(super) fn dataset_stamp(&self) -> Option<(u64, SplitPlan)> {
+        self.dataset
+            .as_ref()
+            .map(|active| (active.revision, active.split))
+    }
+
+    /// Результат поиска годен, только если данные и разбиение не менялись.
+    pub(super) fn search_matches_dataset(&self) -> bool {
+        self.search_stamp.is_some() && self.search_stamp == self.dataset_stamp()
     }
 
     pub(super) fn open_table(&mut self, path: String, has_header: bool) {
@@ -620,8 +646,8 @@ impl App {
         self.form.mlp_layers = choice.mlp_layers;
         self.form.lr = choice.lr;
         self.form.batch = choice.batch_size;
-        // Двухфазность: Optimize ранжировал на search-эпохах, а Train делает
-        // финальное обучение на полном бюджете.
+        // Поиск ранжировал на search-эпохах, а ручной режим получает полный
+        // бюджет для возможной ручной правки.
         self.form.epochs = choice.final_epochs;
         self.form.seed = choice.seed;
         match choice.schedule {
@@ -638,11 +664,11 @@ impl App {
             }
         }
         self.tab = Tab::Train;
-        self.status = "лучший конфиг применён во вкладке Train".to_string();
+        self.status = "выбранная конфигурация перенесена в ручной режим".to_string();
     }
 
-    /// Переносит лучший конфиг Optimize в Epoch-sweep, чтобы подобрать число
-    /// эпох. Конфиг тот же; эпохи Optimize не переносим — задаём список для
+    /// Переносит выбранную конфигурацию в Epoch-sweep, чтобы подобрать число
+    /// эпох. Search-бюджет не переносим — задаём список для
     /// прохода.
     pub(super) fn apply_choice_to_epoch_sweep(&mut self, choice: &SweepChoice) {
         self.epoch_form.kind = choice.kind;
@@ -688,7 +714,7 @@ impl App {
     }
 
     /// Переносит текущий конфиг Epoch-sweep и рекомендованное число эпох в
-    /// Train. Замыкает поток Optimize → Check epochs → Train.
+    /// ручной режим.
     pub(super) fn apply_epoch_form_to_train(&mut self, epochs: usize) {
         let f = &self.epoch_form;
         self.form.kind = f.kind;
@@ -728,8 +754,6 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tab, Tab::KanCurves, "KAN curves");
                 ui.selectable_value(&mut self.tab, Tab::KanFormulas, "KAN formulas");
                 ui.selectable_value(&mut self.tab, Tab::Diagnose, "Diagnose");
-                ui.selectable_value(&mut self.tab, Tab::Optimize, "Optimize");
-                ui.selectable_value(&mut self.tab, Tab::Sweep, "Sweep");
                 ui.selectable_value(&mut self.tab, Tab::Text, "Text");
                 ui.selectable_value(&mut self.tab, Tab::Prepare, "Prepare");
                 ui.selectable_value(&mut self.tab, Tab::EpochSweep, "Epoch-sweep");
@@ -752,12 +776,60 @@ impl eframe::App for App {
                     Tab::KanCurves => self.ui_kan_curves(ui),
                     Tab::KanFormulas => self.ui_kan_formulas(ui),
                     Tab::Diagnose => self.ui_diagnose(ui),
-                    Tab::Optimize => self.ui_optimize(ui),
-                    Tab::Sweep => self.ui_sweep(ui),
                     Tab::Text => self.ui_text(ui),
                     Tab::Prepare => self.ui_prepare(ui),
                     Tab::EpochSweep => self.ui_epoch_sweep(ui),
                 });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blackbox;
+    use crate::schema::ModelSchema;
+    use std::sync::Arc;
+
+    fn active(revision: u64) -> ActiveDataset {
+        let data = blackbox::sum().generate(16, 0);
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        ActiveDataset::new(
+            PreparedData {
+                origin: DatasetOrigin::Blackbox("sum".to_string()),
+                data: Arc::new(data),
+                schema,
+            },
+            None,
+            true,
+            revision,
+        )
+    }
+
+    /// Отпечаток результата поиска — данные и разбиение. По нему видно, что
+    /// финальное обучение запускать уже нельзя.
+    #[test]
+    fn search_stamp_follows_dataset_and_split() {
+        let mut first = active(1);
+        let stamp = (first.revision, first.split);
+
+        // Тот же набор и то же разбиение — результат актуален.
+        assert_eq!(stamp, (first.revision, first.split));
+
+        // Сменилось разбиение — отпечаток другой.
+        first.split = SplitPlan::kfold_default();
+        assert_ne!(stamp, (first.revision, first.split));
+
+        // Сменились данные — ревизия другая, даже если разбиение прежнее.
+        let second = active(2);
+        assert_ne!(stamp, (second.revision, second.split));
+    }
+
+    #[test]
+    fn summary_describes_the_active_dataset() {
+        let text = active(1).summary();
+        assert!(text.contains("чёрный ящик: sum"), "{text}");
+        assert!(text.contains("16 строк"), "{text}");
+        assert!(text.contains("2 вход → 1 выход"), "{text}");
     }
 }

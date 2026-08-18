@@ -16,7 +16,7 @@ use crate::metrics::{
 };
 use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
 use crate::schema::ModelSchema;
-use crate::split::{FinalEval, SearchPool, SplitPlan};
+use crate::split::{FinalEval, PreparedSplit, SearchPool, SplitPlan};
 use crate::train::{
     fit_normalizers, predict_dataset, train_surrogate_cb, validate_train, LrSchedule, TrainConfig,
 };
@@ -241,6 +241,13 @@ pub struct TrainingOutcome {
     /// Единственный замер на test: `None`, если фазу не запрашивали либо запуск
     /// отменён до оценки.
     pub final_eval: Option<FinalEval>,
+}
+
+/// Результат финального refit после уже выполненного выбора конфигурации.
+/// `None` означает отмену до открытия test.
+pub struct RefitOutcome {
+    pub model: Option<TrainedModel>,
+    pub eval: Option<FinalEval>,
 }
 
 // --- поиск конфигурации ---
@@ -712,6 +719,74 @@ pub fn run_training(
     } else {
         setup.train.epochs
     };
+    let refit = refit_prepared(
+        dataset,
+        prepared,
+        setup,
+        final_epochs,
+        final_init_seed,
+        cancel,
+        on_point,
+        configure_model,
+        post_train,
+    )?;
+    Ok(TrainingOutcome {
+        development,
+        final_model: refit.model,
+        final_eval: refit.eval,
+    })
+}
+
+/// Переобучить уже выбранную конфигурацию на всём search-pool и один раз
+/// измерить её на отложенном test.
+///
+/// В отличие от [`run_training`], здесь нет development-фазы: выбор уже был
+/// сделан поиском, включая агрегацию K-fold. Поэтому функция одинаково
+/// работает для holdout и K-fold и не выдаёт один fold за общую оценку.
+#[allow(clippy::too_many_arguments)]
+pub fn refit(
+    dataset: &Dataset,
+    split: SplitPlan,
+    setup: &TrainingSetup,
+    final_init_seed: u64,
+    cancel: &AtomicBool,
+    on_point: &mut dyn FnMut(Phase, &EpochPoint),
+    configure_model: ConfigureModel<'_>,
+    post_train: PostTrain<'_>,
+) -> Result<RefitOutcome, String> {
+    setup.validate()?;
+    if setup.early_stopping.is_some() {
+        return Err(
+            "refit требует заранее выбранного числа эпох; early stopping без validation невозможен"
+                .to_string(),
+        );
+    }
+    let prepared = split.prepare(dataset.data())?;
+    refit_prepared(
+        dataset,
+        prepared,
+        setup,
+        setup.train.epochs,
+        final_init_seed,
+        cancel,
+        on_point,
+        configure_model,
+        post_train,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refit_prepared(
+    dataset: &Dataset,
+    prepared: PreparedSplit,
+    setup: &TrainingSetup,
+    final_epochs: usize,
+    final_init_seed: u64,
+    cancel: &AtomicBool,
+    on_point: &mut dyn FnMut(Phase, &EpochPoint),
+    configure_model: ConfigureModel<'_>,
+    post_train: PostTrain<'_>,
+) -> Result<RefitOutcome, String> {
     let pool = prepared.search.all();
     let specs = dataset.schema().feature_specs();
     let (in_norm, out_norm) = fit_normalizers(&pool, &specs);
@@ -742,10 +817,9 @@ pub fn run_training(
         cancel,
     );
     if cancel.load(Ordering::Relaxed) {
-        return Ok(TrainingOutcome {
-            development,
-            final_model: None,
-            final_eval: None,
+        return Ok(RefitOutcome {
+            model: None,
+            eval: None,
         });
     }
     let mut final_model = TrainedModel {
@@ -761,10 +835,9 @@ pub fn run_training(
     };
     post_train(Phase::Final, &mut final_model, &pool, None);
     if cancel.load(Ordering::Relaxed) {
-        return Ok(TrainingOutcome {
-            development,
-            final_model: None,
-            final_eval: None,
+        return Ok(RefitOutcome {
+            model: None,
+            eval: None,
         });
     }
 
@@ -785,10 +858,9 @@ pub fn run_training(
         final_init_seed,
     )?;
 
-    Ok(TrainingOutcome {
-        development,
-        final_model: Some(final_model),
-        final_eval: Some(final_eval),
+    Ok(RefitOutcome {
+        model: Some(final_model),
+        eval: Some(final_eval),
     })
 }
 
@@ -1359,6 +1431,29 @@ mod tests {
         .err()
         .expect("K-fold нельзя выдавать за один development fold");
         assert!(error.contains("K-fold"), "{error}");
+    }
+
+    #[test]
+    fn refit_supports_kfold_after_search() {
+        let ds = dataset(120);
+        let never = AtomicBool::new(false);
+        let plan = SplitPlan::kfold_default();
+        let outcome = refit(
+            &ds,
+            plan,
+            &setup(1),
+            DEFAULT_FINAL_INIT_SEED,
+            &never,
+            &mut |_, _| {},
+            &mut |_, _| {},
+            &mut |_, _, _, _| {},
+        )
+        .expect("K-fold refit должен обучиться на всём pool");
+
+        assert!(outcome.model.is_some());
+        let eval = outcome.eval.expect("test открывается после refit");
+        assert_eq!(eval.origin.plan, plan);
+        assert_eq!(eval.origin.final_init_seed, DEFAULT_FINAL_INIT_SEED);
     }
 
     #[test]

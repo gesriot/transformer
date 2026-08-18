@@ -2,16 +2,40 @@
 
 use super::messages::Command;
 use super::model::ModelInfo;
-use super::session::BLACKBOXES;
 use super::session::{App, NO_DATASET};
 use crate::config::ModelConfig;
 use crate::encoders::{ValueEncoderConfig, ValueEncoderKind};
 use crate::epoch_sweep::{self};
 use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
-use crate::sweep::{self, SearchBudget, SweepAxes, SweepObjective, SweepRow};
+use crate::split::DEFAULT_FINAL_INIT_SEED;
+use crate::sweep::{self, SearchBudget, SweepAxes, SweepChoice, SweepObjective, SweepRow};
 use crate::train::{validate_train, LrSchedule, TrainConfig};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
+
+/// Что делает экран обучения.
+///
+/// Поиск и одиночное обучение — разные операции, но одно состояние экрана:
+/// данные, разбиение и результат у них общие.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum TrainingMode {
+    /// Одна конфигурация: ручные гиперпараметры.
+    Single,
+    /// Готовый бюджет поиска.
+    Auto(SearchBudget),
+    /// Своя сетка из [`CustomSearchForm`].
+    Custom,
+}
+
+impl TrainingMode {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            TrainingMode::Single => "Одна конфигурация",
+            TrainingMode::Auto(_) => "Авто",
+            TrainingMode::Custom => "Своя сетка",
+        }
+    }
+}
 
 /// Состояние формы Train. Числа редактируются `DragValue` (без строкового
 /// парсинга); валидность проверяется теми же `validate_*`, что и в CLI.
@@ -126,8 +150,9 @@ impl TrainForm {
     }
 }
 
-pub(super) struct SweepForm {
-    pub(super) blackbox: String,
+/// Редактируемая своя сетка. Хранится именно форма, а не готовые [`SweepAxes`]:
+/// промежуточные значения бывают невалидными, и представлять их проще строками.
+pub(super) struct CustomSearchForm {
     pub(super) seeds: String,
     pub(super) d_models: String,
     pub(super) layers: String,
@@ -141,10 +166,9 @@ pub(super) struct SweepForm {
     pub(super) batch: usize,
 }
 
-impl Default for SweepForm {
+impl Default for CustomSearchForm {
     fn default() -> Self {
         Self {
-            blackbox: "sum".to_string(),
             seeds: "0".to_string(),
             d_models: "32".to_string(),
             layers: "2".to_string(),
@@ -160,10 +184,11 @@ impl Default for SweepForm {
     }
 }
 
-impl SweepForm {
-    pub(super) fn build(&self) -> Result<(String, SweepAxes), String> {
+impl CustomSearchForm {
+    /// Собрать и проверить сетку. Невалидная форма не доходит до запуска.
+    pub(super) fn build(&self, model_kinds: Vec<ModelKind>) -> Result<SweepAxes, String> {
         let axes = SweepAxes {
-            model_kinds: vec![ModelKind::Transformer],
+            model_kinds,
             seeds: parse_csv_u64(&self.seeds, "seeds")?,
             d_models: parse_csv_usize(&self.d_models, "d-models")?,
             layers: parse_csv_usize(&self.layers, "layers-list")?,
@@ -183,12 +208,11 @@ impl SweepForm {
             batch_size: self.batch,
         };
         sweep::validate_axes(&axes)?;
-        Ok((self.blackbox.clone(), axes))
+        Ok(axes)
     }
 }
 
 pub(super) struct OptimizeForm {
-    pub(super) preset: usize,    // 0 quick, 1 balanced, 2 thorough
     pub(super) objective: usize, // 0 worst, 1 aggregate, 2 mean, 3 nrmse
     pub(super) include_mlp: bool,
     pub(super) include_transformer: bool,
@@ -198,7 +222,6 @@ pub(super) struct OptimizeForm {
 impl Default for OptimizeForm {
     fn default() -> Self {
         Self {
-            preset: 0,
             objective: 0,
             include_mlp: true,
             include_transformer: true,
@@ -217,38 +240,32 @@ impl OptimizeForm {
         }
     }
 
-    /// Оси сетки из пресета (без требования файла) — для оценки размера в UI.
-    pub(super) fn budget(&self) -> SearchBudget {
-        match self.preset {
-            1 => SearchBudget::Balanced,
-            2 => SearchBudget::Thorough,
-            _ => SearchBudget::Quick,
-        }
-    }
-
-    pub(super) fn axes(&self) -> Result<SweepAxes, String> {
-        let mut model_kinds = Vec::new();
+    /// Выбранные архитектуры. Пустой список — ошибка: искать не по чему.
+    pub(super) fn model_kinds(&self) -> Result<Vec<ModelKind>, String> {
+        let mut kinds = Vec::new();
         if self.include_transformer {
-            model_kinds.push(ModelKind::Transformer);
+            kinds.push(ModelKind::Transformer);
         }
         if self.include_mlp {
-            model_kinds.push(ModelKind::Mlp);
+            kinds.push(ModelKind::Mlp);
         }
         if self.include_kan {
-            model_kinds.push(ModelKind::Kan);
+            kinds.push(ModelKind::Kan);
         }
-        if model_kinds.is_empty() {
+        if kinds.is_empty() {
             return Err("выберите хотя бы одну архитектуру (transformer/mlp/kan)".to_string());
         }
-        // Сетки бюджетов живут в ядре: раньше они были только здесь, и CLI не
-        // мог запустить тот же поиск, что и кнопка в интерфейсе.
-        let axes = SweepAxes::for_budget(self.budget(), model_kinds);
-        sweep::validate_axes(&axes)?;
-        Ok(axes)
+        Ok(kinds)
     }
 
-    pub(super) fn build(&self) -> Result<(SweepAxes, SweepObjective), String> {
-        Ok((self.axes()?, self.objective()))
+    /// Оси сетки из выбранного бюджета — для оценки размера и запуска.
+    pub(super) fn axes(&self, budget: SearchBudget) -> Result<SweepAxes, String> {
+        let model_kinds = self.model_kinds()?;
+        // Сетки бюджетов живут в ядре: раньше они были только здесь, и CLI не
+        // мог запустить тот же поиск, что и кнопка в интерфейсе.
+        let axes = SweepAxes::for_budget(budget, model_kinds);
+        sweep::validate_axes(&axes)?;
+        Ok(axes)
     }
 }
 
@@ -484,11 +501,45 @@ fn objective_display_score(objective: SweepObjective, row: &SweepRow) -> f32 {
 
 impl App {
     pub(super) fn ui_train(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Train (numeric)");
+        ui.heading("Обучение");
 
         self.ui_dataset_bar(ui);
 
         ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Режим:");
+            ui.selectable_value(
+                &mut self.mode,
+                TrainingMode::Single,
+                TrainingMode::Single.label(),
+            );
+            let auto = matches!(self.mode, TrainingMode::Auto(_));
+            if ui
+                .selectable_label(auto, TrainingMode::Auto(SearchBudget::default()).label())
+                .clicked()
+                && !auto
+            {
+                self.mode = TrainingMode::Auto(SearchBudget::default());
+            }
+            ui.selectable_value(
+                &mut self.mode,
+                TrainingMode::Custom,
+                TrainingMode::Custom.label(),
+            );
+        });
+
+        match self.mode {
+            TrainingMode::Single => self.ui_single_config(ui),
+            TrainingMode::Auto(budget) => self.ui_auto_search(ui, budget),
+            TrainingMode::Custom => self.ui_custom_search(ui),
+        }
+
+        self.ui_search_results(ui);
+        self.ui_training_output(ui);
+    }
+
+    /// Ручная конфигурация: та же сетка гиперпараметров, что и раньше.
+    fn ui_single_config(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label("Модель:");
             ui.selectable_value(&mut self.form.kind, ModelKind::Transformer, "transformer");
@@ -592,7 +643,7 @@ impl App {
         ui.separator();
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!self.busy(), egui::Button::new("Train"))
+                .add_enabled(!self.busy(), egui::Button::new("Обучить"))
                 .clicked()
             {
                 match (self.form.build(), self.active_data()) {
@@ -604,6 +655,8 @@ impl App {
                             split,
                             nc,
                             tcfg,
+                            // Ручной запуск — фаза разработки: test не трогаем.
+                            final_phase: false,
                         });
                     }
                     (Ok(_), None) => self.status = NO_DATASET.to_string(),
@@ -611,7 +664,7 @@ impl App {
                 }
             }
             if ui
-                .add_enabled(self.training, egui::Button::new("Cancel"))
+                .add_enabled(self.training, egui::Button::new("Отмена"))
                 .clicked()
             {
                 self.worker.request_cancel();
@@ -620,23 +673,350 @@ impl App {
             if ui
                 .add_enabled(
                     self.model_info.is_some() && !self.busy(),
-                    egui::Button::new("Save model…"),
+                    egui::Button::new("Сохранить модель…"),
                 )
                 .clicked()
             {
                 self.save_model_dialog();
             }
         });
+    }
 
+    /// Готовый бюджет: архитектуры, цель и цена операции.
+    fn ui_auto_search(&mut self, ui: &mut egui::Ui, budget: SearchBudget) {
+        ui.horizontal(|ui| {
+            ui.label("Бюджет:");
+            for candidate in [
+                SearchBudget::Quick,
+                SearchBudget::Balanced,
+                SearchBudget::Thorough,
+            ] {
+                if ui
+                    .selectable_label(budget == candidate, candidate.label())
+                    .clicked()
+                {
+                    self.mode = TrainingMode::Auto(candidate);
+                }
+            }
+        });
+        ui.label(format!("{}: {}", budget.label(), budget.hint()));
+        self.ui_search_common(ui, self.optimize_form.axes(budget));
+    }
+
+    /// Своя сетка: форма редактируется свободно, оси собираются перед запуском.
+    fn ui_custom_search(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("custom_grid")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("seeds");
+                ui.text_edit_singleline(&mut self.custom_form.seeds);
+                ui.end_row();
+                ui.label("d-models");
+                ui.text_edit_singleline(&mut self.custom_form.d_models);
+                ui.end_row();
+                ui.label("layers");
+                ui.text_edit_singleline(&mut self.custom_form.layers);
+                ui.end_row();
+                ui.label("d-ffs");
+                ui.text_edit_singleline(&mut self.custom_form.d_ffs);
+                ui.end_row();
+                ui.label("lrs");
+                ui.text_edit_singleline(&mut self.custom_form.lrs);
+                ui.end_row();
+                ui.label("value-encoders");
+                ui.text_edit_singleline(&mut self.custom_form.value_encoders);
+                ui.end_row();
+                ui.label("fourier-scales");
+                ui.text_edit_singleline(&mut self.custom_form.fourier_scales);
+                ui.end_row();
+                ui.label("schedulers");
+                ui.text_edit_singleline(&mut self.custom_form.schedulers);
+                ui.end_row();
+                ui.label("epochs");
+                ui.add(egui::DragValue::new(&mut self.custom_form.epochs).range(1..=100000));
+                ui.end_row();
+                ui.label("batch");
+                ui.add(egui::DragValue::new(&mut self.custom_form.batch).range(1..=8192));
+                ui.end_row();
+            });
+        let axes = self
+            .optimize_form
+            .model_kinds()
+            .and_then(|kinds| self.custom_form.build(kinds));
+        self.ui_search_common(ui, axes);
+    }
+
+    /// Общая часть обоих режимов поиска: архитектуры, цель, цена и запуск.
+    fn ui_search_common(&mut self, ui: &mut egui::Ui, axes: Result<SweepAxes, String>) {
+        let objective_before = self.optimize_form.objective;
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.optimize_form.include_transformer, "transformer");
+            ui.checkbox(&mut self.optimize_form.include_mlp, "mlp");
+            ui.checkbox(&mut self.optimize_form.include_kan, "kan");
+            ui.label("цель:");
+            egui::ComboBox::from_id_salt("search_objective")
+                .selected_text(objective_label(self.optimize_form.objective()))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.optimize_form.objective, 0, "worst-output R²");
+                    ui.selectable_value(&mut self.optimize_form.objective, 1, "aggregate R²");
+                    ui.selectable_value(&mut self.optimize_form.objective, 2, "mean-output R²");
+                    ui.selectable_value(&mut self.optimize_form.objective, 3, "aggregate nRMSE");
+                });
+        });
+        if self.optimize_form.objective != objective_before {
+            self.sort_search_rows();
+            self.search_selected = None;
+        }
+
+        // Цена операции — до запуска: она понятнее названия бюджета.
+        let folds = self.dataset.as_ref().map_or(1, |d| match d.split {
+            crate::split::SplitPlan::KFold { k, .. } => k,
+            crate::split::SplitPlan::Holdout { .. } => 1,
+        });
+        match &axes {
+            Ok(a) => match sweep::sweep_cost(a, folds) {
+                Ok(cost) => {
+                    ui.label(format!("Оценка: {}", cost.describe()));
+                }
+                Err(e) => {
+                    ui.colored_label(egui::Color32::from_rgb(200, 60, 60), e);
+                }
+            },
+            Err(e) => {
+                ui.colored_label(egui::Color32::from_rgb(200, 60, 60), e.clone());
+            }
+        }
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.busy(), egui::Button::new("Искать"))
+                .clicked()
+            {
+                match (axes, self.active_data()) {
+                    (Ok(axes), Some((data, split))) => {
+                        self.worker.reset_cancel();
+                        // Отпечаток фиксируется в момент отправки команды, а не
+                        // когда worker успеет ответить SearchStarted.
+                        self.search_stamp = self.dataset_stamp();
+                        self.searching = true;
+                        self.search_selected = None;
+                        self.search_rows.clear();
+                        self.search_total = None;
+                        self.search_cancelled = false;
+                        self.worker.send(Command::Search {
+                            data,
+                            split,
+                            axes,
+                            objective: self.optimize_form.objective(),
+                        });
+                    }
+                    (Ok(_), None) => self.status = NO_DATASET.to_string(),
+                    (Err(e), _) => self.status = format!("Ошибка: {e}"),
+                }
+            }
+            if ui
+                .add_enabled(self.searching, egui::Button::new("Отмена"))
+                .clicked()
+            {
+                self.worker.request_cancel();
+                self.status = "отмена поиска…".to_string();
+            }
+        });
+    }
+
+    /// Таблица результатов и запуск финального обучения по выбранной строке.
+    fn ui_search_results(&mut self, ui: &mut egui::Ui) {
+        if self.search_rows.is_empty() {
+            return;
+        }
+        ui.separator();
+        if let Some((cfgs, runs)) = self.search_total {
+            ui.label(format!(
+                "Конфигураций: {cfgs}; прогонов: {runs}; готово: {}",
+                self.search_rows.len()
+            ));
+        }
+        if self.search_cancelled {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 0),
+                "Поиск отменён; показаны завершённые конфигурации.",
+            );
+        }
+        let stale = !self.search_matches_dataset();
+        if stale {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 0),
+                "Данные или разбиение изменились: результат относится к другому \
+                 набору, финальное обучение по нему запрещено.",
+            );
+        }
+
+        let source = epoch_sweep::source_label(self.search_rows[0].source);
+        ui.label(format!(
+            "Ранжирование: {}; метрики {source}",
+            objective_label(self.optimize_form.objective())
+        ));
+
+        let objective = self.optimize_form.objective();
+        let mut selected = self.search_selected;
+        egui::ScrollArea::vertical()
+            .max_height(300.0)
+            .show(ui, |ui| {
+                egui::Grid::new("search_rows")
+                    .num_columns(8)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label("#");
+                        ui.label("score");
+                        ui.label("R²");
+                        ui.label("worst y");
+                        ui.label("mean y");
+                        ui.label("aggr nRMSE");
+                        ui.label("rel");
+                        ui.label("конфигурация");
+                        ui.end_row();
+                        for (i, row) in self.search_rows.iter().enumerate() {
+                            let mark = if i == 0 { "*" } else { "" };
+                            if ui
+                                .add_enabled_ui(!self.searching, |ui| {
+                                    ui.selectable_label(
+                                        selected == Some(i),
+                                        format!("{mark}{}", i + 1),
+                                    )
+                                })
+                                .inner
+                                .clicked()
+                            {
+                                selected = Some(i);
+                            }
+                            ui.label(format!("{:.5}", objective_display_score(objective, row)));
+                            ui.label(format!("{:.5}", row.r2_mean));
+                            ui.label(format!("{:.5}", row.worst_output_r2_mean));
+                            ui.label(format!("{:.5}", row.mean_output_r2_mean));
+                            ui.label(format!("{:.5}", row.nrmse_mean));
+                            ui.label(format!("{:.1}%", row.rel_mean * 100.0));
+                            ui.label(&row.label);
+                            ui.end_row();
+                        }
+                    });
+            });
+        self.search_selected = selected;
+
+        // По умолчанию берётся лучшая строка: она же первая в ранжировании.
+        let chosen = self
+            .search_selected
+            .or(if self.search_rows.is_empty() {
+                None
+            } else {
+                Some(0)
+            })
+            .and_then(|i| self.search_rows.get(i).map(|r| r.choice.clone()));
+        ui.horizontal(|ui| {
+            let ready = chosen.is_some() && !self.busy() && !stale;
+            if ui
+                .add_enabled(ready, egui::Button::new("Обучить финально"))
+                .on_hover_text(
+                    "Переобучить выбранную конфигурацию на train+validation и один раз \
+                     открыть test",
+                )
+                .clicked()
+            {
+                if let Some(choice) = &chosen {
+                    self.train_final_from_choice(choice);
+                }
+            }
+            if ui
+                .add_enabled(
+                    chosen.is_some() && !self.busy(),
+                    egui::Button::new("В ручной режим"),
+                )
+                .clicked()
+            {
+                if let Some(choice) = &chosen {
+                    self.apply_choice_to_train(choice);
+                    self.mode = TrainingMode::Single;
+                }
+            }
+            if ui
+                .add_enabled(
+                    chosen.is_some() && !self.busy(),
+                    egui::Button::new("Подобрать эпохи"),
+                )
+                .clicked()
+            {
+                if let Some(choice) = &chosen {
+                    self.apply_choice_to_epoch_sweep(choice);
+                }
+            }
+        });
+    }
+
+    /// Запустить финальное обучение по выбранной строке поиска.
+    ///
+    /// Конфигурация берётся из строки напрямую, а seed — заранее заданный
+    /// `final_init_seed`: выбирать seed по результату поиска значит подбирать
+    /// его по тем же данным.
+    fn train_final_from_choice(&mut self, choice: &SweepChoice) {
+        let Some((data, split)) = self.active_data() else {
+            self.status = NO_DATASET.to_string();
+            return;
+        };
+        let nc = NumericConfig {
+            kind: choice.kind,
+            transformer: ModelConfig {
+                d_model: choice.d_model,
+                n_heads: choice.heads,
+                n_enc_layers: choice.layers,
+                n_dec_layers: choice.layers,
+                d_ff: choice.d_ff,
+                ln_eps: 1e-5,
+            },
+            value: choice.value,
+            mlp_width: choice.mlp_width,
+            mlp_layers: choice.mlp_layers,
+            kan: choice.kan,
+        };
+        let tcfg = TrainConfig {
+            epochs: choice.final_epochs,
+            batch_size: choice.batch_size,
+            lr: choice.lr,
+            seed: DEFAULT_FINAL_INIT_SEED,
+            schedule: choice.schedule,
+        };
+        if let Err(e) =
+            validate_numeric(&nc).and_then(|()| validate_train(tcfg.lr, tcfg.batch_size))
+        {
+            self.status = format!("Ошибка: {e}");
+            return;
+        }
+        self.train_parameter_count = None;
+        self.worker.reset_cancel();
+        self.worker.send(Command::TrainNumeric {
+            data,
+            split,
+            nc,
+            tcfg,
+            final_phase: true,
+        });
+    }
+
+    /// Результат обучения: кривая, метрики и единственный замер на test.
+    fn ui_training_output(&mut self, ui: &mut egui::Ui) {
         if let Some(count) = self.train_parameter_count {
             ui.label(format!("Параметров: {count}"));
         }
 
-        if !self.loss_curve.is_empty() {
-            let points = PlotPoints::from(self.loss_curve.clone());
-            Plot::new("loss_plot")
-                .height(220.0)
-                .show(ui, |pui| pui.line(Line::new(points).name("train loss")));
+        if !self.loss_curve.is_empty() || !self.final_loss_curve.is_empty() {
+            let development = PlotPoints::from(self.loss_curve.clone());
+            let final_refit = PlotPoints::from(self.final_loss_curve.clone());
+            Plot::new("loss_plot").height(220.0).show(ui, |pui| {
+                if !self.loss_curve.is_empty() {
+                    pui.line(Line::new(development).name("development train loss"));
+                }
+                if !self.final_loss_curve.is_empty() {
+                    pui.line(Line::new(final_refit).name("final train+validation loss"));
+                }
+            });
         }
         if let Some(m) = &self.metrics {
             ui.separator();
@@ -647,7 +1027,21 @@ impl App {
                 m.rel_error * 100.0,
                 m.r2
             ));
-            ui.label("Test отложен и в этой сессии не открывается.");
+            if self.final_eval.is_none() {
+                ui.label("Test отложен: его открывает только финальное обучение.");
+            }
+        }
+        if let Some(f) = &self.final_eval {
+            ui.separator();
+            ui.label(format!(
+                "test ({} строк, единственный замер): RMSE={:.5}   MAE={:.5}   \
+                 rel.error={:.2}%   R²={:.5}",
+                f.origin.test_rows,
+                f.metrics.rmse,
+                f.metrics.mae,
+                f.metrics.rel_error * 100.0,
+                f.metrics.r2
+            ));
         }
         if let Some(warning) = self
             .model_info
@@ -655,304 +1049,6 @@ impl App {
             .and_then(ModelInfo::categorical_warning)
         {
             ui.colored_label(egui::Color32::from_rgb(200, 120, 0), warning);
-        }
-    }
-
-    pub(super) fn ui_optimize(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Optimize");
-
-        self.ui_dataset_bar(ui);
-
-        ui.horizontal(|ui| {
-            ui.label("бюджет");
-            egui::ComboBox::from_id_salt("optimize_preset")
-                .selected_text(self.optimize_form.budget().label())
-                .show_ui(ui, |ui| {
-                    for (index, budget) in [
-                        SearchBudget::Quick,
-                        SearchBudget::Balanced,
-                        SearchBudget::Thorough,
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    {
-                        ui.selectable_value(&mut self.optimize_form.preset, index, budget.label());
-                    }
-                });
-            ui.label("objective");
-            egui::ComboBox::from_id_salt("optimize_objective")
-                .selected_text(objective_label(self.optimize_form.objective()))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.optimize_form.objective, 0, "worst-output R²");
-                    ui.selectable_value(&mut self.optimize_form.objective, 1, "aggregate R²");
-                    ui.selectable_value(&mut self.optimize_form.objective, 2, "mean-output R²");
-                    ui.selectable_value(&mut self.optimize_form.objective, 3, "aggregate nRMSE");
-                });
-        });
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.optimize_form.include_transformer, "transformer");
-            ui.checkbox(&mut self.optimize_form.include_mlp, "mlp");
-            ui.checkbox(&mut self.optimize_form.include_kan, "kan");
-        });
-        ui.label(format!(
-            "{}: {}",
-            self.optimize_form.budget().label(),
-            self.optimize_form.budget().hint()
-        ));
-        ui.label(
-            "Optimize только ищет конфиг. Финальное обучение делает Train \
-             после «Apply best» (на полном бюджете эпох).",
-        );
-        // Оценка размера до запуска — чтобы случайно не словить долгий прогон.
-        // Цена операции показывается до запуска: она понятнее названия бюджета.
-        if let Ok(cost) = self
-            .optimize_form
-            .axes()
-            .and_then(|a| sweep::sweep_cost(&a, 1))
-        {
-            ui.label(format!("Оценка: {}", cost.describe()));
-        }
-        self.sort_optimize_rows();
-
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!self.busy(), egui::Button::new("Run optimize"))
-                .clicked()
-            {
-                match (self.optimize_form.build(), self.active_data()) {
-                    (Ok((axes, objective)), Some((data, split))) => {
-                        self.worker.reset_cancel();
-                        self.worker.send(Command::Optimize {
-                            data,
-                            split,
-                            axes,
-                            objective,
-                        });
-                    }
-                    (Ok(_), None) => self.status = NO_DATASET.to_string(),
-                    (Err(e), _) => self.status = format!("Ошибка: {e}"),
-                }
-            }
-            if ui
-                .add_enabled(self.optimizing, egui::Button::new("Cancel"))
-                .clicked()
-            {
-                self.worker.request_cancel();
-                self.status = "отмена optimize…".to_string();
-            }
-            let best_choice = self.optimize_rows.first().map(|r| r.choice.clone());
-            let has_best = best_choice.is_some() && !self.optimizing;
-            if ui
-                .add_enabled(has_best, egui::Button::new("Apply to Train"))
-                .clicked()
-            {
-                if let Some(choice) = &best_choice {
-                    self.apply_choice_to_train(choice);
-                }
-            }
-            if ui
-                .add_enabled(has_best, egui::Button::new("Check epochs"))
-                .on_hover_text("Перенести конфиг в Epoch-sweep и подобрать число эпох")
-                .clicked()
-            {
-                if let Some(choice) = &best_choice {
-                    self.apply_choice_to_epoch_sweep(choice);
-                }
-            }
-        });
-
-        if let Some((cfgs, runs)) = self.optimize_total {
-            ui.label(format!(
-                "Конфигов: {cfgs}; прогонов: {runs}; готово: {}",
-                self.optimize_rows.len()
-            ));
-        }
-        if self.optimize_cancelled {
-            ui.colored_label(
-                egui::Color32::from_rgb(200, 120, 0),
-                "Optimize отменён; показаны завершённые конфиги.",
-            );
-        }
-
-        if !self.optimize_rows.is_empty() {
-            ui.separator();
-            let (search_epochs, final_epochs) = self
-                .optimize_rows
-                .first()
-                .map(|r| (r.choice.epochs, r.choice.final_epochs))
-                .unwrap_or((0, 0));
-            let source = epoch_sweep::source_label(self.optimize_rows[0].source);
-            ui.label(format!(
-                "Ранжирование: {}; метрики {source} (поиск на {search_epochs} эпох; Apply -> {final_epochs})",
-                objective_label(self.optimize_form.objective())
-            ));
-            egui::ScrollArea::vertical()
-                .max_height(360.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("optimize_rows")
-                        .num_columns(8)
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.label("#");
-                            ui.label("score");
-                            ui.label("R²");
-                            ui.label("worst y");
-                            ui.label("mean y");
-                            ui.label("aggr nRMSE");
-                            ui.label("rel");
-                            ui.label("config");
-                            ui.end_row();
-                            let objective = self.optimize_form.objective();
-                            for (i, row) in self.optimize_rows.iter().enumerate() {
-                                let mark = if i == 0 { "*" } else { "" };
-                                ui.label(format!("{mark}{}", i + 1));
-                                ui.label(format!("{:.5}", objective_display_score(objective, row)));
-                                ui.label(format!("{:.5}", row.r2_mean));
-                                ui.label(format!("{:.5}", row.worst_output_r2_mean));
-                                ui.label(format!("{:.5}", row.mean_output_r2_mean));
-                                ui.label(format!("{:.5}", row.nrmse_mean));
-                                ui.label(format!("{:.1}%", row.rel_mean * 100.0));
-                                ui.label(&row.label);
-                                ui.end_row();
-                            }
-                        });
-                });
-        }
-    }
-
-    pub(super) fn ui_sweep(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Sweep");
-
-        egui::ComboBox::from_label("чёрный ящик")
-            .selected_text(&self.sweep_form.blackbox)
-            .show_ui(ui, |ui| {
-                for &name in BLACKBOXES {
-                    ui.selectable_value(&mut self.sweep_form.blackbox, name.to_string(), name);
-                }
-            });
-
-        ui.separator();
-        egui::Grid::new("sweep_axes")
-            .num_columns(2)
-            .spacing([12.0, 6.0])
-            .show(ui, |ui| {
-                ui.label("seeds");
-                ui.text_edit_singleline(&mut self.sweep_form.seeds);
-                ui.end_row();
-                ui.label("d-models");
-                ui.text_edit_singleline(&mut self.sweep_form.d_models);
-                ui.end_row();
-                ui.label("layers-list");
-                ui.text_edit_singleline(&mut self.sweep_form.layers);
-                ui.end_row();
-                ui.label("d-ffs");
-                ui.text_edit_singleline(&mut self.sweep_form.d_ffs);
-                ui.end_row();
-                ui.label("lrs");
-                ui.text_edit_singleline(&mut self.sweep_form.lrs);
-                ui.end_row();
-                ui.label("value-encoders");
-                ui.text_edit_singleline(&mut self.sweep_form.value_encoders);
-                ui.end_row();
-                ui.label("fourier-scales");
-                ui.text_edit_singleline(&mut self.sweep_form.fourier_scales);
-                ui.end_row();
-                ui.label("fourier-bands");
-                ui.add(egui::DragValue::new(&mut self.sweep_form.fourier_bands).range(1..=64));
-                ui.end_row();
-                ui.label("schedulers");
-                ui.text_edit_singleline(&mut self.sweep_form.schedulers);
-                ui.end_row();
-                ui.label("epochs");
-                ui.add(egui::DragValue::new(&mut self.sweep_form.epochs).range(1..=100000));
-                ui.end_row();
-                ui.label("batch-size");
-                ui.add(egui::DragValue::new(&mut self.sweep_form.batch).range(1..=8192));
-                ui.end_row();
-            });
-
-        // «Своя сетка» уже представлена этими полями. Стоимость должна быть
-        // видна до запуска так же, как у готовых бюджетов Optimize.
-        if let Ok(cost) = self
-            .sweep_form
-            .build()
-            .and_then(|(_, axes)| sweep::sweep_cost(&axes, 1))
-        {
-            ui.label(format!("Оценка: {}", cost.describe()));
-        }
-
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !self.training && !self.sweeping,
-                    egui::Button::new("Run sweep"),
-                )
-                .clicked()
-            {
-                match self.sweep_form.build() {
-                    Ok((blackbox, axes)) => {
-                        self.worker.reset_cancel();
-                        self.worker.send(Command::Sweep { blackbox, axes });
-                    }
-                    Err(e) => self.status = format!("Ошибка: {e}"),
-                }
-            }
-            if ui
-                .add_enabled(self.sweeping, egui::Button::new("Cancel"))
-                .clicked()
-            {
-                self.worker.request_cancel();
-                self.status = "отмена sweep…".to_string();
-            }
-        });
-
-        if let Some((cfgs, runs)) = self.sweep_total {
-            ui.label(format!(
-                "Конфигов: {cfgs}; прогонов: {runs}; готово: {}",
-                self.sweep_rows.len()
-            ));
-        }
-        if self.sweep_cancelled {
-            ui.colored_label(
-                egui::Color32::from_rgb(200, 120, 0),
-                "Sweep отменён; показаны завершённые конфиги.",
-            );
-        }
-
-        if !self.sweep_rows.is_empty() {
-            ui.separator();
-            ui.label(format!(
-                "Источник метрик: {}",
-                epoch_sweep::source_label(self.sweep_rows[0].source)
-            ));
-            egui::ScrollArea::vertical()
-                .max_height(320.0)
-                .show(ui, |ui| {
-                    egui::Grid::new("sweep_rows")
-                        .num_columns(7)
-                        .striped(true)
-                        .show(ui, |ui| {
-                            ui.label("#");
-                            ui.label("worst R²");
-                            ui.label("aggregate R²");
-                            ui.label("std");
-                            ui.label("aggr nRMSE");
-                            ui.label("rel");
-                            ui.label("config");
-                            ui.end_row();
-                            for (i, row) in self.sweep_rows.iter().enumerate() {
-                                let mark = if i == 0 { "*" } else { "" };
-                                ui.label(format!("{mark}{}", i + 1));
-                                ui.label(format!("{:.5}", row.worst_output_r2_mean));
-                                ui.label(format!("{:.5}", row.r2_mean));
-                                ui.label(format!("{:.5}", row.r2_std));
-                                ui.label(format!("{:.5}", row.nrmse_mean));
-                                ui.label(format!("{:.1}%", row.rel_mean * 100.0));
-                                ui.label(&row.label);
-                                ui.end_row();
-                            }
-                        });
-                });
         }
     }
 

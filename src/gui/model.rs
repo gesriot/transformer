@@ -195,9 +195,13 @@ impl App {
         egui::Grid::new("kan_symbolic_metrics")
             .num_columns(2)
             .show(ui, |ui| {
-                match (&result.formula_metrics, result.kan_r2) {
-                    (Some(metrics), Some(kan_r2)) => {
-                        ui.label("R² формул на validation");
+                match (
+                    &result.formula_metrics,
+                    result.kan_r2,
+                    &result.evaluation_label,
+                ) {
+                    (Some(metrics), Some(kan_r2), Some(label)) => {
+                        ui.label(format!("R² формул на {label}"));
                         ui.label(format!("{:.5} (KAN: {kan_r2:.5})", metrics.r2));
                         ui.end_row();
                         ui.label("Ошибка формул");
@@ -207,10 +211,15 @@ impl App {
                             metrics.rel_error * 100.0
                         ));
                         ui.end_row();
+                        if label == "train+validation" {
+                            ui.label("Интерпретация");
+                            ui.label("верность формул финальной модели, не оценка обобщения");
+                            ui.end_row();
+                        }
                     }
                     _ => {
-                        ui.label("Test-метрики");
-                        ui.label("недоступны: модель из checkpoint-а (нет validation-набора)");
+                        ui.label("Сравнение формул с KAN");
+                        ui.label("недоступно: модель из checkpoint-а без набора оценки");
                         ui.end_row();
                     }
                 }
@@ -294,9 +303,14 @@ impl App {
                 "  → underfit: ёмкость или кодирование значений (value encoder / Fourier)"
             });
             ui.label(format!(
-                "Экстраполяция: {} из {} validation-строк вне обученного диапазона",
-                d.extrapolation_rows, d.extrapolation_total
+                "Экстраполяция: {} из {} строк ({}) вне обученного диапазона",
+                d.extrapolation_rows, d.extrapolation_total, d.evaluation_label
             ));
+            if d.evaluation_label == "train+validation" {
+                ui.label(
+                    "Финальная модель обучена на этом наборе: диагностика описывает fit, а не обобщение.",
+                );
+            }
 
             ui.separator();
             ui.label("Остаток по входным признакам:");

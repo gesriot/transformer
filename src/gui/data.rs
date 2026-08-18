@@ -204,7 +204,7 @@ impl App {
             return;
         };
         let mut open = true;
-        let mut close_after_apply = false;
+        let mut applied: Option<(PreparedTable, TableProfile)> = None;
         let mut reopen: Option<(String, bool)> = None;
 
         egui::Window::new("Разметка таблицы")
@@ -363,30 +363,36 @@ impl App {
                     .clicked()
                 {
                     match state.apply() {
-                        Ok(prepared) => {
-                            self.dataset = Some(ActiveDataset::new(
-                                PreparedData {
-                                    origin: DatasetOrigin::Table(prepared.path.clone()),
-                                    data: Arc::clone(&prepared.data),
-                                    schema: prepared.schema.clone(),
-                                },
-                                Some(state.profile.clone()),
-                                prepared.has_header,
-                            ));
-                            self.status = "разметка применена".to_string();
-                            close_after_apply = true;
-                        }
+                        // Датасет ставим после закрытия окна: внутри замыкания
+                        // `self` уже занят состоянием диалога.
+                        Ok(prepared) => applied = Some((prepared, state.profile.clone())),
                         Err(e) => state.apply_error = Some(e),
                     }
                 }
             });
 
-        if let Some((path, has_header)) = reopen {
+        if let Some((prepared, profile)) = applied {
+            // Датасет ставим после закрытия окна: внутри замыкания `self` уже
+            // занят состоянием диалога.
+            let revision = self.next_revision();
+            self.set_dataset(ActiveDataset::new(
+                PreparedData {
+                    origin: DatasetOrigin::Table(prepared.path.clone()),
+                    data: Arc::clone(&prepared.data),
+                    schema: prepared.schema.clone(),
+                },
+                Some(profile),
+                prepared.has_header,
+                revision,
+            ));
+            self.status = "разметка применена".to_string();
+            self.markup = None;
+        } else if let Some((path, has_header)) = reopen {
             // Старую интерпретацию больше нельзя применить, пока worker читает
             // файл заново с другой семантикой первой строки.
             self.markup = None;
             self.open_table(path, has_header);
-        } else if !open || close_after_apply {
+        } else if !open {
             self.markup = None;
         }
     }
@@ -517,6 +523,7 @@ mod tests {
             },
             Some(state.profile.clone()),
             prepared.has_header,
+            1,
         );
 
         assert_eq!(active.prepared.data.inputs.dim(), (2, 2));

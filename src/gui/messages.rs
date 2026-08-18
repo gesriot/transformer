@@ -8,11 +8,12 @@ use crate::markup::TableProfile;
 use crate::metrics::Metrics;
 use crate::numeric_model::{ModelKind, NumericConfig};
 use crate::schema::ModelSchema;
-use crate::split::SplitPlan;
+use crate::split::{FinalEval, SplitPlan};
 use crate::sweep::{SweepAxes, SweepObjective, SweepRow};
 use crate::table::Table;
 use crate::tnum::PrepareSpec;
 use crate::train::{TextTrainConfig, TrainConfig};
+use crate::training::Phase;
 use std::sync::Arc;
 
 /// Откуда взялся активный набор данных.
@@ -65,6 +66,8 @@ pub struct DiagnosticsResult {
     pub overfit_loss: f32,
     pub extrapolation_rows: usize,
     pub extrapolation_total: usize,
+    /// Набор, на котором считались остатки и экстраполяция.
+    pub evaluation_label: String,
     /// На признак: (доля смен знака остатка, tail/inner).
     pub residuals: Vec<(f32, f32)>,
     /// (среднее, макс) чувствительности — только для blackbox.
@@ -95,9 +98,12 @@ pub struct KanSymbolicInfo {
     pub formulas: String,
     pub min_edge_r2: f32,
     pub mean_edge_r2: f32,
-    /// Метрики формул на validation: `None` у модели из checkpoint-а.
+    /// Метрики формул на доступном наборе: `None` у модели из checkpoint-а.
     pub formula_metrics: Option<Metrics>,
     pub kan_r2: Option<f32>,
+    /// Набор для сравнения формулы с KAN. У финальной модели это
+    /// train+validation, поэтому такая метрика описывает fidelity, не обобщение.
+    pub evaluation_label: Option<String>,
     pub weak_edges: Vec<KanWeakEdge>,
 }
 
@@ -113,6 +119,9 @@ pub enum Command {
         split: SplitPlan,
         nc: NumericConfig,
         tcfg: TrainConfig,
+        /// Переобучить выбранную конфигурацию на train+validation и один раз
+        /// открыть test. Запрашивается только для финального обучения.
+        final_phase: bool,
     },
     LoadModel(String),
     SaveModel(String),
@@ -129,11 +138,9 @@ pub enum Command {
     },
     ExtractKanSymbolic,
     Diagnose,
-    Sweep {
-        blackbox: String,
-        axes: SweepAxes,
-    },
-    Optimize {
+    /// Поиск конфигурации по активному набору данных. Единственная команда
+    /// поиска: отдельный blackbox-перебор обходил активный датасет стороной.
+    Search {
         data: PreparedData,
         split: SplitPlan,
         axes: SweepAxes,
@@ -184,12 +191,17 @@ pub enum Event {
         parameter_count: usize,
     },
     Epoch {
+        phase: Phase,
         epoch: usize,
         loss: f32,
     },
-    /// Завершение обучения: `Some` — метрики на validation, `None` — отменено.
+    /// Завершение обучения. У development есть validation-метрики, у refit —
+    /// финальный test; отмена помечается отдельно, чтобы не смешивать случаи.
     TrainDone {
         metrics: Option<Metrics>,
+        /// Единственный замер на test: есть только у финального обучения.
+        final_eval: Option<FinalEval>,
+        cancelled: bool,
     },
     /// Набор данных открыт и готов к работе.
     DatasetOpened {
@@ -236,25 +248,14 @@ pub enum Event {
     Diagnostics {
         result: DiagnosticsResult,
     },
-    SweepStarted {
+    SearchStarted {
         total_configs: usize,
         total_runs: usize,
     },
-    SweepRow {
+    SearchRow {
         row: SweepRow,
     },
-    SweepDone {
-        rows: Vec<SweepRow>,
-        cancelled: bool,
-    },
-    OptimizeStarted {
-        total_configs: usize,
-        total_runs: usize,
-    },
-    OptimizeRow {
-        row: SweepRow,
-    },
-    OptimizeDone {
+    SearchDone {
         rows: Vec<SweepRow>,
         cancelled: bool,
     },
