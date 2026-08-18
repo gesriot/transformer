@@ -2,8 +2,13 @@
 //! Запуск: `transformer gui`. Окно + worker-поток; всё ML-состояние (Rc !Send)
 //! живёт в worker-потоке, UI общается с ним каналами.
 
-mod app;
+mod data;
+mod demo;
 mod messages;
+mod model;
+mod predict;
+mod session;
+mod train;
 mod worker;
 
 /// Поднимает нативное окно egui (блокирует поток до закрытия).
@@ -18,7 +23,7 @@ pub fn run_gui() -> eframe::Result<()> {
     eframe::run_native(
         "Transformer",
         options,
-        Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
+        Box::new(|cc| Ok(Box::new(session::App::new(cc)))),
     )
 }
 
