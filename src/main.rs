@@ -24,12 +24,13 @@ use transformer::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
 use transformer::epoch_sweep;
 use transformer::generate::generate;
 use transformer::init::set_init_seed;
+use transformer::interpret::{self, InterpretOverrides, InterpretProfile};
 use transformer::metrics::{evaluate, Metrics};
 use transformer::numeric_model::{
     validate_numeric, KanConfig, ModelKind, NumericConfig, NumericModel,
 };
 use transformer::schema::ModelSchema;
-use transformer::serialize::{calibration_sample, load_numeric, load_numeric_full, save_numeric};
+use transformer::serialize::{calibration_sample, load_numeric_full, save_numeric};
 use transformer::split::{
     SplitPlan, DEFAULT_DATA_SEED, DEFAULT_FINAL_INIT_SEED, DEFAULT_SPLIT_SEED,
 };
@@ -87,7 +88,7 @@ const NUMERIC_FLAGS: &[&str] = &[
 ];
 
 /// Булевы флаги (без значения).
-const NUMERIC_BOOL_FLAGS: &[&str] = &["diagnose", "kan-symbolic", "kan-compact"];
+const NUMERIC_BOOL_FLAGS: &[&str] = &["diagnose", "kan-symbolic", "kan-compact", "interpret"];
 
 /// Флаги подкоманды prepare (таблица -> .tnum).
 const PREPARE_FLAGS: &[&str] = &["inputs", "outputs", "delimiter", "categorical"];
@@ -270,54 +271,37 @@ fn numeric_config_from(f: &Flags) -> Result<NumericConfig, String> {
     Ok(nc)
 }
 
-/// Разрежение KAN: activation-L1 при обучении и/или hard-prune + fine-tune.
-struct KanSparsity {
-    l1: f32,
-    prune: Option<f32>,
-    finetune_epochs: usize,
-}
-
-/// Разбор `--kan-l1 / --kan-prune / --kan-finetune-epochs`. `None` — флаги не
-/// заданы; заданные при не-KAN модели — ошибка (не молчаливое игнорирование).
-fn kan_sparsity_from(f: &Flags, nc: &NumericConfig) -> Result<Option<KanSparsity>, String> {
-    let l1 = f.f32("kan-l1")?;
-    let prune = f.f32("kan-prune")?;
-    let finetune = f.usize("kan-finetune-epochs")?;
-    if l1.is_none() && prune.is_none() && finetune.is_none() {
+/// Разбор конвейера интерпретации: `--interpret` задаёт профиль, явные
+/// `--kan-*` его переопределяют. Флаги при не-KAN модели — ошибка, а не
+/// молчаливое игнорирование.
+fn interpret_from(f: &Flags, nc: &NumericConfig) -> Result<Option<InterpretProfile>, String> {
+    let overrides = InterpretOverrides {
+        l1: f.f32("kan-l1")?,
+        prune: f.f32("kan-prune")?,
+        finetune_epochs: f.usize("kan-finetune-epochs")?,
+        compact: f.has("kan-compact").then_some(true),
+    };
+    let use_profile = f.has("interpret");
+    if !use_profile && overrides.is_empty() {
         return Ok(None);
     }
     if nc.kind != ModelKind::Kan {
         return Err(
-            "--kan-l1/--kan-prune/--kan-finetune-epochs применимы только к --model-kind kan"
+            "--interpret и --kan-l1/--kan-prune/--kan-finetune-epochs/--kan-compact \
+             применимы только к --model-kind kan"
                 .to_string(),
         );
     }
-    let l1 = l1.unwrap_or(0.0);
-    if !l1.is_finite() || l1 < 0.0 {
-        return Err("--kan-l1 должен быть конечным и >= 0".to_string());
-    }
-    if let Some(p) = prune {
-        if !p.is_finite() || !(0.0..1.0).contains(&p) {
-            return Err("--kan-prune (отн. порог важности) должен быть в [0, 1)".to_string());
-        }
-    }
-    if finetune.is_some() && prune.is_none() {
-        return Err("--kan-finetune-epochs имеет смысл только вместе с --kan-prune".to_string());
-    }
-    Ok(Some(KanSparsity {
-        l1,
-        prune,
-        finetune_epochs: finetune.unwrap_or(10).max(1),
-    }))
+    interpret::resolve(use_profile, &overrides).map_err(|e| format!("конвейер интерпретации: {e}"))
 }
 
 /// Включает activation-L1 на построенной модели (до обучения).
-fn apply_kan_l1(model: &NumericModel, sparsity: &Option<KanSparsity>) {
-    if let Some(s) = sparsity {
+fn apply_kan_l1(model: &NumericModel, profile: &Option<InterpretProfile>) {
+    if let Some(s) = profile {
         if s.l1 > 0.0 {
             model
                 .as_kan()
-                .expect("kan_sparsity_from гарантирует kind=Kan")
+                .expect("interpret_from гарантирует kind=Kan")
                 .set_l1_lambda(s.l1);
             println!("KAN activation-L1: λ={}", s.l1);
         }
@@ -520,6 +504,7 @@ fn print_usage() {
     eprintln!("  флаги: --d-model --heads --layers --d-ff --lr --batch-size --seed");
     eprintln!("         --model-kind transformer|mlp|kan --mlp-width --mlp-layers");
     eprintln!("         --kan-width --kan-layers --kan-grid");
+    eprintln!("         --interpret (профиль KAN: L1 → prune → fine-tune → compact)");
     eprintln!("         --kan-l1 <λ> --kan-prune <отн. порог> --kan-finetune-epochs <N>");
     eprintln!("         --kan-symbolic (извлечь формулы из обученной KAN)");
     eprintln!("         --kan-compact (физически удалить мёртвые узлы после прунинга)");
@@ -667,12 +652,14 @@ fn run_numeric_flow(
 
     print_config(&nc, &tcfg);
     warn_categorical_without_embedding(&nc, dataset.schema());
-    let sparsity = kan_sparsity_from(f, &nc).unwrap_or_else(|e| fail(&e));
+    let interpret = interpret_from(f, &nc).unwrap_or_else(|e| fail(&e));
+    if let Some(profile) = &interpret {
+        println!("Конвейер интерпретации {}", profile.describe());
+    }
     validate_kan_symbolic(f, &nc).unwrap_or_else(|e| fail(&e));
 
     let setup = TrainingSetup::new(nc.clone(), tcfg.clone());
     let never = std::sync::atomic::AtomicBool::new(false);
-    let compact = f.has("kan-compact");
     let final_tcfg = TrainConfig {
         seed: DEFAULT_FINAL_INIT_SEED,
         ..tcfg.clone()
@@ -704,7 +691,7 @@ fn run_numeric_flow(
                 ),
             }
             println!("Параметров: {}", model.parameter_count());
-            apply_kan_l1(model, &sparsity);
+            apply_kan_l1(model, &interpret);
         },
         &mut |phase, trained, train_data, eval| {
             // Один и тот же конвейер в обеих фазах: иначе сохранённая модель
@@ -713,7 +700,7 @@ fn run_numeric_flow(
                 Phase::Development => &tcfg,
                 Phase::Final => &final_tcfg,
             };
-            apply_kan_pipeline(trained, train_data, eval, &sparsity, compact, phase_tcfg);
+            apply_kan_pipeline(trained, train_data, eval, &interpret, phase_tcfg);
         },
     )
     .unwrap_or_else(|e| fail(&e));
@@ -770,10 +757,9 @@ fn run_numeric_flow(
             path,
             &nc,
             dataset.schema(),
-            &final_model.model,
-            &final_model.in_norm,
-            &final_model.out_norm,
+            &final_model,
             &pool,
+            interpret.as_ref(),
         );
     }
 }
@@ -784,12 +770,11 @@ fn apply_kan_pipeline(
     trained: &mut TrainedModel,
     train_data: &NumericDataset,
     eval: Option<&NumericDataset>,
-    sparsity: &Option<KanSparsity>,
-    compact: bool,
+    profile: &Option<InterpretProfile>,
     tcfg: &TrainConfig,
 ) {
-    if let Some(threshold) = sparsity.as_ref().and_then(|s| s.prune) {
-        let ft = sparsity.as_ref().map_or(10, |s| s.finetune_epochs);
+    if let Some(threshold) = profile.as_ref().and_then(|p| p.prune) {
+        let ft = profile.as_ref().map_or(10, |p| p.finetune_epochs);
         run_kan_prune(
             &trained.model,
             train_data,
@@ -801,7 +786,7 @@ fn apply_kan_pipeline(
             ft,
         );
     }
-    if compact {
+    if profile.is_some_and(|p| p.compact) {
         run_kan_compact(
             &mut trained.model,
             eval,
@@ -870,11 +855,12 @@ fn save_and_verify(
     path: &str,
     nc: &NumericConfig,
     schema: &ModelSchema,
-    model: &NumericModel,
-    in_norm: &Normalizer,
-    out_norm: &Normalizer,
+    trained: &TrainedModel,
     pool: &NumericDataset,
+    interpret: Option<&InterpretProfile>,
 ) {
+    // Модель и её нормализаторы врозь бессмысленны, поэтому едут вместе.
+    let (model, in_norm, out_norm) = (&trained.model, &trained.in_norm, &trained.out_norm);
     // Калибровка (выборка сырых обучающих строк) едет в checkpoint: symbolic
     // extraction остаётся доступной после загрузки .bin.
     let calibration = calibration_sample(&pool.inputs, 256);
@@ -886,13 +872,24 @@ fn save_and_verify(
         in_norm,
         out_norm,
         Some(&calibration),
+        interpret,
     )
     .expect("сохранение модели");
     // Проверка целостности файла, а не качества: test уже потрачен, поэтому
     // сравниваем предсказания загруженной модели с исходной на тех же данных.
-    let (loaded, in2, out2) = load_numeric(path).expect("загрузка модели");
+    let checkpoint = load_numeric_full(path).expect("загрузка модели");
+    assert_eq!(
+        checkpoint.interpret,
+        interpret.copied(),
+        "checkpoint изменил профиль интерпретации при сохранении"
+    );
     let before = predict_dataset(model, pool, in_norm, out_norm);
-    let after = predict_dataset(&loaded, pool, &in2, &out2);
+    let after = predict_dataset(
+        &checkpoint.model,
+        pool,
+        &checkpoint.in_norm,
+        &checkpoint.out_norm,
+    );
     let max_diff = before
         .iter()
         .zip(after.iter())
@@ -1094,6 +1091,7 @@ fn run_epoch_sweep_cmd(args: &[String]) {
         "kan-finetune-epochs",
         "kan-symbolic",
         "kan-compact",
+        "interpret",
     ] {
         if f.has(k) {
             fail(&format!("--{k} не поддерживается в epoch-sweep"));

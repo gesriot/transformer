@@ -11,6 +11,7 @@ pub mod generate;
 pub mod gui;
 pub mod heads;
 pub mod init;
+pub mod interpret;
 pub mod kan;
 pub mod loss;
 pub mod markup;

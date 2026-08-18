@@ -130,9 +130,31 @@ data
 ./target/release/transformer numeric-file train.tnum \
   --model-kind kan --kan-width 16 --kan-layers 2 --kan-grid 16 \
   --lr 3e-3 --epochs 80 --seed 0 \
-  --kan-l1 1e-3 --kan-prune 0.05 --kan-finetune-epochs 20 \
-  --kan-compact --kan-symbolic --model model-kan.bin
+  --interpret --kan-symbolic --model model-kan.bin
 ```
+
+`--interpret` — это **версионируемый профиль** конвейера, а не непрозрачная
+галочка. Он задаёт четыре параметра (`L1 1e-3`, `prune 0.05`, `fine-tune 20`,
+структурное сжатие), печатает их фактические значения перед запуском и
+сохраняет их в checkpoint отдельной секцией: через полгода видно, с каким
+порогом модель стала такой.
+
+Явные флаги **переопределяют** профиль:
+
+```bash
+--interpret --kan-prune 0.3 --kan-finetune-epochs 3
+# Конвейер интерпретации v1: L1 0.001, prune 0.3, fine-tune 3 эпох, структурное сжатие
+```
+
+Без `--interpret` работают только перечисленные флаги — как раньше:
+
+```bash
+--kan-l1 1e-4
+# Конвейер интерпретации v1: L1 0.0001, без прунинга
+```
+
+`--kan-symbolic` в профиль **не входит**: формулы считаются лениво, по запросу,
+и обучение не меняют.
 
 Фазы выполняются в таком порядке:
 
@@ -269,7 +291,7 @@ test. После смены набора прежний поиск очищае�
 ```
 
 `epoch-sweep` пишет `runs/epoch_sweep_results.csv` и печатает sparklines
-loss/R². KAN-операции `--kan-l1`, `--kan-prune`, `--kan-finetune-epochs`,
+loss/R². KAN-операции `--interpret`, `--kan-l1`, `--kan-prune`, `--kan-finetune-epochs`,
 `--kan-compact` и `--kan-symbolic` намеренно не поддерживаются внутри
 epoch-sweep: это разные фазы final-training, которые нельзя молча смешивать с
 поиском числа эпох.

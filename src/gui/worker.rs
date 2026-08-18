@@ -16,6 +16,7 @@ use crate::data::{Normalizer, NumericDataset, OutOfRange, TextDataset};
 use crate::encoders::FeatureSpec;
 use crate::generate::generate;
 use crate::init::set_init_seed;
+use crate::interpret::InterpretProfile;
 use crate::markup::TableProfile;
 use crate::metrics::evaluate;
 use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
@@ -103,6 +104,10 @@ struct Loaded {
     out_norm: Normalizer,
     n_inputs: usize,
     n_outputs: usize,
+    /// Разрешённый профиль уже применённого конвейера. У обученной пока в GUI
+    /// модели его нет; у загруженной модели переносится при повторном
+    /// сохранении, чтобы GUI не стирал происхождение checkpoint-а.
+    interpret: Option<InterpretProfile>,
     /// Данные обучения для диагностики (`None` для загруженной `.bin`).
     diag: Option<DiagData>,
     /// Калибровочная выборка сырых train-входов: у загруженного checkpoint-а
@@ -560,6 +565,7 @@ fn load_model(path: &str) -> Result<Loaded, String> {
         out_norm: checkpoint.out_norm,
         n_inputs,
         n_outputs,
+        interpret: checkpoint.interpret,
         diag: None, // у загруженной .bin нет данных обучения
         calibration: checkpoint.calibration,
     })
@@ -574,6 +580,7 @@ fn save_model(loaded: &Loaded, path: &str) -> Result<(), String> {
         &loaded.in_norm,
         &loaded.out_norm,
         loaded.calibration.as_ref(),
+        loaded.interpret.as_ref(),
     )
     .map_err(|e| format!("сохранение {path}: {e}"))
 }
@@ -1051,6 +1058,7 @@ fn train_numeric(
         out_norm,
         n_inputs,
         n_outputs: n_out,
+        interpret: None,
         diag: Some(DiagData {
             nc: nc.clone(),
             origin: prepared.origin.clone(),
@@ -1248,6 +1256,7 @@ mod tests {
             out_norm,
             n_inputs: train.inputs.ncols(),
             n_outputs: train.outputs.ncols(),
+            interpret: None,
             diag: Some(DiagData {
                 nc: config,
                 origin: DatasetOrigin::Blackbox("sum".to_string()),
@@ -1268,6 +1277,56 @@ mod tests {
         assert!(result.kan_r2.expect("R² KAN есть").is_finite());
         assert_eq!(result.evaluation_label.as_deref(), Some("validation"));
         assert!(result.weak_edges.iter().all(|edge| edge.r2 < 0.99));
+    }
+
+    #[test]
+    fn gui_resave_preserves_interpret_profile() {
+        let config = NumericConfig {
+            kind: ModelKind::Kan,
+            transformer: ModelConfig::default(),
+            value: ValueEncoderConfig::default(),
+            mlp_width: 16,
+            mlp_layers: 1,
+            kan: KanConfig {
+                width: 4,
+                layers: 1,
+                grid: 5,
+            },
+        };
+        let data = blackbox::sum().generate(16, 0);
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let specs = schema.feature_specs();
+        let (in_norm, out_norm) = fit_normalizers(&data, &specs);
+        let profile = InterpretProfile::v1();
+        let loaded = Loaded {
+            model: config.build(&specs, 1),
+            nc: config,
+            schema,
+            in_norm,
+            out_norm,
+            n_inputs: 2,
+            n_outputs: 1,
+            interpret: Some(profile),
+            diag: None,
+            calibration: None,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "transformer_gui_interpret_resave_{}.bin",
+            std::process::id()
+        ));
+        let resaved_path = std::env::temp_dir().join(format!(
+            "transformer_gui_interpret_resave_copy_{}.bin",
+            std::process::id()
+        ));
+
+        save_model(&loaded, path.to_str().unwrap()).unwrap();
+        let reloaded = load_model(path.to_str().unwrap()).unwrap();
+        save_model(&reloaded, resaved_path.to_str().unwrap()).unwrap();
+        let resaved = load_model(resaved_path.to_str().unwrap()).unwrap();
+
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(resaved_path).ok();
+        assert_eq!(resaved.interpret, Some(profile));
     }
 
     #[test]

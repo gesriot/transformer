@@ -34,8 +34,7 @@ cargo build --release --no-default-features
 ./target/release/transformer numeric-file data.tnum \
   --model-kind kan --kan-width 16 --kan-layers 2 --kan-grid 16 \
   --lr 3e-3 --epochs 80 --seed 0 \
-  --kan-l1 1e-3 --kan-prune 0.05 --kan-finetune-epochs 20 \
-  --kan-compact --kan-symbolic --model model-kan.bin
+  --interpret --kan-symbolic --model model-kan.bin
 ```
 
 Пайплайн KAN: обучение → activation-L1 → hard-prune → fine-tune → structural

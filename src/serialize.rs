@@ -12,6 +12,7 @@
 use crate::config::ModelConfig;
 use crate::data::{Normalizer, Vocab};
 use crate::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
+use crate::interpret::{InterpretProfile, INTERPRET_PROFILE_VERSION};
 use crate::numeric_model::{KanConfig, ModelKind, NumericConfig, NumericModel};
 use crate::schema::{Column, ColumnRole, ColumnType, ModelSchema};
 use crate::tensor::Tensor;
@@ -51,6 +52,7 @@ const SURROGATE_SECTIONS: &[&str] = &[
     "meta",
     "feature_specs",
     "schema",
+    "interpret",
     "params",
     "kan_masks",
     "kan_dims",
@@ -69,6 +71,9 @@ pub struct NumericCheckpoint {
     /// Схема данных. У старых checkpoint-ов достраивается синтетически из
     /// сохранённых `feature_specs`, поэтому поле есть всегда.
     pub schema: ModelSchema,
+    /// Какой конвейер интерпретации применён. `None` — не применялся или
+    /// checkpoint старый.
+    pub interpret: Option<InterpretProfile>,
     /// Выборка СЫРЫХ train-входов — калибровка для symbolic extraction
     /// после загрузки. `None` у старых checkpoint-ов.
     pub calibration: Option<Array2<f32>>,
@@ -446,6 +451,56 @@ fn read_schema(bytes: &[u8]) -> io::Result<ModelSchema> {
     ModelSchema::new(columns, outputs).map_err(invalid)
 }
 
+/// Секция `interpret`: какой конвейер интерпретации получила эта модель.
+///
+/// Пишутся РАЗРЕШЁННЫЕ значения, а не «был профиль»: иначе через полгода не
+/// восстановить, с каким порогом прунинга модель стала такой.
+fn build_interpret(profile: &InterpretProfile) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(&profile.version.to_le_bytes());
+    p.extend_from_slice(&profile.l1.to_le_bytes());
+    // Прунинг может отсутствовать, поэтому у него отдельный флаг наличия.
+    p.extend_from_slice(&u32::from(profile.prune.is_some()).to_le_bytes());
+    p.extend_from_slice(&profile.prune.unwrap_or(0.0).to_le_bytes());
+    p.extend_from_slice(&(profile.finetune_epochs as u64).to_le_bytes());
+    p.extend_from_slice(&u32::from(profile.compact).to_le_bytes());
+    p
+}
+
+fn read_interpret(bytes: &[u8]) -> io::Result<InterpretProfile> {
+    let mut r = bytes;
+    let version = r_u32(&mut r)?;
+    if version != INTERPRET_PROFILE_VERSION {
+        return Err(invalid(format!(
+            "interpret: версия профиля {version} не поддерживается (ожидалась {INTERPRET_PROFILE_VERSION})"
+        )));
+    }
+    let l1 = r_f32(&mut r)?;
+    let has_prune = r_u32(&mut r)?;
+    if has_prune > 1 {
+        return Err(invalid("interpret: has_prune должен быть 0 или 1"));
+    }
+    let prune_value = r_f32(&mut r)?;
+    let finetune_epochs = usize::try_from(r_u64(&mut r)?)
+        .map_err(|_| invalid("interpret: число эпох не помещается в usize"))?;
+    let compact = r_u32(&mut r)?;
+    if compact > 1 {
+        return Err(invalid("interpret: compact должен быть 0 или 1"));
+    }
+    if !r.is_empty() {
+        return Err(invalid("interpret: лишние байты в секции"));
+    }
+    let profile = InterpretProfile {
+        version,
+        l1,
+        prune: (has_prune != 0).then_some(prune_value),
+        finetune_epochs,
+        compact: compact != 0,
+    };
+    profile.validate().map_err(invalid)?;
+    Ok(profile)
+}
+
 fn build_norm(n: &Normalizer) -> Vec<u8> {
     let mut p = Vec::new();
     for vec in [&n.mean, &n.std, &n.min, &n.max] {
@@ -718,6 +773,7 @@ fn validate_checkpoint_components(
 ///
 /// Схема заменила пару «спецификации + число выходов» в сигнатуре: и то и
 /// другое из неё выводится, а рассогласовать их больше нельзя.
+#[allow(clippy::too_many_arguments)]
 pub fn save_numeric(
     path: &str,
     nc: &NumericConfig,
@@ -726,6 +782,7 @@ pub fn save_numeric(
     in_norm: &Normalizer,
     out_norm: &Normalizer,
     calibration: Option<&Array2<f32>>,
+    interpret: Option<&InterpretProfile>,
 ) -> io::Result<()> {
     let specs = validate_checkpoint_components(nc, schema, model, in_norm, out_norm)?;
     let num_outputs = schema.n_outputs();
@@ -743,6 +800,13 @@ pub fn save_numeric(
     ];
     // Маски — не обучаемые параметры и не должны раздувать parameter_count,
     // но фиксируют hard-prune при последующем fine-tune из checkpoint-а.
+    if let Some(profile) = interpret {
+        if nc.kind != ModelKind::Kan {
+            return Err(invalid("interpret допустим только у KAN checkpoint-а"));
+        }
+        profile.validate().map_err(invalid)?;
+        sections.push(("interpret", build_interpret(profile)));
+    }
     if let Some(masks) = model.kan_masks() {
         sections.push(("kan_masks", build_params(&masks)?));
     }
@@ -842,6 +906,13 @@ pub fn load_numeric_full(path: &str) -> io::Result<NumericCheckpoint> {
             .ok_or_else(|| invalid("kan_masks есть у не-KAN checkpoint-а"))?;
         load_params(bytes, &masks)?;
     }
+    let interpret = match secs.get("interpret") {
+        Some(bytes) => Some(read_interpret(bytes)?),
+        None => None,
+    };
+    if interpret.is_some() && nc.kind != ModelKind::Kan {
+        return Err(invalid("interpret есть у не-KAN checkpoint-а"));
+    }
     let calibration = if nc.kind == ModelKind::Kan {
         match secs.get("calibration") {
             Some(bytes) => {
@@ -866,6 +937,7 @@ pub fn load_numeric_full(path: &str) -> io::Result<NumericCheckpoint> {
         out_norm,
         config: nc,
         schema,
+        interpret,
         calibration,
     })
 }
@@ -958,7 +1030,7 @@ mod tests {
         let before = model.predict(&x).data();
 
         let path = tmp_path(name);
-        save_numeric(&path, &nc, &schema, &model, &in_norm, &out_norm, None).unwrap();
+        save_numeric(&path, &nc, &schema, &model, &in_norm, &out_norm, None, None).unwrap();
         let (loaded, _in2, _out2) = load_numeric(&path).unwrap();
         let after = loaded.predict(&x).data();
         let full = load_numeric_full(&path).unwrap();
@@ -1032,6 +1104,7 @@ mod tests {
             &in_norm,
             &out_norm,
             Some(&data.inputs),
+            None,
         )
         .unwrap();
         assert!(load_numeric_full(&path).unwrap().calibration.is_none());
@@ -1067,7 +1140,7 @@ mod tests {
         let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
 
         let path = tmp_path("surr_schema.bin");
-        save_numeric(&path, &nc, &schema, &model, &in_norm, &out_norm, None).unwrap();
+        save_numeric(&path, &nc, &schema, &model, &in_norm, &out_norm, None, None).unwrap();
 
         // Симуляция старого reader-а: в списке известных секций schema нет,
         // но все прежние обязательные секции остаются читаемыми.
@@ -1100,6 +1173,191 @@ mod tests {
         );
         assert_eq!(checkpoint.schema.n_outputs(), 1);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Конвейер интерпретации сохраняется РАЗРЕШЁННЫМИ значениями: через
+    /// полгода должно быть видно, с каким порогом модель стала такой.
+    #[test]
+    fn interpret_profile_round_trip() {
+        let nc = numeric_cfg(ModelKind::Kan);
+        let specs = vec![FeatureSpec::Continuous, FeatureSpec::Continuous];
+        let schema = ModelSchema::synthetic_from_specs(&specs, 1).unwrap();
+        let model = nc.build(&specs, 1);
+        let data = blackbox::sum().generate(8, 0);
+        let in_norm = Normalizer::fit(&data.inputs, &specs);
+        let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
+
+        let profile = InterpretProfile {
+            version: INTERPRET_PROFILE_VERSION,
+            l1: 2e-3,
+            prune: Some(0.1),
+            finetune_epochs: 7,
+            compact: false,
+        };
+        let path = tmp_path("surr_interpret.bin");
+        save_numeric(
+            &path,
+            &nc,
+            &schema,
+            &model,
+            &in_norm,
+            &out_norm,
+            None,
+            Some(&profile),
+        )
+        .unwrap();
+        let checkpoint = load_numeric_full(&path).unwrap();
+        assert_eq!(checkpoint.interpret, Some(profile));
+
+        // Reader старой версии не знает секцию interpret, но пропускает её и
+        // продолжает читать все прежние обязательные секции.
+        let mut legacy_reader = BufReader::new(File::open(&path).unwrap());
+        r_header(&mut legacy_reader, KIND_SURROGATE).unwrap();
+        let legacy_sections = read_sections(
+            &mut legacy_reader,
+            &[
+                "config",
+                "meta",
+                "feature_specs",
+                "schema",
+                "params",
+                "kan_masks",
+                "kan_dims",
+                "calibration",
+                "in_norm",
+                "out_norm",
+            ],
+        )
+        .unwrap();
+        assert!(!legacy_sections.contains_key("interpret"));
+        assert!(legacy_sections.contains_key("params"));
+
+        // Без конвейера секции нет, и это не ошибка.
+        let plain = tmp_path("surr_interpret_none.bin");
+        save_numeric(
+            &plain, &nc, &schema, &model, &in_norm, &out_norm, None, None,
+        )
+        .unwrap();
+        assert_eq!(load_numeric_full(&plain).unwrap().interpret, None);
+
+        // Профиль без прунинга: флаг наличия переживает round-trip.
+        let no_prune = InterpretProfile {
+            prune: None,
+            ..profile
+        };
+        let third = tmp_path("surr_interpret_no_prune.bin");
+        save_numeric(
+            &third,
+            &nc,
+            &schema,
+            &model,
+            &in_norm,
+            &out_norm,
+            None,
+            Some(&no_prune),
+        )
+        .unwrap();
+        assert_eq!(load_numeric_full(&third).unwrap().interpret, Some(no_prune));
+
+        for p in [path, plain, third] {
+            std::fs::remove_file(&p).ok();
+        }
+    }
+
+    /// Чужая версия профиля читаться не должна: «интерпретируемая KAN» обязана
+    /// означать одно и то же.
+    #[test]
+    fn unknown_interpret_version_is_rejected() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&99u32.to_le_bytes());
+        bytes.extend_from_slice(&0.001f32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0.05f32.to_le_bytes());
+        bytes.extend_from_slice(&20u64.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        let err = read_interpret(&bytes).unwrap_err();
+        assert!(err.to_string().contains("версия профиля 99"), "{err}");
+
+        // Обрезанная секция — тоже ошибка, а не молчаливые нули.
+        assert!(read_interpret(&bytes[..6]).is_err());
+
+        // Поля-флаги имеют каноническое представление, другие значения не
+        // должны молча трактоваться как true.
+        let mut invalid_bool = build_interpret(&InterpretProfile::v1());
+        invalid_bool[8..12].copy_from_slice(&2u32.to_le_bytes());
+        assert!(read_interpret(&invalid_bool).is_err());
+        invalid_bool = build_interpret(&InterpretProfile::v1());
+        invalid_bool[24..28].copy_from_slice(&2u32.to_le_bytes());
+        assert!(read_interpret(&invalid_bool).is_err());
+    }
+
+    #[test]
+    fn interpret_metadata_is_only_saved_for_supported_kan_profile() {
+        let nc = numeric_cfg(ModelKind::Mlp);
+        let specs = vec![FeatureSpec::Continuous, FeatureSpec::Continuous];
+        let schema = ModelSchema::synthetic_from_specs(&specs, 1).unwrap();
+        let model = nc.build(&specs, 1);
+        let data = blackbox::sum().generate(8, 0);
+        let in_norm = Normalizer::fit(&data.inputs, &specs);
+        let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
+        let path = tmp_path("surr_interpret_mlp.bin");
+        std::fs::remove_file(&path).ok();
+
+        let err = save_numeric(
+            &path,
+            &nc,
+            &schema,
+            &model,
+            &in_norm,
+            &out_norm,
+            None,
+            Some(&InterpretProfile::v1()),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("только у KAN"), "{err}");
+
+        // Внешний файл может обойти writer: reader обязан независимо
+        // отвергнуть ту же невозможную комбинацию.
+        write_file(
+            &path,
+            KIND_SURROGATE,
+            &[
+                ("config", build_numeric_config(&nc)),
+                ("meta", build_meta_surrogate(1)),
+                ("feature_specs", build_specs(&specs)),
+                ("schema", build_schema(&schema)),
+                ("params", build_params(&model.parameters()).unwrap()),
+                ("in_norm", build_norm(&in_norm)),
+                ("out_norm", build_norm(&out_norm)),
+                ("interpret", build_interpret(&InterpretProfile::v1())),
+            ],
+        )
+        .unwrap();
+        let err = load_numeric_full(&path)
+            .err()
+            .expect("файл должен отвергаться");
+        assert!(err.to_string().contains("не-KAN"), "{err}");
+        std::fs::remove_file(&path).ok();
+
+        let unsupported = InterpretProfile {
+            version: 99,
+            ..InterpretProfile::v1()
+        };
+        let kan = numeric_cfg(ModelKind::Kan);
+        let kan_model = kan.build(&specs, 1);
+        let err = save_numeric(
+            &path,
+            &kan,
+            &schema,
+            &kan_model,
+            &in_norm,
+            &out_norm,
+            None,
+            Some(&unsupported),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("версия профиля 99"), "{err}");
+        assert!(!std::path::Path::new(&path).exists());
     }
 
     /// Checkpoint без секции `schema` (старый файл) читается и получает
@@ -1240,12 +1498,19 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         let wrong_dims = ModelSchema::synthetic(3, 1).unwrap();
-        assert!(
-            save_numeric(&path, &nc, &wrong_dims, &model, &in_norm, &out_norm, None)
-                .unwrap_err()
-                .to_string()
-                .contains("интерфейс модели")
-        );
+        assert!(save_numeric(
+            &path,
+            &nc,
+            &wrong_dims,
+            &model,
+            &in_norm,
+            &out_norm,
+            None,
+            None
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("интерфейс модели"));
 
         let wrong_kind = numeric_cfg(ModelKind::Kan);
         assert!(save_numeric(
@@ -1255,6 +1520,7 @@ mod tests {
             &model,
             &in_norm,
             &out_norm,
+            None,
             None
         )
         .unwrap_err()
@@ -1266,12 +1532,19 @@ mod tests {
             FeatureSpec::Categorical { cardinality: 3 },
         ];
         let wrong_norm = Normalizer::fit(&data.inputs, &categorical_specs);
-        assert!(
-            save_numeric(&path, &nc, &schema, &model, &wrong_norm, &out_norm, None)
-                .unwrap_err()
-                .to_string()
-                .contains("in_norm")
-        );
+        assert!(save_numeric(
+            &path,
+            &nc,
+            &schema,
+            &model,
+            &wrong_norm,
+            &out_norm,
+            None,
+            None
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("in_norm"));
         assert!(!std::path::Path::new(&path).exists());
     }
 
@@ -1315,6 +1588,7 @@ mod tests {
             &in_norm,
             &out_norm,
             Some(&calib),
+            None,
         )
         .unwrap();
         let checkpoint = load_numeric_full(&path).unwrap();
@@ -1350,6 +1624,7 @@ mod tests {
             &model,
             &in_norm,
             &out_norm,
+            None,
             None,
         )
         .unwrap();
