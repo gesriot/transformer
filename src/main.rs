@@ -24,7 +24,7 @@ use transformer::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
 use transformer::epoch_sweep;
 use transformer::generate::generate;
 use transformer::init::set_init_seed;
-use transformer::interpret::{self, InterpretOverrides, InterpretProfile};
+use transformer::interpret::{self, InterpretOverrides, InterpretProfile, InterpretReport};
 use transformer::metrics::{evaluate, Metrics};
 use transformer::numeric_model::{
     validate_numeric, KanConfig, ModelKind, NumericConfig, NumericModel,
@@ -43,8 +43,8 @@ use transformer::tnum::{
     Delimiter, PrepareSpec,
 };
 use transformer::train::{
-    evaluate_surrogate, predict_dataset, train_surrogate, train_text, validate_train, LrSchedule,
-    TextTrainConfig, TrainConfig,
+    evaluate_surrogate, predict_dataset, train_text, validate_train, LrSchedule, TextTrainConfig,
+    TrainConfig,
 };
 use transformer::training::{
     evaluate_on, run_training, Dataset, Phase, TrainedModel, TrainingSetup,
@@ -295,63 +295,42 @@ fn interpret_from(f: &Flags, nc: &NumericConfig) -> Result<Option<InterpretProfi
     interpret::resolve(use_profile, &overrides).map_err(|e| format!("конвейер интерпретации: {e}"))
 }
 
-/// Включает activation-L1 на построенной модели (до обучения).
-fn apply_kan_l1(model: &NumericModel, profile: &Option<InterpretProfile>) {
-    if let Some(s) = profile {
-        if s.l1 > 0.0 {
-            model
-                .as_kan()
-                .expect("interpret_from гарантирует kind=Kan")
-                .set_l1_lambda(s.l1);
-            println!("KAN activation-L1: λ={}", s.l1);
+/// Печать отчёта конвейера: сам конвейер живёт в [`transformer::interpret`],
+/// здесь только вывод.
+fn print_interpret_report(report: &InterpretReport) {
+    if let Some(threshold) = report.profile.prune {
+        println!("\nKAN prune (важность = p95 |φ| на train, порог {threshold} от максимума слоя):");
+        for (l, (a, t)) in report.per_layer.iter().enumerate() {
+            println!("  слой {l}: {a}/{t} активных рёбер");
+        }
+        if let (Some(before), Some(after), Some(ft)) = (
+            report.r2_before,
+            report.r2_after_prune,
+            report.r2_after_finetune,
+        ) {
+            println!(
+                "R² на validation: до прунинга {before:.5} -> после {after:.5} -> \
+                 после fine-tune ({} эпох, λ=0) {ft:.5}",
+                report.profile.finetune_epochs
+            );
         }
     }
-}
-
-/// Прунинг + fine-tune обученной KAN: важность p95 |φ| на train, hard-prune
-/// ниже относительного порога, дообучение с λ=0.
-///
-/// `eval` — набор для отчёта о влиянии прунинга (validation в фазе разработки).
-/// У финальной модели его нет: test потратить нельзя, а train+validation уже
-/// внутри обучения, поэтому там печатаются только активные рёбра.
-#[allow(clippy::too_many_arguments)]
-fn run_kan_prune(
-    model: &NumericModel,
-    train: &NumericDataset,
-    eval: Option<&NumericDataset>,
-    in_norm: &Normalizer,
-    out_norm: &Normalizer,
-    tcfg: &TrainConfig,
-    threshold: f32,
-    finetune_epochs: usize,
-) {
-    let kan = model.as_kan().expect("прунинг вызывается только для KAN");
-    let before = eval.map(|d| evaluate_surrogate(model, d, in_norm, out_norm));
-
-    let calibration = in_norm.transform(&train.inputs);
-    let report = kan.prune_edges(threshold, &calibration);
-    println!("\nKAN prune (важность = p95 |φ| на train, порог {threshold} от максимума слоя):");
-    for (l, (a, t)) in report.per_layer.iter().enumerate() {
-        println!("  слой {l}: {a}/{t} активных рёбер");
-    }
-    let after_prune = eval.map(|d| evaluate_surrogate(model, d, in_norm, out_norm));
-
-    kan.set_l1_lambda(0.0);
-    let ft_cfg = TrainConfig {
-        epochs: finetune_epochs,
-        ..tcfg.clone()
-    };
-    train_surrogate(model, train, in_norm, out_norm, &ft_cfg);
-
-    let (active, total) = report.totals();
-    if let (Some(before), Some(after_prune), Some(eval)) = (before, after_prune, eval) {
-        let after_ft = evaluate_surrogate(model, eval, in_norm, out_norm);
+    let (active, total) = report.active_edges;
+    println!("Активных рёбер: {active}/{total}");
+    if let Some(c) = report.compaction {
         println!(
-            "R² на validation: до прунинга {:.5} -> после {:.5} -> после fine-tune ({finetune_epochs} эпох, λ=0) {:.5}",
-            before.r2, after_prune.r2, after_ft.r2
+            "Структурное сжатие: скрытых узлов {} -> {}, параметров {} -> {}",
+            c.nodes_before, c.nodes_after, c.params_before, c.params_after
         );
+        if let (Some(before), Some(after)) = (
+            report.r2_after_finetune.or(report.r2_before),
+            report.r2_after_compact,
+        ) {
+            println!(
+                "R² на validation: {before:.5} -> {after:.5} (удаление точное — совпадение ожидаемо)"
+            );
+        }
     }
-    println!("Активных рёбер: {active}/{total} (параметры не сжимаются — это следующий шаг)");
 }
 
 /// `--kan-symbolic` при не-KAN модели — ошибка, не молчаливое игнорирование.
@@ -362,33 +341,6 @@ fn validate_kan_symbolic(f: &Flags, nc: &NumericConfig) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// Структурное сжатие KAN: физически удаляет мёртвые скрытые узлы (после
-/// hard-prune) с реальным уменьшением числа параметров и проверяет, что
-/// функция сети не изменилась (R² на переданной eval-части до/после).
-fn run_kan_compact(
-    model: &mut NumericModel,
-    eval: Option<&NumericDataset>,
-    in_norm: &Normalizer,
-    out_norm: &Normalizer,
-) {
-    let before = eval.map(|d| evaluate_surrogate(model, d, in_norm, out_norm));
-    let report = model
-        .as_kan_mut()
-        .expect("структурное сжатие вызывается только для KAN")
-        .compact();
-    println!(
-        "\nСтруктурное сжатие: скрытых узлов {} -> {}, параметров {} -> {}",
-        report.nodes_before, report.nodes_after, report.params_before, report.params_after
-    );
-    if let (Some(before), Some(eval)) = (before, eval) {
-        let after = evaluate_surrogate(model, eval, in_norm, out_norm);
-        println!(
-            "R² на validation: {:.5} -> {:.5} (удаление точное — совпадение ожидаемо)",
-            before.r2, after.r2
-        );
-    }
 }
 
 /// Symbolic extraction обученной KAN: фит рёбер примитивами по активациям,
@@ -691,7 +643,9 @@ fn run_numeric_flow(
                 ),
             }
             println!("Параметров: {}", model.parameter_count());
-            apply_kan_l1(model, &interpret);
+            if let Some(profile) = &interpret {
+                interpret::apply_l1(model, profile).unwrap_or_else(|e| fail(&e));
+            }
         },
         &mut |phase, trained, train_data, eval| {
             // Один и тот же конвейер в обеих фазах: иначе сохранённая модель
@@ -764,8 +718,9 @@ fn run_numeric_flow(
     }
 }
 
-/// KAN-конвейер одной фазы: activation-L1 уже применён при построении, здесь —
-/// прунинг с fine-tune и структурное сжатие.
+/// KAN-конвейер одной фазы: прунинг с fine-tune и структурное сжатие.
+///
+/// Сам конвейер общий для CLI и GUI; здесь остаётся только печать отчёта.
 fn apply_kan_pipeline(
     trained: &mut TrainedModel,
     train_data: &NumericDataset,
@@ -773,27 +728,20 @@ fn apply_kan_pipeline(
     profile: &Option<InterpretProfile>,
     tcfg: &TrainConfig,
 ) {
-    if let Some(threshold) = profile.as_ref().and_then(|p| p.prune) {
-        let ft = profile.as_ref().map_or(10, |p| p.finetune_epochs);
-        run_kan_prune(
-            &trained.model,
-            train_data,
-            eval,
-            &trained.in_norm,
-            &trained.out_norm,
-            tcfg,
-            threshold,
-            ft,
-        );
-    }
-    if profile.is_some_and(|p| p.compact) {
-        run_kan_compact(
-            &mut trained.model,
-            eval,
-            &trained.in_norm,
-            &trained.out_norm,
-        );
-    }
+    let Some(profile) = profile else {
+        return;
+    };
+    let report = interpret::run_pipeline(
+        &mut trained.model,
+        train_data,
+        eval,
+        &trained.in_norm,
+        &trained.out_norm,
+        tcfg,
+        profile,
+    )
+    .unwrap_or_else(|e| fail(&e));
+    print_interpret_report(&report);
 }
 
 fn run_numeric(args: &[String]) {

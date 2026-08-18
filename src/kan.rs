@@ -315,7 +315,7 @@ pub struct PruneReport {
 }
 
 /// Отчёт структурного сжатия: скрытые узлы и параметры до/после.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompactReport {
     pub nodes_before: usize,
     pub nodes_after: usize,
@@ -525,12 +525,20 @@ impl KanNet {
                     // Все узлы границы мертвы (вырожденная сеть): оставляем
                     // один с нулевыми масками, чтобы формы остались валидными.
                     kept.push(0);
-                    let (_, out_next) = self.layers[k + 1].dims();
+                    let cleared_live_edges = (0..in_k).any(|i| mask_in[[i, 0]] > 0.5)
+                        || (0..out_next).any(|o| mask_out[[0, o]] > 0.5);
                     for i in 0..in_k {
                         self.layers[k].prune_edge(i, 0);
                     }
                     for o in 0..out_next {
                         self.layers[k + 1].prune_edge(0, o);
+                    }
+                    if n_nodes == 1 {
+                        // Форма уже минимальная, а обнуление масок идемпотентно:
+                        // новая итерация нужна только когда реально очистились
+                        // рёбра — они могли омертвить предыдущую границу.
+                        changed |= cleared_live_edges;
+                        continue;
                     }
                 }
                 let narrowed = self.layers[k].retain_outputs(&kept);
@@ -857,5 +865,43 @@ mod tests {
             last < first * 0.1,
             "KAN не выучил sum: {first:.4} -> {last:.4}"
         );
+    }
+
+    /// Вырожденная сеть: все рёбра слоя отсечены. Раньше `compact` крутился на
+    /// ней вечно — обнуление масок он считал изменением, хотя форма уже была
+    /// минимальной.
+    #[test]
+    fn compact_terminates_on_a_fully_pruned_network() {
+        crate::init::set_init_seed(0);
+        let mut net = KanNet::new(2, 4, 1, 5, 2);
+        for layer in net.layers.iter_mut() {
+            let (n_in, n_out) = layer.dims();
+            for i in 0..n_in {
+                for o in 0..n_out {
+                    layer.prune_edge(i, o);
+                }
+            }
+        }
+        let report = net.compact();
+        assert!(report.nodes_after <= report.nodes_before);
+        // Сеть осталась работоспособной по форме.
+        assert_eq!(net.active_edges().0, 0);
+        assert!(!net.layer_dims().is_empty());
+    }
+
+    /// Очистка рёбер единственного узла должна запустить ещё одну итерацию:
+    /// иначе мёртвые узлы на уже пройденной предыдущей границе останутся.
+    #[test]
+    fn compact_reaches_fixed_point_through_a_single_node_boundary() {
+        crate::init::set_init_seed(0);
+        let mut net = KanNet::from_dims(&[(2, 2), (2, 1), (1, 1)], 5);
+        net.layers[2].prune_edge(0, 0);
+
+        let report = net.compact();
+
+        assert_eq!(net.layer_dims(), vec![(2, 1), (1, 1), (1, 1)]);
+        assert_eq!(report.nodes_before, 3);
+        assert_eq!(report.nodes_after, 2);
+        assert_eq!(net.active_edges().0, 0);
     }
 }
