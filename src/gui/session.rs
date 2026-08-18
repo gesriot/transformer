@@ -6,14 +6,18 @@
 
 use super::data::{MarkupState, PrepareForm};
 use super::demo::TextForm;
-use super::messages::{Command, DiagnosticsResult, Event, KanModelInfo, KanSymbolicInfo};
+use super::messages::{
+    Command, DatasetOrigin, DiagnosticsResult, Event, KanModelInfo, KanSymbolicInfo, PreparedData,
+};
 use super::model::ModelInfo;
-use super::train::{EpochSweepForm, OptimizeForm, SourceKind, SweepForm, TrainForm};
+use super::train::{EpochSweepForm, OptimizeForm, SweepForm, TrainForm};
 use super::worker::Worker;
 use crate::data::OutOfRange;
 use crate::encoders::ValueEncoderKind;
 use crate::epoch_sweep::EpochRow;
+use crate::markup::TableProfile;
 use crate::metrics::Metrics;
+use crate::split::SplitPlan;
 use crate::sweep::{self, SweepChoice, SweepObjective, SweepRow};
 use crate::train::LrSchedule;
 use eframe::egui;
@@ -32,14 +36,69 @@ pub(super) enum Tab {
     EpochSweep,
 }
 
+/// Одно сообщение на все экраны: данные общие, значит и текст общий.
+pub(super) const NO_DATASET: &str = "сначала откройте данные";
+
 pub(super) const BLACKBOXES: &[&str] = &["sum", "product", "sine", "polynomial", "projectile"];
 pub(super) const KAN_CURVE_SAMPLES: usize = 201;
+
+/// Активный набор данных сессии.
+///
+/// Один на всё окно: экраны обучения, поиска и кривой по эпохам берут данные
+/// отсюда, а не выбирают файл каждый сам. Иначе один и тот же файл открывался
+/// бы по-разному в разных формах, а ручная разметка терялась бы.
+pub(super) struct ActiveDataset {
+    pub(super) prepared: PreparedData,
+    /// Профиль есть только у таблиц: `.tnum` и чёрный ящик уже размечены.
+    pub(super) profile: Option<TableProfile>,
+    /// План разбиения — свойство набора данных, а не отдельного запуска.
+    pub(super) split: SplitPlan,
+    /// Как читалась таблица: «Разметить заново» должно открыть её так же.
+    pub(super) table_has_header: bool,
+}
+
+impl ActiveDataset {
+    pub(super) fn new(
+        prepared: PreparedData,
+        profile: Option<TableProfile>,
+        table_has_header: bool,
+    ) -> Self {
+        Self {
+            prepared,
+            profile,
+            split: SplitPlan::default(),
+            table_has_header,
+        }
+    }
+
+    /// Строка для шапки: что открыто и какой оно формы.
+    pub(super) fn summary(&self) -> String {
+        let schema = &self.prepared.schema;
+        format!(
+            "{} · {} строк · {} вход → {} выход",
+            self.prepared.origin.short_name(),
+            self.prepared.data.len(),
+            schema.n_inputs(),
+            schema.n_outputs()
+        )
+    }
+
+    /// Сколько замечаний к качеству данных нашёл профиль. У `.tnum` и чёрного
+    /// ящика профиля нет — там и предупреждать не о чем.
+    pub(super) fn data_notes(&self) -> usize {
+        self.profile.as_ref().map_or(0, |p| p.messages().len())
+    }
+}
 
 pub struct App {
     pub(super) worker: Worker,
     pub(super) tab: Tab,
     pub(super) status: String,
     pub(super) form: TrainForm,
+    /// Активный набор данных сессии; `None` — данные ещё не открыты.
+    pub(super) dataset: Option<ActiveDataset>,
+    /// Идёт чтение набора данных: запускать что-либо на старых данных нельзя.
+    pub(super) dataset_opening: bool,
     pub(super) training: bool,
     pub(super) sweeping: bool,
     pub(super) loss_curve: Vec<[f64; 2]>,
@@ -48,7 +107,7 @@ pub struct App {
     // Predict (UI-M5)
     pub(super) model_info: Option<ModelInfo>,
     /// Worker читает и профилирует таблицу. Пока ответ не пришёл, нельзя
-    /// запустить действие со старым `prepared`.
+    /// запустить действие со старым активным набором.
     pub(super) table_opening: bool,
     /// Открытый диалог разметки таблицы.
     pub(super) markup: Option<MarkupState>,
@@ -102,6 +161,8 @@ impl App {
             tab: Tab::Train,
             status: "–".to_string(),
             form: TrainForm::default(),
+            dataset: None,
+            dataset_opening: false,
             training: false,
             sweeping: false,
             loss_curve: Vec::new(),
@@ -160,6 +221,7 @@ impl App {
                     self.batch_predicting = false;
                     self.kan_symbolic_pending = false;
                     self.table_opening = false;
+                    self.dataset_opening = false;
                     self.status = format!("Ошибка: {e}");
                 }
                 Event::TrainStarted {
@@ -186,6 +248,11 @@ impl App {
                         }
                         None => self.status = "обучение отменено".to_string(),
                     }
+                }
+                Event::DatasetOpened { data } => {
+                    self.dataset_opening = false;
+                    self.status = format!("данные открыты: {}", data.origin.short_name());
+                    self.dataset = Some(ActiveDataset::new(data, None, true));
                 }
                 Event::TableOpened {
                     path,
@@ -427,7 +494,99 @@ impl App {
             || self.batch_predicting
             || self.kan_symbolic_pending
             || self.table_opening
+            || self.dataset_opening
             || self.markup.is_some()
+    }
+
+    /// Полоса активного набора данных. Её рисует каждый экран обучения: пока
+    /// разделы не объединены, это единственное место выбора данных.
+    pub(super) fn ui_dataset_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Данные:");
+            match &self.dataset {
+                Some(active) => {
+                    ui.label(active.summary());
+                    let notes = active.data_notes();
+                    if notes > 0 {
+                        ui.label(format!("· замечаний к данным: {notes}"));
+                    }
+                }
+                None => {
+                    ui.label("не открыты");
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            let idle = !self.busy();
+            ui.add_enabled_ui(idle, |ui| {
+                egui::ComboBox::from_id_salt("dataset_blackbox")
+                    .selected_text("Чёрный ящик…")
+                    .show_ui(ui, |ui| {
+                        for &name in BLACKBOXES {
+                            if ui.selectable_label(false, name).clicked() {
+                                self.open_dataset(DatasetOrigin::Blackbox(name.to_string()));
+                            }
+                        }
+                    });
+            });
+            if ui
+                .add_enabled(idle, egui::Button::new("Открыть .tnum…"))
+                .clicked()
+            {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("tnum", &["tnum"])
+                    .pick_file()
+                {
+                    self.open_dataset(DatasetOrigin::File(p.display().to_string()));
+                }
+            }
+            if ui
+                .add_enabled(idle, egui::Button::new("Открыть таблицу…"))
+                .clicked()
+            {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter(
+                        "таблицы",
+                        &["xlsx", "xlsm", "xlsb", "xls", "ods", "csv", "tsv", "txt"],
+                    )
+                    .pick_file()
+                {
+                    self.open_table(p.display().to_string(), true);
+                }
+            }
+            if let Some((path, has_header)) = self.markup_source() {
+                if ui
+                    .add_enabled(idle, egui::Button::new("Разметить заново…"))
+                    .clicked()
+                {
+                    self.open_table(path, has_header);
+                }
+            }
+        });
+    }
+
+    /// Путь таблицы, если активные данные пришли из разметки.
+    fn markup_source(&self) -> Option<(String, bool)> {
+        let active = self.dataset.as_ref()?;
+        match &active.prepared.origin {
+            DatasetOrigin::Table(path) => Some((path.clone(), active.table_has_header)),
+            _ => None,
+        }
+    }
+
+    /// Активные данные и их план разбиения для команды worker-у.
+    ///
+    /// `None` — данные не открыты: экран сам решает, что показать.
+    pub(super) fn active_data(&self) -> Option<(PreparedData, SplitPlan)> {
+        self.dataset
+            .as_ref()
+            .map(|active| (active.prepared.clone(), active.split))
+    }
+
+    pub(super) fn open_dataset(&mut self, origin: DatasetOrigin) {
+        self.dataset_opening = true;
+        self.status = format!("открываю {}…", origin.short_name());
+        self.worker.send(Command::OpenDataset { origin });
     }
 
     pub(super) fn sort_optimize_rows(&mut self) {
@@ -442,8 +601,6 @@ impl App {
     }
 
     pub(super) fn apply_choice_to_train(&mut self, choice: &SweepChoice) {
-        self.form.source_kind = SourceKind::Tnum;
-        self.form.file_path = self.optimize_form.file_path.clone();
         self.form.kind = choice.kind;
         self.form.kan_width = choice.kan.width;
         self.form.kan_layers = choice.kan.layers;
@@ -488,7 +645,6 @@ impl App {
     /// эпох. Конфиг тот же; эпохи Optimize не переносим — задаём список для
     /// прохода.
     pub(super) fn apply_choice_to_epoch_sweep(&mut self, choice: &SweepChoice) {
-        self.epoch_form.file_path = self.optimize_form.file_path.clone();
         self.epoch_form.kind = choice.kind;
         self.epoch_form.kan_width = choice.kan.width;
         self.epoch_form.kan_layers = choice.kan.layers;
@@ -535,8 +691,6 @@ impl App {
     /// Train. Замыкает поток Optimize → Check epochs → Train.
     pub(super) fn apply_epoch_form_to_train(&mut self, epochs: usize) {
         let f = &self.epoch_form;
-        self.form.source_kind = SourceKind::Tnum;
-        self.form.file_path = f.file_path.clone();
         self.form.kind = f.kind;
         self.form.d_model = f.d_model;
         self.form.heads = f.heads;

@@ -1,8 +1,8 @@
 //! Экран данных: разметка таблицы и подготовка `.tnum`.
 
 use super::messages::Command;
-use super::session::App;
-use super::train::SourceKind;
+use super::messages::{DatasetOrigin, PreparedData};
+use super::session::{ActiveDataset, App};
 use crate::data::NumericDataset;
 use crate::markup::{analyze_roles, DraftType, RoleReport, SchemaDraft, Severity, TableProfile};
 use crate::schema::{ColumnRole, ModelSchema};
@@ -14,7 +14,6 @@ use std::sync::Arc;
 /// Подтверждённая разметка таблицы: готовые данные и схема.
 #[derive(Clone)]
 pub(super) struct PreparedTable {
-    pub(super) name: String,
     pub(super) path: String,
     pub(super) has_header: bool,
     pub(super) data: Arc<NumericDataset>,
@@ -94,10 +93,6 @@ impl MarkupState {
         let schema = self.draft.finish()?;
         let data = self.table.to_dataset(&schema)?;
         Ok(PreparedTable {
-            name: std::path::Path::new(&self.path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| self.path.clone()),
             path: self.path.clone(),
             has_header: self.has_header,
             data: Arc::new(data),
@@ -369,8 +364,15 @@ impl App {
                 {
                     match state.apply() {
                         Ok(prepared) => {
-                            self.form.prepared = Some(prepared);
-                            self.form.source_kind = SourceKind::Table;
+                            self.dataset = Some(ActiveDataset::new(
+                                PreparedData {
+                                    origin: DatasetOrigin::Table(prepared.path.clone()),
+                                    data: Arc::clone(&prepared.data),
+                                    schema: prepared.schema.clone(),
+                                },
+                                Some(state.profile.clone()),
+                                prepared.has_header,
+                            ));
                             self.status = "разметка применена".to_string();
                             close_after_apply = true;
                         }
@@ -470,9 +472,8 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::super::messages::DataSource;
-    use super::super::train::{SourceKind, TrainForm};
     use super::*;
+    use crate::split::SplitPlan;
     use crate::table::Delimiter;
 
     fn markup(text: &str, suggested: Option<usize>) -> MarkupState {
@@ -499,43 +500,33 @@ mod tests {
         assert_eq!(prepared.data.inputs.dim(), (2, 1));
     }
 
-    /// Результат диалога — готовые данные и схема, а не путь: иначе worker
-    /// открыл бы файл заново и потерял ручную разметку.
+    /// Разметка становится активным набором данных сессии: в worker уходят
+    /// данные и схема, а не путь, иначе он открыл бы файл заново и потерял
+    /// ручную разметку.
     #[test]
-    fn prepared_source_carries_data_and_schema() {
+    fn markup_result_becomes_the_active_dataset() {
         let mut state = markup("t,mat,y\n80,песок,1\n60,глина,2\n", Some(2));
         state.on_roles_changed();
         let prepared = state.apply().unwrap();
 
-        let form = TrainForm {
-            source_kind: SourceKind::Table,
-            prepared: Some(prepared),
-            ..Default::default()
-        };
-        let (source, _, _) = form.build().unwrap();
-        match source {
-            DataSource::Prepared { data, schema, .. } => {
-                assert_eq!(data.inputs.dim(), (2, 2));
-                assert_eq!(schema.input_names(), vec!["t", "mat"]);
-                // Категория распознана по подписям, коды воспроизводимы.
-                assert_eq!(schema.inputs()[1].cardinality(), Some(2));
-                assert_eq!(data.inputs[[0, 1]], 1.0); // песок — второй по алфавиту
-            }
-            _ => panic!("ожидался Prepared"),
-        }
-    }
+        let active = ActiveDataset::new(
+            PreparedData {
+                origin: DatasetOrigin::Table(prepared.path.clone()),
+                data: Arc::clone(&prepared.data),
+                schema: prepared.schema.clone(),
+            },
+            Some(state.profile.clone()),
+            prepared.has_header,
+        );
 
-    #[test]
-    fn table_source_without_markup_refuses_to_train() {
-        let form = TrainForm {
-            source_kind: SourceKind::Table,
-            ..Default::default()
-        };
-        let err = match form.build() {
-            Err(e) => e,
-            Ok(_) => panic!("обучение без разметки должно быть отклонено"),
-        };
-        assert!(err.contains("подтвердите разметку"), "{err}");
+        assert_eq!(active.prepared.data.inputs.dim(), (2, 2));
+        assert_eq!(active.prepared.schema.input_names(), vec!["t", "mat"]);
+        // Категория распознана по подписям, коды воспроизводимы.
+        assert_eq!(active.prepared.schema.inputs()[1].cardinality(), Some(2));
+        assert_eq!(active.prepared.data.inputs[[0, 1]], 1.0); // песок — второй по алфавиту
+                                                              // Разбиение — свойство набора данных.
+        assert_eq!(active.split, SplitPlan::default());
+        assert!(active.summary().contains("2 строк"));
     }
 
     #[test]

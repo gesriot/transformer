@@ -1,10 +1,9 @@
 //! Экран обучения: одна конфигурация, поиск по сетке и кривая по эпохам.
 
-use super::data::PreparedTable;
-use super::messages::{Command, DataSource};
+use super::messages::Command;
 use super::model::ModelInfo;
-use super::session::App;
 use super::session::BLACKBOXES;
+use super::session::{App, NO_DATASET};
 use crate::config::ModelConfig;
 use crate::encoders::{ValueEncoderConfig, ValueEncoderKind};
 use crate::epoch_sweep::{self};
@@ -13,26 +12,10 @@ use crate::sweep::{self, SearchBudget, SweepAxes, SweepObjective, SweepRow};
 use crate::train::{validate_train, LrSchedule, TrainConfig};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
-use std::sync::Arc;
-
-/// Откуда берутся данные для обучения.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum SourceKind {
-    Blackbox,
-    /// `.tnum` — схема уже подтверждена, разметка не нужна.
-    Tnum,
-    /// XLSX/CSV/TSV — обязательно через диалог разметки.
-    Table,
-}
 
 /// Состояние формы Train. Числа редактируются `DragValue` (без строкового
 /// парсинга); валидность проверяется теми же `validate_*`, что и в CLI.
 pub(super) struct TrainForm {
-    pub(super) source_kind: SourceKind,
-    pub(super) blackbox: String,
-    pub(super) file_path: String,
-    /// Результат диалога разметки: данные и схема, а не путь.
-    pub(super) prepared: Option<PreparedTable>,
     pub(super) kind: ModelKind,
     pub(super) d_model: usize,
     pub(super) heads: usize,
@@ -58,10 +41,6 @@ pub(super) struct TrainForm {
 impl Default for TrainForm {
     fn default() -> Self {
         Self {
-            source_kind: SourceKind::Blackbox,
-            blackbox: "sum".to_string(),
-            file_path: String::new(),
-            prepared: None,
             kind: ModelKind::Transformer,
             d_model: 32,
             heads: 4,
@@ -87,28 +66,7 @@ impl Default for TrainForm {
 }
 
 impl TrainForm {
-    pub(super) fn build(&self) -> Result<(DataSource, NumericConfig, TrainConfig), String> {
-        let source = match self.source_kind {
-            SourceKind::Blackbox => DataSource::Blackbox(self.blackbox.clone()),
-            SourceKind::Tnum => {
-                if self.file_path.is_empty() {
-                    return Err("укажите .tnum файл".to_string());
-                }
-                DataSource::File(self.file_path.clone())
-            }
-            SourceKind::Table => {
-                let prepared = self
-                    .prepared
-                    .as_ref()
-                    .ok_or_else(|| "откройте таблицу и подтвердите разметку".to_string())?;
-                DataSource::Prepared {
-                    name: prepared.name.clone(),
-                    data: Arc::clone(&prepared.data),
-                    schema: prepared.schema.clone(),
-                }
-            }
-        };
-
+    pub(super) fn build(&self) -> Result<(NumericConfig, TrainConfig), String> {
         let value = ValueEncoderConfig {
             kind: match self.kind {
                 ModelKind::Transformer => match self.venc {
@@ -164,7 +122,7 @@ impl TrainForm {
             schedule,
         };
         validate_train(tcfg.lr, tcfg.batch_size)?;
-        Ok((source, nc, tcfg))
+        Ok((nc, tcfg))
     }
 }
 
@@ -230,7 +188,6 @@ impl SweepForm {
 }
 
 pub(super) struct OptimizeForm {
-    pub(super) file_path: String,
     pub(super) preset: usize,    // 0 quick, 1 balanced, 2 thorough
     pub(super) objective: usize, // 0 worst, 1 aggregate, 2 mean, 3 nrmse
     pub(super) include_mlp: bool,
@@ -241,7 +198,6 @@ pub(super) struct OptimizeForm {
 impl Default for OptimizeForm {
     fn default() -> Self {
         Self {
-            file_path: String::new(),
             preset: 0,
             objective: 0,
             include_mlp: true,
@@ -291,17 +247,12 @@ impl OptimizeForm {
         Ok(axes)
     }
 
-    pub(super) fn build(&self) -> Result<(String, SweepAxes, SweepObjective), String> {
-        if self.file_path.is_empty() {
-            return Err("выберите .tnum файл".to_string());
-        }
-        let axes = self.axes()?;
-        Ok((self.file_path.clone(), axes, self.objective()))
+    pub(super) fn build(&self) -> Result<(SweepAxes, SweepObjective), String> {
+        Ok((self.axes()?, self.objective()))
     }
 }
 
 pub(super) struct EpochSweepForm {
-    pub(super) file_path: String,
     pub(super) epochs: String,
     pub(super) target_r2: f32,
     pub(super) min_gain: f32,
@@ -328,7 +279,6 @@ pub(super) struct EpochSweepForm {
 }
 
 pub(super) struct EpochSweepRequest {
-    pub(super) path: String,
     pub(super) nc: NumericConfig,
     pub(super) base_tcfg: TrainConfig,
     pub(super) milestones: Vec<usize>,
@@ -340,7 +290,6 @@ pub(super) struct EpochSweepRequest {
 impl Default for EpochSweepForm {
     fn default() -> Self {
         Self {
-            file_path: String::new(),
             epochs: "1,2,5,10,20,40".to_string(),
             target_r2: 0.95,
             min_gain: 0.02,
@@ -370,9 +319,6 @@ impl Default for EpochSweepForm {
 
 impl EpochSweepForm {
     pub(super) fn build(&self) -> Result<EpochSweepRequest, String> {
-        if self.file_path.is_empty() {
-            return Err("выберите .tnum файл".to_string());
-        }
         let milestones = parse_csv_usize(&self.epochs, "epochs")?;
         if milestones.is_empty() || milestones.contains(&0) {
             return Err("epochs: список должен быть непустым и > 0".to_string());
@@ -444,7 +390,6 @@ impl EpochSweepForm {
         };
         validate_train(tcfg.lr, tcfg.batch_size)?;
         Ok(EpochSweepRequest {
-            path: self.file_path.clone(),
             nc,
             base_tcfg: tcfg,
             milestones,
@@ -541,88 +486,7 @@ impl App {
     pub(super) fn ui_train(&mut self, ui: &mut egui::Ui) {
         ui.heading("Train (numeric)");
 
-        ui.horizontal(|ui| {
-            ui.selectable_value(
-                &mut self.form.source_kind,
-                SourceKind::Blackbox,
-                "Чёрный ящик",
-            );
-            ui.selectable_value(&mut self.form.source_kind, SourceKind::Tnum, ".tnum файл");
-            ui.selectable_value(&mut self.form.source_kind, SourceKind::Table, "Таблица");
-        });
-        match self.form.source_kind {
-            SourceKind::Tnum => {
-                ui.horizontal(|ui| {
-                    if ui.button("Выбрать .tnum…").clicked() {
-                        if let Some(p) = rfd::FileDialog::new()
-                            .add_filter("tnum", &["tnum"])
-                            .pick_file()
-                        {
-                            self.form.file_path = p.display().to_string();
-                        }
-                    }
-                    ui.label(if self.form.file_path.is_empty() {
-                        "(файл не выбран)"
-                    } else {
-                        &self.form.file_path
-                    });
-                });
-                ui.label(".tnum уже содержит подтверждённую схему — разметка не нужна.");
-            }
-            SourceKind::Table => {
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(!self.busy(), egui::Button::new("Открыть таблицу…"))
-                        .clicked()
-                    {
-                        if let Some(p) = rfd::FileDialog::new()
-                            .add_filter(
-                                "таблицы",
-                                &["xlsx", "xlsm", "xlsb", "xls", "ods", "csv", "tsv", "txt"],
-                            )
-                            .pick_file()
-                        {
-                            self.open_table(p.display().to_string(), true);
-                        }
-                    }
-                    match &self.form.prepared {
-                        Some(p) => {
-                            ui.label(format!(
-                                "{}: {} строк, {} вход → {} выход",
-                                p.name,
-                                p.data.len(),
-                                p.schema.n_inputs(),
-                                p.schema.n_outputs()
-                            ));
-                        }
-                        None => {
-                            ui.label("(таблица не размечена)");
-                        }
-                    }
-                });
-                if self.form.prepared.is_some()
-                    && ui
-                        .add_enabled(
-                            self.markup.is_none() && !self.busy(),
-                            egui::Button::new("Разметить заново…"),
-                        )
-                        .clicked()
-                {
-                    if let Some(p) = self.form.prepared.clone() {
-                        self.open_table(p.path.clone(), p.has_header);
-                    }
-                }
-            }
-            SourceKind::Blackbox => {
-                egui::ComboBox::from_label("чёрный ящик")
-                    .selected_text(&self.form.blackbox)
-                    .show_ui(ui, |ui| {
-                        for &name in BLACKBOXES {
-                            ui.selectable_value(&mut self.form.blackbox, name.to_string(), name);
-                        }
-                    });
-            }
-        }
+        self.ui_dataset_bar(ui);
 
         ui.separator();
         ui.horizontal(|ui| {
@@ -731,13 +595,19 @@ impl App {
                 .add_enabled(!self.busy(), egui::Button::new("Train"))
                 .clicked()
             {
-                match self.form.build() {
-                    Ok((source, nc, tcfg)) => {
+                match (self.form.build(), self.active_data()) {
+                    (Ok((nc, tcfg)), Some((data, split))) => {
                         self.train_parameter_count = None;
                         self.worker.reset_cancel();
-                        self.worker.send(Command::TrainNumeric { source, nc, tcfg });
+                        self.worker.send(Command::TrainNumeric {
+                            data,
+                            split,
+                            nc,
+                            tcfg,
+                        });
                     }
-                    Err(e) => self.status = format!("Ошибка: {e}"),
+                    (Ok(_), None) => self.status = NO_DATASET.to_string(),
+                    (Err(e), _) => self.status = format!("Ошибка: {e}"),
                 }
             }
             if ui
@@ -791,21 +661,7 @@ impl App {
     pub(super) fn ui_optimize(&mut self, ui: &mut egui::Ui) {
         ui.heading("Optimize");
 
-        ui.horizontal(|ui| {
-            if ui.button("Выбрать .tnum…").clicked() {
-                if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("tnum", &["tnum"])
-                    .pick_file()
-                {
-                    self.optimize_form.file_path = p.display().to_string();
-                }
-            }
-            ui.label(if self.optimize_form.file_path.is_empty() {
-                "(файл не выбран)"
-            } else {
-                &self.optimize_form.file_path
-            });
-        });
+        self.ui_dataset_bar(ui);
 
         ui.horizontal(|ui| {
             ui.label("бюджет");
@@ -863,16 +719,18 @@ impl App {
                 .add_enabled(!self.busy(), egui::Button::new("Run optimize"))
                 .clicked()
             {
-                match self.optimize_form.build() {
-                    Ok((path, axes, objective)) => {
+                match (self.optimize_form.build(), self.active_data()) {
+                    (Ok((axes, objective)), Some((data, split))) => {
                         self.worker.reset_cancel();
-                        self.worker.send(Command::OptimizeFile {
-                            path,
+                        self.worker.send(Command::Optimize {
+                            data,
+                            split,
                             axes,
                             objective,
                         });
                     }
-                    Err(e) => self.status = format!("Ошибка: {e}"),
+                    (Ok(_), None) => self.status = NO_DATASET.to_string(),
+                    (Err(e), _) => self.status = format!("Ошибка: {e}"),
                 }
             }
             if ui
@@ -1100,21 +958,7 @@ impl App {
 
     pub(super) fn ui_epoch_sweep(&mut self, ui: &mut egui::Ui) {
         ui.heading("Epoch-sweep");
-        ui.horizontal(|ui| {
-            if ui.button("Выбрать .tnum…").clicked() {
-                if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("tnum", &["tnum"])
-                    .pick_file()
-                {
-                    self.epoch_form.file_path = p.display().to_string();
-                }
-            }
-            ui.label(if self.epoch_form.file_path.is_empty() {
-                "(файл не выбран)"
-            } else {
-                &self.epoch_form.file_path
-            });
-        });
+        self.ui_dataset_bar(ui);
         ui.horizontal(|ui| {
             ui.label("Модель:");
             ui.selectable_value(
@@ -1255,11 +1099,12 @@ impl App {
                 .add_enabled(!self.busy(), egui::Button::new("Run"))
                 .clicked()
             {
-                match self.epoch_form.build() {
-                    Ok(req) => {
+                match (self.epoch_form.build(), self.active_data()) {
+                    (Ok(req), Some((data, split))) => {
                         self.worker.reset_cancel();
                         self.worker.send(Command::EpochSweep {
-                            path: req.path,
+                            data,
+                            split,
                             nc: req.nc,
                             base_tcfg: req.base_tcfg,
                             milestones: req.milestones,
@@ -1268,7 +1113,8 @@ impl App {
                             plateau_min: req.plateau_min,
                         });
                     }
-                    Err(e) => self.status = format!("Ошибка: {e}"),
+                    (Ok(_), None) => self.status = NO_DATASET.to_string(),
+                    (Err(e), _) => self.status = format!("Ошибка: {e}"),
                 }
             }
             if ui
@@ -1383,7 +1229,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (_, config, _) = form.build().unwrap();
+        let (config, _) = form.build().unwrap();
         assert_eq!(config.kind, ModelKind::Kan);
         assert_eq!(config.value.kind, ValueEncoderKind::Linear);
         assert_eq!(config.kan.width, 16);
@@ -1394,7 +1240,6 @@ mod tests {
     #[test]
     fn epoch_sweep_form_builds_kan_config() {
         let form = EpochSweepForm {
-            file_path: "test.tnum".to_string(),
             kind: ModelKind::Kan,
             kan_width: 16,
             kan_layers: 2,

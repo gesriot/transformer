@@ -6,7 +6,8 @@
 //! для Predict; UI получает только числа/статусы.
 
 use super::messages::{
-    Command, DataSource, DiagnosticsResult, Event, KanModelInfo, KanSymbolicInfo, KanWeakEdge,
+    Command, DatasetOrigin, DiagnosticsResult, Event, KanModelInfo, KanSymbolicInfo, KanWeakEdge,
+    PreparedData,
 };
 use crate::batch_predict::{read_prediction_xlsx, write_prediction_xlsx};
 use crate::blackbox;
@@ -111,7 +112,7 @@ struct Loaded {
 /// Данные сессии обучения, нужные для диагностики.
 struct DiagData {
     nc: NumericConfig,
-    source: DataSource,
+    origin: DatasetOrigin,
     in_specs: Vec<FeatureSpec>,
     train: NumericDataset,
     /// Validation текущей сессии. Test сюда не попадает: он отложен в
@@ -139,13 +140,19 @@ fn worker_loop(
 
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
-            Command::TrainNumeric { source, nc, tcfg } => {
-                match train_numeric(&source, &nc, &tcfg, &evt_tx, &ctx, &cancel) {
+            Command::TrainNumeric {
+                data,
+                split,
+                nc,
+                tcfg,
+            } => {
+                let origin = data.origin.clone();
+                match train_numeric(&data, split, &nc, &tcfg, &evt_tx, &ctx, &cancel) {
                     Ok(Some(loaded)) => {
                         let _ = evt_tx.send(Event::ModelReady {
                             schema: loaded.schema.clone(),
                             kind: loaded.nc.kind,
-                            source: source_desc(&source),
+                            source: source_desc(&origin),
                             parameter_count: loaded.model.parameter_count(),
                             kan: kan_model_info(
                                 &loaded.model,
@@ -317,11 +324,12 @@ fn worker_loop(
                     }
                 }
             }
-            Command::OptimizeFile {
-                path,
+            Command::Optimize {
+                data,
+                split,
                 axes,
                 objective,
-            } => match run_optimize_file(&path, &axes, objective, &evt_tx, &ctx, &cancel) {
+            } => match run_optimize(&data, split, &axes, objective, &evt_tx, &ctx, &cancel) {
                 Ok(()) => {}
                 Err(e) => {
                     let _ = evt_tx.send(Event::Error(e));
@@ -367,6 +375,17 @@ fn worker_loop(
                 }
                 ctx.request_repaint();
             }
+            Command::OpenDataset { origin } => {
+                match open_dataset(&origin) {
+                    Ok(data) => {
+                        let _ = evt_tx.send(Event::DatasetOpened { data });
+                    }
+                    Err(e) => {
+                        let _ = evt_tx.send(Event::Error(e));
+                    }
+                }
+                ctx.request_repaint();
+            }
             Command::OpenTable { path, has_header } => {
                 match open_table(&path, has_header) {
                     Ok((table, profile, suggested_inputs, suggested_categories)) => {
@@ -406,7 +425,8 @@ fn worker_loop(
                 ctx.request_repaint();
             }
             Command::EpochSweep {
-                path,
+                data,
+                split,
                 nc,
                 base_tcfg,
                 milestones,
@@ -415,7 +435,8 @@ fn worker_loop(
                 plateau_min,
             } => {
                 match run_epoch_sweep(
-                    &path,
+                    &data,
+                    split,
                     &nc,
                     &base_tcfg,
                     &milestones,
@@ -438,11 +459,11 @@ fn worker_loop(
     }
 }
 
-fn source_desc(s: &DataSource) -> String {
-    match s {
-        DataSource::Blackbox(name) => format!("blackbox: {name}"),
-        DataSource::File(path) => format!("файл: {path}"),
-        DataSource::Prepared { name, .. } => format!("таблица: {name}"),
+fn source_desc(origin: &DatasetOrigin) -> String {
+    match origin {
+        DatasetOrigin::Blackbox(name) => format!("blackbox: {name}"),
+        DatasetOrigin::File(path) => format!("файл: {path}"),
+        DatasetOrigin::Table(path) => format!("таблица: {path}"),
     }
 }
 
@@ -598,13 +619,12 @@ fn diagnose(l: &Loaded) -> Result<DiagnosticsResult, String> {
         .map(|r| (r.sign_change_rate, r.tail_ratio))
         .collect();
 
-    let sensitivity = match &d.source {
-        DataSource::Blackbox(name) => blackbox::by_name(name).map(|bb| {
+    // Чувствительность исходного процесса известна только у демо-ящика.
+    let sensitivity = d.origin.blackbox().and_then(|name| {
+        blackbox::by_name(name).map(|bb| {
             crate::diagnostics::sensitivity_probe(&bb, &l.in_norm, &l.out_norm, 300, 0.01, 0)
-        }),
-        // Чувствительность исходного процесса известна только у демо-ящика.
-        DataSource::File(_) | DataSource::Prepared { .. } => None,
-    };
+        })
+    });
 
     Ok(DiagnosticsResult {
         overfit_loss,
@@ -684,17 +704,17 @@ fn run_sweep(
     Ok(())
 }
 
-fn run_optimize_file(
-    path: &str,
+fn run_optimize(
+    prepared: &PreparedData,
+    split: SplitPlan,
     axes: &SweepAxes,
     objective: SweepObjective,
     evt_tx: &Sender<Event>,
     ctx: &egui::Context,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    let (data, schema) = read_numeric_source(path)?;
-    let dataset = Dataset::new(data, schema)?;
-    let prepared = SplitPlan::default().prepare(dataset.data())?;
+    let dataset = Dataset::new(clone_data(prepared), prepared.schema.clone())?;
+    let splits = split.prepare(dataset.data())?;
     let (total_configs, total_runs) = sweep::sweep_size(axes)?;
     let _ = evt_tx.send(Event::OptimizeStarted {
         total_configs,
@@ -702,7 +722,7 @@ fn run_optimize_file(
     });
     ctx.request_repaint();
 
-    let result = sweep::run_sweep(&dataset, &prepared.search, axes, objective, cancel, |row| {
+    let result = sweep::run_sweep(&dataset, &splits.search, axes, objective, cancel, |row| {
         let _ = evt_tx.send(Event::OptimizeRow { row: row.clone() });
         ctx.request_repaint();
     })?;
@@ -860,7 +880,8 @@ fn prepare_tnum(
 
 #[allow(clippy::too_many_arguments)]
 fn run_epoch_sweep(
-    path: &str,
+    prepared: &PreparedData,
+    split: SplitPlan,
     nc: &NumericConfig,
     base_tcfg: &TrainConfig,
     milestones: &[usize],
@@ -886,9 +907,8 @@ fn run_epoch_sweep(
         return Err("plateau-min-r2 должен быть конечным".to_string());
     }
 
-    let (data, schema) = read_numeric_source(path)?;
-    let dataset = Dataset::new(data, schema)?;
-    let prepared = SplitPlan::default().prepare(dataset.data())?;
+    let dataset = Dataset::new(clone_data(prepared), prepared.schema.clone())?;
+    let splits = split.prepare(dataset.data())?;
     let mut points: Vec<usize> = milestones.iter().copied().filter(|&e| e > 0).collect();
     points.sort_unstable();
     points.dedup();
@@ -904,7 +924,7 @@ fn run_epoch_sweep(
     };
     let rows = epoch_sweep::run_epoch_sweep_cb(
         &dataset,
-        &prepared.search,
+        &splits.search,
         nc,
         base_tcfg,
         &points,
@@ -919,6 +939,43 @@ fn run_epoch_sweep(
     });
     ctx.request_repaint();
     Ok(())
+}
+
+/// Копия данных для `Dataset`: активный набор живёт в сессии под `Arc`, а ядру
+/// нужен владеющий экземпляр.
+fn clone_data(prepared: &PreparedData) -> NumericDataset {
+    prepared
+        .data
+        .gather(&(0..prepared.data.len()).collect::<Vec<_>>())
+}
+
+/// Прочитать источник данных: сгенерировать чёрный ящик либо прочитать файл.
+///
+/// Дальше сессия работает с готовыми данными, поэтому файл открывается ровно
+/// один раз — на этом и держится инвариант «один активный датасет».
+fn open_dataset(origin: &DatasetOrigin) -> Result<PreparedData, String> {
+    let (data, schema) = match origin {
+        DatasetOrigin::Blackbox(name) => {
+            let bb = blackbox::by_name(name)
+                .ok_or_else(|| format!("неизвестный чёрный ящик: {name}"))?;
+            // Seed обучения не должен менять саму выборку.
+            (
+                bb.generate(2000, DEFAULT_DATA_SEED),
+                ModelSchema::synthetic(bb.n_inputs(), bb.n_outputs)?,
+            )
+        }
+        DatasetOrigin::File(path) => read_numeric_source(path)?,
+        DatasetOrigin::Table(path) => {
+            return Err(format!(
+                "{path}: размеченная таблица приходит из диалога разметки, а не из чтения"
+            ))
+        }
+    };
+    Ok(PreparedData {
+        origin: origin.clone(),
+        data: Arc::new(data),
+        schema,
+    })
 }
 
 /// Прочитать таблицу и посчитать профиль. Автоопределение подсказывает границу
@@ -954,7 +1011,8 @@ fn open_table(
 /// Обучение в worker-потоке. Возвращает обученную модель (Rc живёт здесь) или
 /// `None` при отмене.
 fn train_numeric(
-    source: &DataSource,
+    prepared: &PreparedData,
+    split: SplitPlan,
     nc: &NumericConfig,
     tcfg: &TrainConfig,
     evt_tx: &Sender<Event>,
@@ -964,31 +1022,13 @@ fn train_numeric(
     validate_numeric(nc)?;
     validate_train(tcfg.lr, tcfg.batch_size)?;
 
-    let (data, schema): (Arc<NumericDataset>, ModelSchema) = match source {
-        DataSource::Prepared { data, schema, .. } => (Arc::clone(data), schema.clone()),
-        DataSource::Blackbox(name) => {
-            let bb = blackbox::by_name(name)
-                .ok_or_else(|| format!("неизвестный чёрный ящик: {name}"))?;
-            // Seed обучения не должен менять саму выборку.
-            (
-                Arc::new(bb.generate(2000, DEFAULT_DATA_SEED)),
-                ModelSchema::synthetic(bb.n_inputs(), bb.n_outputs)?,
-            )
-        }
-        DataSource::File(path) => {
-            let (data, schema) = read_numeric_source(path)?;
-            (Arc::new(data), schema)
-        }
-    };
+    let (data, schema) = (Arc::clone(&prepared.data), prepared.schema.clone());
     let in_specs = schema.feature_specs();
     let n_inputs = data.inputs.ncols();
     let n_out = data.outputs.ncols();
     // Данные уже могут быть общими (размеченная таблица), поэтому Dataset
     // строится из копии: владение остаётся у вызывающего.
-    let dataset = Dataset::new(
-        data.gather(&(0..data.len()).collect::<Vec<_>>()),
-        schema.clone(),
-    )?;
+    let dataset = Dataset::new(clone_data(prepared), schema.clone())?;
 
     // Счётчик параметров нужен до обучения; RNG это не сбивает — ядро само
     // выставляет seed перед построением модели.
@@ -1004,7 +1044,7 @@ fn train_numeric(
     let setup = TrainingSetup::new(nc.clone(), tcfg.clone());
     let outcome = run_training(
         &dataset,
-        SplitPlan::default(),
+        split,
         &setup,
         false,
         DEFAULT_FINAL_INIT_SEED,
@@ -1026,8 +1066,8 @@ fn train_numeric(
         return Ok(None);
     }
 
-    let prepared = SplitPlan::default().prepare(dataset.data())?;
-    let (train, val) = prepared.search.fold(0)?;
+    let splits = split.prepare(dataset.data())?;
+    let (train, val) = splits.search.fold(0)?;
     let TrainedModel {
         model,
         in_norm,
@@ -1050,7 +1090,7 @@ fn train_numeric(
         n_outputs: n_out,
         diag: Some(DiagData {
             nc: nc.clone(),
-            source: source.clone(),
+            origin: prepared.origin.clone(),
             in_specs,
             train,
             val,
@@ -1121,7 +1161,7 @@ mod tests {
             n_outputs: train.outputs.ncols(),
             diag: Some(DiagData {
                 nc: config,
-                source: DataSource::Blackbox("sum".to_string()),
+                origin: DatasetOrigin::Blackbox("sum".to_string()),
                 in_specs,
                 train,
                 val,

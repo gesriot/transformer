@@ -8,29 +8,56 @@ use crate::markup::TableProfile;
 use crate::metrics::Metrics;
 use crate::numeric_model::{ModelKind, NumericConfig};
 use crate::schema::ModelSchema;
+use crate::split::SplitPlan;
 use crate::sweep::{SweepAxes, SweepObjective, SweepRow};
 use crate::table::Table;
 use crate::tnum::PrepareSpec;
 use crate::train::{TextTrainConfig, TrainConfig};
 use std::sync::Arc;
 
-/// Источник данных для обучения.
-#[derive(Clone)]
-pub enum DataSource {
+/// Откуда взялся активный набор данных.
+///
+/// Нужен не для чтения — данные уже прочитаны, — а для подписи в интерфейсе и
+/// для диагностики: чувствительность исходного процесса считается только у
+/// вызываемого чёрного ящика.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DatasetOrigin {
     Blackbox(String),
-    /// Путь к готовому источнику (`.tnum` со своей схемой либо таблица,
-    /// размеченная автоопределением).
+    /// `.tnum` со своей схемой.
     File(String),
-    /// Данные, размеченные пользователем в диалоге.
-    ///
-    /// Передаём именно данные, а не путь: иначе worker открыл бы файл заново
-    /// через автоопределение и ручная разметка потерялась бы. Временный
-    /// адаптер до общего ядра обучения (Э4).
-    Prepared {
-        name: String,
-        data: Arc<NumericDataset>,
-        schema: ModelSchema,
-    },
+    /// Таблица, размеченная пользователем в диалоге.
+    Table(String),
+}
+
+impl DatasetOrigin {
+    pub fn blackbox(&self) -> Option<&str> {
+        match self {
+            DatasetOrigin::Blackbox(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// Короткая подпись для шапки: путь целиком там не помещается.
+    pub fn short_name(&self) -> String {
+        match self {
+            DatasetOrigin::Blackbox(name) => format!("чёрный ящик: {name}"),
+            DatasetOrigin::File(path) | DatasetOrigin::Table(path) => std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.clone()),
+        }
+    }
+}
+
+/// Готовый набор данных: значения, схема и происхождение.
+///
+/// В worker передаются именно данные, а не путь: иначе он открыл бы файл
+/// заново через автоопределение и ручная разметка потерялась бы.
+#[derive(Clone)]
+pub struct PreparedData {
+    pub origin: DatasetOrigin,
+    pub data: Arc<NumericDataset>,
+    pub schema: ModelSchema,
 }
 
 /// Результат диагностики (числа для UI).
@@ -76,8 +103,14 @@ pub struct KanSymbolicInfo {
 
 /// Команды UI -> worker.
 pub enum Command {
+    /// Открыть набор данных: сгенерировать чёрный ящик или прочитать `.tnum`.
+    /// Чтение — в worker-е, дальше сессия работает с готовыми данными.
+    OpenDataset {
+        origin: DatasetOrigin,
+    },
     TrainNumeric {
-        source: DataSource,
+        data: PreparedData,
+        split: SplitPlan,
         nc: NumericConfig,
         tcfg: TrainConfig,
     },
@@ -100,8 +133,9 @@ pub enum Command {
         blackbox: String,
         axes: SweepAxes,
     },
-    OptimizeFile {
-        path: String,
+    Optimize {
+        data: PreparedData,
+        split: SplitPlan,
         axes: SweepAxes,
         objective: SweepObjective,
     },
@@ -129,7 +163,8 @@ pub enum Command {
         has_header: bool,
     },
     EpochSweep {
-        path: String,
+        data: PreparedData,
+        split: SplitPlan,
         nc: NumericConfig,
         base_tcfg: TrainConfig,
         milestones: Vec<usize>,
@@ -155,6 +190,10 @@ pub enum Event {
     /// Завершение обучения: `Some` — метрики на validation, `None` — отменено.
     TrainDone {
         metrics: Option<Metrics>,
+    },
+    /// Набор данных открыт и готов к работе.
+    DatasetOpened {
+        data: PreparedData,
     },
     /// Таблица прочитана и профилирована. Подсказки только заполняют начальное
     /// состояние диалога, решение остаётся за пользователем.
