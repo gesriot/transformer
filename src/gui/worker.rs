@@ -1297,6 +1297,76 @@ mod tests {
     }
 
     #[test]
+    fn final_gui_interpretation_publishes_a_final_only_report() {
+        let data = blackbox::sum().generate(64, 0);
+        let prepared = PreparedData {
+            origin: DatasetOrigin::Blackbox("sum".to_string()),
+            data: Arc::new(data),
+            schema: ModelSchema::synthetic(2, 1).unwrap(),
+        };
+        let config = NumericConfig {
+            kind: ModelKind::Kan,
+            transformer: ModelConfig::default(),
+            value: ValueEncoderConfig::default(),
+            mlp_width: 4,
+            mlp_layers: 1,
+            kan: KanConfig {
+                width: 2,
+                layers: 2,
+                grid: 3,
+            },
+        };
+        let train = TrainConfig {
+            epochs: 1,
+            batch_size: 16,
+            ..Default::default()
+        };
+        let profile = InterpretProfile {
+            prune: Some(0.9),
+            finetune_epochs: 1,
+            compact: true,
+            ..InterpretProfile::v1()
+        };
+        let (tx, rx) = mpsc::channel();
+
+        let loaded = train_numeric(
+            &prepared,
+            SplitPlan::default(),
+            &config,
+            &train,
+            EvalSchedule::Never,
+            Some(profile),
+            true,
+            &tx,
+            &egui::Context::default(),
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        .expect("финальная KAN");
+        assert_eq!(loaded.interpret, Some(profile));
+
+        let reports = rx
+            .try_iter()
+            .find_map(|event| match event {
+                Event::TrainDone {
+                    interpret,
+                    final_eval,
+                    cancelled,
+                    ..
+                } => {
+                    assert!(!cancelled);
+                    assert!(final_eval.is_some(), "test измеряется после конвейера");
+                    interpret
+                }
+                _ => None,
+            })
+            .expect("отчёт конвейера");
+        assert!(reports.development.is_none());
+        assert!(reports.final_model.is_some());
+        assert_eq!(reports.profile(), Some(&profile));
+    }
+
+    #[test]
     fn development_gui_training_reports_each_output() {
         let inputs =
             Array2::from_shape_fn((64, 2), |(row, column)| (row as f32 + column as f32) / 64.0);

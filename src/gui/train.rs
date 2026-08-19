@@ -425,12 +425,17 @@ impl App {
     /// Переключатель конвейера рядом с параметрами KAN; переопределения — под
     /// «Дополнительно», потому что нужны редко.
     fn ui_interpret_controls(&mut self, ui: &mut egui::Ui) {
-        self.ui_interpret_controls_for(ui, self.form.kind);
+        self.ui_interpret_controls_for(ui, self.form.kind, "single");
     }
 
     /// То же для модели, выбранной поиском: её вид берётся из строки, а не из
     /// формы ручного режима.
-    fn ui_interpret_controls_for(&mut self, ui: &mut egui::Ui, kind: ModelKind) {
+    fn ui_interpret_controls_for(
+        &mut self,
+        ui: &mut egui::Ui,
+        kind: ModelKind,
+        context: &'static str,
+    ) {
         if kind != ModelKind::Kan {
             return;
         }
@@ -451,7 +456,10 @@ impl App {
             }
         }
         egui::CollapsingHeader::new("Дополнительно")
-            .id_salt("interpret_overrides")
+            // Результаты поиска не очищаются при переходе в ручной режим, и
+            // оба блока могут оказаться в одном кадре. Их состояние раскрытия
+            // не должно делить один egui-id.
+            .id_salt(("interpret_overrides", context))
             .show(ui, |ui| {
                 let o = &mut self.interpret_overrides;
                 let default = InterpretProfile::v1();
@@ -934,7 +942,7 @@ impl App {
         if chosen.as_ref().is_some_and(|c| c.kind == ModelKind::Kan) {
             ui.separator();
             ui.label("Ранжирование выполнено до конвейера интерпретации.");
-            self.ui_interpret_controls_for(ui, ModelKind::Kan);
+            self.ui_interpret_controls_for(ui, ModelKind::Kan, "search");
         }
 
         ui.horizontal(|ui| {
