@@ -1123,7 +1123,9 @@ fn train_numeric(
             init_seed: tcfg.seed,
         }),
         final_eval,
-        interpret: development.clone().map(|development| {
+        // Публикуем, если есть хотя бы один отчёт: после поиска фаза только
+        // финальная, и её отчёт терять нельзя.
+        interpret: (development.is_some() || final_report.is_some()).then(|| {
             Box::new(InterpretReports {
                 development,
                 final_model: final_report,

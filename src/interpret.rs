@@ -99,7 +99,10 @@ impl InterpretProfile {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct InterpretOverrides {
     pub l1: Option<f32>,
-    pub prune: Option<f32>,
+    /// Трёхсоставное: `None` — взять из профиля, `Some(None)` — явно выключить
+    /// прунинг, `Some(Some(θ))` — задать порог. Двух состояний не хватает:
+    /// иначе выключенный прунинг не отличить от «не трогали».
+    pub prune: Option<Option<f32>>,
     pub finetune_epochs: Option<usize>,
     pub compact: Option<bool>,
 }
@@ -131,7 +134,7 @@ pub fn resolve(
         profile.l1 = l1;
     }
     if let Some(prune) = overrides.prune {
-        profile.prune = Some(prune);
+        profile.prune = prune;
     }
     if let Some(epochs) = overrides.finetune_epochs {
         profile.finetune_epochs = epochs;
@@ -431,7 +434,7 @@ mod tests {
     #[test]
     fn invalid_overrides_are_an_error_not_a_silent_skip() {
         let overrides = InterpretOverrides {
-            prune: Some(1.5),
+            prune: Some(Some(1.5)),
             ..Default::default()
         };
         // С профилем и без него результат одинаков: это ошибка, а не None.
@@ -541,7 +544,7 @@ mod tests {
         let p = resolve(
             true,
             &InterpretOverrides {
-                prune: Some(0.2),
+                prune: Some(Some(0.2)),
                 compact: Some(false),
                 ..Default::default()
             },
@@ -553,6 +556,30 @@ mod tests {
         // Не переопределённое остаётся профильным.
         assert_eq!(p.l1, InterpretProfile::v1().l1);
         assert_eq!(p.finetune_epochs, InterpretProfile::v1().finetune_epochs);
+    }
+
+    /// Прунинг обязан выключаться явно: иначе снятый флажок в интерфейсе на
+    /// следующем кадре снова включался бы значением из профиля.
+    #[test]
+    fn pruning_can_be_switched_off_explicitly() {
+        let off = resolve(
+            true,
+            &InterpretOverrides {
+                prune: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(off.prune, None);
+        // Профиль по умолчанию прунинг включает — значит выключение сработало.
+        assert!(InterpretProfile::v1().prune.is_some());
+
+        // Отсутствие переопределения по-прежнему означает «как в профиле».
+        let kept = resolve(true, &InterpretOverrides::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.prune, InterpretProfile::v1().prune);
     }
 
     #[test]
@@ -608,7 +635,7 @@ mod tests {
                 resolve(
                     false,
                     &InterpretOverrides {
-                        prune: Some(prune),
+                        prune: Some(Some(prune)),
                         ..Default::default()
                     }
                 )

@@ -146,24 +146,24 @@ impl App {
         }
         if let Some(reports) = &self.interpret_reports {
             ui.separator();
-            ui.label(format!(
-                "Конвейер интерпретации {}",
-                reports.development.profile.describe()
-            ));
+            if let Some(profile) = reports.profile() {
+                ui.label(format!("Конвейер интерпретации {}", profile.describe()));
+            }
             // У модели разработки виден эффект прунинга на validation…
-            let d = &reports.development;
-            if let (Some(before), Some(after), Some(ft)) =
-                (d.r2_before, d.r2_after_prune, d.r2_after_finetune)
-            {
+            if let Some(d) = &reports.development {
+                if let (Some(before), Some(after), Some(ft)) =
+                    (d.r2_before, d.r2_after_prune, d.r2_after_finetune)
+                {
+                    ui.label(format!(
+                        "R² на validation: до прунинга {before:.5} → после {after:.5} → \
+                         после fine-tune {ft:.5}"
+                    ));
+                }
                 ui.label(format!(
-                    "R² на validation: до прунинга {before:.5} → после {after:.5} → \
-                     после fine-tune {ft:.5}"
+                    "Активных рёбер после прунинга: {}/{}",
+                    d.active_edges.0, d.active_edges.1
                 ));
             }
-            ui.label(format!(
-                "Активных рёбер после прунинга: {}/{}",
-                d.active_edges.0, d.active_edges.1
-            ));
             // …а у финальной — какой стала структура сохранённой модели.
             if let Some(f) = &reports.final_model {
                 if let Some(c) = f.compaction {

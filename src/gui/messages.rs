@@ -53,12 +53,24 @@ impl DatasetOrigin {
 
 /// Отчёты конвейера интерпретации по фазам.
 ///
-/// Их два, потому что смысл разный: у модели разработки видно, как прунинг
-/// повлиял на validation, у финальной — какой стала структура.
+/// Оба необязательны: смысл у них разный (у модели разработки видно влияние
+/// прунинга на validation, у финальной — какая получилась структура), и фазы
+/// бывают по отдельности. Финальное обучение после поиска состоит ТОЛЬКО из
+/// финальной фазы, поэтому обязательный development терял бы её отчёт.
 #[derive(Clone, Debug)]
 pub struct InterpretReports {
-    pub development: InterpretReport,
+    pub development: Option<InterpretReport>,
     pub final_model: Option<InterpretReport>,
+}
+
+impl InterpretReports {
+    /// Профиль общий для обеих фаз — берём у того отчёта, который есть.
+    pub fn profile(&self) -> Option<&InterpretProfile> {
+        self.development
+            .as_ref()
+            .or(self.final_model.as_ref())
+            .map(|r| &r.profile)
+    }
 }
 
 /// Готовый набор данных: значения, схема и происхождение.

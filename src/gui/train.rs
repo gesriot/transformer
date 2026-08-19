@@ -425,7 +425,13 @@ impl App {
     /// Переключатель конвейера рядом с параметрами KAN; переопределения — под
     /// «Дополнительно», потому что нужны редко.
     fn ui_interpret_controls(&mut self, ui: &mut egui::Ui) {
-        if self.form.kind != ModelKind::Kan {
+        self.ui_interpret_controls_for(ui, self.form.kind);
+    }
+
+    /// То же для модели, выбранной поиском: её вид берётся из строки, а не из
+    /// формы ручного режима.
+    fn ui_interpret_controls_for(&mut self, ui: &mut egui::Ui, kind: ModelKind) {
+        if kind != ModelKind::Kan {
             return;
         }
         ui.checkbox(
@@ -463,15 +469,19 @@ impl App {
                     o.l1 = Some(l1);
                 }
 
-                let mut prune_enabled = o.prune.or(default.prune).is_some();
+                // Текущее значение: переопределение, иначе профильное.
+                let effective_prune = o.prune.unwrap_or(default.prune);
+                let mut prune_enabled = effective_prune.is_some();
                 if ui.checkbox(&mut prune_enabled, "прунинг").changed() {
-                    o.prune = prune_enabled.then_some(default.prune.unwrap_or(0.05));
+                    // Выключение записывается ЯВНО: без этого следующий кадр
+                    // снова взял бы порог из профиля и флажок бы «отскочил».
+                    o.prune = Some(prune_enabled.then(|| default.prune.unwrap_or(0.05)));
                     if !prune_enabled {
                         o.finetune_epochs = None;
                     }
                 }
                 if prune_enabled {
-                    let mut prune = o.prune.or(default.prune).unwrap_or(0.05);
+                    let mut prune = effective_prune.unwrap_or(0.05);
                     if ui
                         .add(
                             egui::DragValue::new(&mut prune)
@@ -481,7 +491,7 @@ impl App {
                         )
                         .changed()
                     {
-                        o.prune = Some(prune);
+                        o.prune = Some(Some(prune));
                     }
                     let mut epochs = o.finetune_epochs.unwrap_or(default.finetune_epochs);
                     if ui
@@ -918,6 +928,15 @@ impl App {
                 Some(0)
             })
             .and_then(|i| self.search_rows.get(i).map(|r| r.choice.clone()));
+
+        // Конвейер применяется уже к выбранной модели, поэтому его настройки
+        // стоят здесь же, а не только в ручном режиме.
+        if chosen.as_ref().is_some_and(|c| c.kind == ModelKind::Kan) {
+            ui.separator();
+            ui.label("Ранжирование выполнено до конвейера интерпретации.");
+            self.ui_interpret_controls_for(ui, ModelKind::Kan);
+        }
+
         ui.horizontal(|ui| {
             let ready = chosen.is_some() && !self.busy() && !stale;
             if ui

@@ -277,7 +277,9 @@ fn numeric_config_from(f: &Flags) -> Result<NumericConfig, String> {
 fn interpret_from(f: &Flags, nc: &NumericConfig) -> Result<Option<InterpretProfile>, String> {
     let overrides = InterpretOverrides {
         l1: f.f32("kan-l1")?,
-        prune: f.f32("kan-prune")?,
+        // Явное выключение прунинга из CLI пока не требуется: флага для него
+        // нет, поэтому переопределение только задаёт порог.
+        prune: f.f32("kan-prune")?.map(Some),
         finetune_epochs: f.usize("kan-finetune-epochs")?,
         compact: f.has("kan-compact").then_some(true),
     };
