@@ -739,6 +739,8 @@ fn apply_kan_pipeline(
         &trained.out_norm,
         tcfg,
         profile,
+        // В CLI отменять некому: отмена приходит только из интерфейса.
+        &std::sync::atomic::AtomicBool::new(false),
     )
     .unwrap_or_else(|e| fail(&e));
     print_interpret_report(&report);

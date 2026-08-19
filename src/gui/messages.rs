@@ -3,6 +3,7 @@
 
 use crate::config::ModelConfig;
 use crate::data::{NumericDataset, OutOfRange};
+use crate::interpret::{InterpretProfile, InterpretReport};
 use crate::markup::TableProfile;
 use crate::metrics::Metrics;
 use crate::numeric_model::{ModelKind, NumericConfig};
@@ -48,6 +49,16 @@ impl DatasetOrigin {
                 .unwrap_or_else(|| path.clone()),
         }
     }
+}
+
+/// Отчёты конвейера интерпретации по фазам.
+///
+/// Их два, потому что смысл разный: у модели разработки видно, как прунинг
+/// повлиял на validation, у финальной — какой стала структура.
+#[derive(Clone, Debug)]
+pub struct InterpretReports {
+    pub development: InterpretReport,
+    pub final_model: Option<InterpretReport>,
 }
 
 /// Готовый набор данных: значения, схема и происхождение.
@@ -129,6 +140,8 @@ pub enum Command {
         /// Когда снимать метрики на validation по ходу обучения. Кривая по
         /// эпохам — настройка обычного обучения, а не отдельный сценарий.
         eval: EvalSchedule,
+        /// Конвейер интерпретации: применяется в обеих фазах или нигде.
+        interpret: Option<InterpretProfile>,
         /// Переобучить выбранную конфигурацию на train+validation и один раз
         /// открыть test. Запрашивается только для финального обучения.
         final_phase: bool,
@@ -201,6 +214,9 @@ pub enum Event {
     /// финальный test; отмена помечается отдельно, чтобы не смешивать случаи.
     TrainDone {
         metrics: Option<Metrics>,
+        /// Отчёты конвейера по фазам: развитие и финальная модель. В боксе,
+        /// потому что иначе один этот вариант раздувает всё перечисление.
+        interpret: Option<Box<InterpretReports>>,
         /// Поколоночные validation-метрики development-модели.
         per_output: Option<Vec<Metrics>>,
         validation_origin: Option<ValidationOrigin>,

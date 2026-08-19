@@ -144,6 +144,41 @@ impl App {
         } else {
             ui.label("Checkpoint не хранит метрики: они появятся после обучения в этой сессии.");
         }
+        if let Some(reports) = &self.interpret_reports {
+            ui.separator();
+            ui.label(format!(
+                "Конвейер интерпретации {}",
+                reports.development.profile.describe()
+            ));
+            // У модели разработки виден эффект прунинга на validation…
+            let d = &reports.development;
+            if let (Some(before), Some(after), Some(ft)) =
+                (d.r2_before, d.r2_after_prune, d.r2_after_finetune)
+            {
+                ui.label(format!(
+                    "R² на validation: до прунинга {before:.5} → после {after:.5} → \
+                     после fine-tune {ft:.5}"
+                ));
+            }
+            ui.label(format!(
+                "Активных рёбер после прунинга: {}/{}",
+                d.active_edges.0, d.active_edges.1
+            ));
+            // …а у финальной — какой стала структура сохранённой модели.
+            if let Some(f) = &reports.final_model {
+                if let Some(c) = f.compaction {
+                    ui.label(format!(
+                        "Финальная модель: скрытых узлов {} → {}, параметров {} → {}",
+                        c.nodes_before, c.nodes_after, c.params_before, c.params_after
+                    ));
+                }
+                ui.label(format!(
+                    "Активных рёбер финальной модели: {}/{}",
+                    f.active_edges.0, f.active_edges.1
+                ));
+            }
+        }
+
         if ui
             .add_enabled(!self.busy(), egui::Button::new("Сохранить модель…"))
             .clicked()

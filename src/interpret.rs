@@ -15,7 +15,8 @@
 use crate::data::{Normalizer, NumericDataset};
 use crate::kan::CompactReport;
 use crate::numeric_model::NumericModel;
-use crate::train::{evaluate_surrogate, train_surrogate, TrainConfig};
+use crate::train::{evaluate_surrogate, train_surrogate_cb, TrainConfig};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Версия профиля. Меняется, если меняется смысл или состав параметров.
 pub const INTERPRET_PROFILE_VERSION: u32 = 1;
@@ -170,6 +171,9 @@ pub struct InterpretReport {
     /// Структурное сжатие: узлы и параметры до/после.
     pub compaction: Option<CompactReport>,
     pub r2_after_compact: Option<f32>,
+    /// Конвейер прерван отменой: модель осталась в промежуточном состоянии и
+    /// её нельзя ни сохранять, ни считать финальной.
+    pub cancelled: bool,
 }
 
 impl InterpretReport {
@@ -197,6 +201,7 @@ pub fn apply_l1(model: &NumericModel, profile: &InterpretProfile) -> Result<(), 
 /// `eval` — набор для отчёта о влиянии (validation в фазе разработки). Его
 /// отсутствие меняет только отчёт, но не сами операции: модель обязана
 /// получиться той же.
+#[allow(clippy::too_many_arguments)]
 pub fn run_pipeline(
     model: &mut NumericModel,
     train: &NumericDataset,
@@ -205,6 +210,7 @@ pub fn run_pipeline(
     out_norm: &Normalizer,
     tcfg: &TrainConfig,
     profile: &InterpretProfile,
+    cancel: &AtomicBool,
 ) -> Result<InterpretReport, String> {
     profile.validate()?;
     if model.as_kan().is_none() {
@@ -230,7 +236,32 @@ pub fn run_pipeline(
             epochs: profile.finetune_epochs,
             ..tcfg.clone()
         };
-        train_surrogate(model, train, in_norm, out_norm, &ft_cfg);
+        // Дообучение — это ещё десятки эпох, поэтому оно обязано слушать
+        // отмену: иначе кнопка в интерфейсе перестаёт реагировать.
+        train_surrogate_cb(
+            model,
+            train,
+            in_norm,
+            out_norm,
+            &ft_cfg,
+            &mut |_, _| true,
+            cancel,
+        );
+        if cancel.load(Ordering::Relaxed) {
+            // Модель осталась недообученной: структуру дальше не трогаем, а
+            // вызывающий по флагу поймёт, что результат неполон.
+            return Ok(InterpretReport {
+                profile: *profile,
+                per_layer,
+                active_edges: model.as_kan().expect("проверено выше").active_edges(),
+                r2_before,
+                r2_after_prune,
+                r2_after_finetune: None,
+                compaction: None,
+                r2_after_compact: None,
+                cancelled: true,
+            });
+        }
         r2_after_finetune = measure(model);
     }
 
@@ -251,6 +282,7 @@ pub fn run_pipeline(
         r2_after_finetune,
         compaction,
         r2_after_compact,
+        cancelled: false,
     })
 }
 
@@ -311,6 +343,7 @@ mod tests {
             &out_norm,
             &train_cfg(),
             profile,
+            &AtomicBool::new(false),
         )
         .unwrap();
         (model, report)
@@ -391,6 +424,54 @@ mod tests {
         assert_eq!(report.active_edges.0, report.active_edges.1);
     }
 
+    /// Отмена во время fine-tune обязана прерывать конвейер: модель осталась
+    /// недообученной, сжатие не выполняется, результат помечен неполным.
+    /// Невалидные переопределения обязаны быть ошибкой, а не «конвейера нет»:
+    /// иначе интерфейс запустил бы обучение без того, что просили.
+    #[test]
+    fn invalid_overrides_are_an_error_not_a_silent_skip() {
+        let overrides = InterpretOverrides {
+            prune: Some(1.5),
+            ..Default::default()
+        };
+        // С профилем и без него результат одинаков: это ошибка, а не None.
+        assert!(resolve(true, &overrides).is_err());
+        assert!(resolve(false, &overrides).is_err());
+    }
+
+    #[test]
+    fn cancel_stops_the_pipeline_and_marks_the_report() {
+        let data = blackbox::sum().generate(96, 0);
+        let prepared = SplitPlan::default().prepare(&data).unwrap();
+        let (train, val) = prepared.search.fold(0).unwrap();
+        let specs = vec![FeatureSpec::Continuous; 2];
+        let (in_norm, out_norm) = fit_normalizers(&train, &specs);
+
+        crate::init::set_init_seed(0);
+        let nc = kan_config();
+        let mut model = nc.build(&specs, 1);
+        let profile = InterpretProfile::v1();
+        let cancelled = AtomicBool::new(true);
+        let report = run_pipeline(
+            &mut model,
+            &train,
+            Some(&val),
+            &in_norm,
+            &out_norm,
+            &train_cfg(),
+            &profile,
+            &cancelled,
+        )
+        .unwrap();
+
+        assert!(report.cancelled);
+        // Прунинг уже произошёл, а вот дообучение и сжатие — нет.
+        assert!(!report.per_layer.is_empty());
+        assert!(report.r2_after_finetune.is_none());
+        assert!(report.compaction.is_none());
+        assert!(report.r2_after_compact.is_none());
+    }
+
     #[test]
     fn pipeline_rejects_non_kan_models() {
         let specs = vec![FeatureSpec::Continuous; 2];
@@ -409,6 +490,7 @@ mod tests {
             &out_norm,
             &train_cfg(),
             &InterpretProfile::v1(),
+            &AtomicBool::new(false),
         )
         .unwrap_err();
         assert!(err.contains("только к KAN"), "{err}");

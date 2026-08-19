@@ -6,6 +6,7 @@ use super::session::App;
 use crate::config::ModelConfig;
 use crate::encoders::{ValueEncoderConfig, ValueEncoderKind};
 use crate::epoch_sweep;
+use crate::interpret::{self, InterpretOverrides, InterpretProfile};
 use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
 use crate::split::DEFAULT_FINAL_INIT_SEED;
 use crate::sweep::{self, SearchBudget, SweepAxes, SweepChoice, SweepObjective, SweepRow};
@@ -408,6 +409,103 @@ impl App {
         )
     }
 
+    /// Профиль интерпретации для запуска. Только у KAN: у остальных моделей
+    /// конвейера нет, и молча применять его нельзя.
+    ///
+    /// Ошибка разрешения профиля возвращается наверх, а не гасится: иначе
+    /// обучение молча пошло бы БЕЗ конвейера, хотя его просили.
+    fn interpret_profile(&self, kind: ModelKind) -> Result<Option<InterpretProfile>, String> {
+        if !self.interpret_enabled || kind != ModelKind::Kan {
+            return Ok(None);
+        }
+        interpret::resolve(true, &self.interpret_overrides)
+            .map_err(|e| format!("конвейер интерпретации: {e}"))
+    }
+
+    /// Переключатель конвейера рядом с параметрами KAN; переопределения — под
+    /// «Дополнительно», потому что нужны редко.
+    fn ui_interpret_controls(&mut self, ui: &mut egui::Ui) {
+        if self.form.kind != ModelKind::Kan {
+            return;
+        }
+        ui.checkbox(
+            &mut self.interpret_enabled,
+            "Интерпретируемая KAN, профиль v1",
+        );
+        if !self.interpret_enabled {
+            return;
+        }
+        match interpret::resolve(true, &self.interpret_overrides) {
+            Ok(Some(profile)) => {
+                ui.label(format!("Конвейер {}", profile.describe()));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                ui.colored_label(egui::Color32::from_rgb(200, 60, 60), e);
+            }
+        }
+        egui::CollapsingHeader::new("Дополнительно")
+            .id_salt("interpret_overrides")
+            .show(ui, |ui| {
+                let o = &mut self.interpret_overrides;
+                let default = InterpretProfile::v1();
+
+                let mut l1 = o.l1.unwrap_or(default.l1);
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut l1)
+                            .range(0.0..=1.0)
+                            .speed(1e-4)
+                            .prefix("L1 "),
+                    )
+                    .changed()
+                {
+                    o.l1 = Some(l1);
+                }
+
+                let mut prune_enabled = o.prune.or(default.prune).is_some();
+                if ui.checkbox(&mut prune_enabled, "прунинг").changed() {
+                    o.prune = prune_enabled.then_some(default.prune.unwrap_or(0.05));
+                    if !prune_enabled {
+                        o.finetune_epochs = None;
+                    }
+                }
+                if prune_enabled {
+                    let mut prune = o.prune.or(default.prune).unwrap_or(0.05);
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut prune)
+                                .range(0.0..=0.99)
+                                .speed(0.01)
+                                .prefix("порог "),
+                        )
+                        .changed()
+                    {
+                        o.prune = Some(prune);
+                    }
+                    let mut epochs = o.finetune_epochs.unwrap_or(default.finetune_epochs);
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut epochs)
+                                .range(1..=1000)
+                                .prefix("fine-tune "),
+                        )
+                        .changed()
+                    {
+                        o.finetune_epochs = Some(epochs);
+                    }
+                }
+
+                let mut compact = o.compact.unwrap_or(default.compact);
+                if ui.checkbox(&mut compact, "структурное сжатие").changed() {
+                    o.compact = Some(compact);
+                }
+                if ui.button("Сбросить к профилю").clicked() {
+                    *o = InterpretOverrides::default();
+                }
+            });
+    }
+
     /// Расписание замеров validation по эпохам: кривая обучения — настройка
     /// обычного обучения, а не отдельный сценарий.
     fn eval_schedule(&self) -> EvalSchedule {
@@ -503,6 +601,7 @@ impl App {
         });
 
         self.eval_every = self.eval_every.min(self.form.epochs);
+        self.ui_interpret_controls(ui);
         ui.horizontal(|ui| {
             ui.label("validation каждые");
             ui.add(egui::DragValue::new(&mut self.eval_every).range(0..=self.form.epochs));
@@ -549,6 +648,13 @@ impl App {
             {
                 match (self.form.build(), self.active_data()) {
                     (Ok((nc, tcfg)), Ok((data, split))) => {
+                        let interpret = match self.interpret_profile(nc.kind) {
+                            Ok(profile) => profile,
+                            Err(e) => {
+                                self.status = format!("Ошибка: {e}");
+                                return;
+                            }
+                        };
                         self.train_parameter_count = None;
                         self.worker.reset_cancel();
                         self.worker.send(Command::TrainNumeric {
@@ -557,6 +663,7 @@ impl App {
                             nc,
                             tcfg,
                             eval: self.eval_schedule(),
+                            interpret,
                             // Ручной запуск — фаза разработки: test не трогаем.
                             final_phase: false,
                         });
@@ -881,6 +988,13 @@ impl App {
             self.status = format!("Ошибка: {e}");
             return;
         }
+        let interpret = match self.interpret_profile(nc.kind) {
+            Ok(profile) => profile,
+            Err(e) => {
+                self.status = format!("Ошибка: {e}");
+                return;
+            }
+        };
         self.train_parameter_count = None;
         self.worker.reset_cancel();
         self.worker.send(Command::TrainNumeric {
@@ -891,6 +1005,7 @@ impl App {
             // Refit учится на train+validation, поэтому validation-кривой у
             // него быть не может. Число эпох уже выбрано поиском.
             eval: EvalSchedule::Never,
+            interpret,
             final_phase: true,
         });
     }

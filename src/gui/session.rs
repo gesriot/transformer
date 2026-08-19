@@ -7,14 +7,15 @@
 use super::data::{MarkupState, PrepareForm};
 use super::demo::TextForm;
 use super::messages::{
-    Command, DatasetOrigin, DiagnosticsResult, Event, KanModelInfo, KanSymbolicInfo, PreparedData,
-    ValidationOrigin,
+    Command, DatasetOrigin, DiagnosticsResult, Event, InterpretReports, KanModelInfo,
+    KanSymbolicInfo, PreparedData, ValidationOrigin,
 };
 use super::model::{ModelInfo, ModelView};
 use super::train::{CustomSearchForm, SearchForm, TrainForm, TrainingMode};
 use super::worker::Worker;
 use crate::data::OutOfRange;
 use crate::encoders::ValueEncoderKind;
+use crate::interpret::InterpretOverrides;
 use crate::markup::{Message, TableProfile};
 use crate::metrics::Metrics;
 use crate::split::{FinalEval, SplitPlan};
@@ -227,6 +228,11 @@ pub struct App {
     /// данных запускать по нему финальное обучение нельзя: строки описывают
     /// уже другой набор.
     pub(super) search_stamp: Option<(u64, SplitPlan)>,
+    /// Отчёты конвейера интерпретации по фазам.
+    pub(super) interpret_reports: Option<Box<InterpretReports>>,
+    /// Запускать ли конвейер интерпретации и с какими переопределениями.
+    pub(super) interpret_enabled: bool,
+    pub(super) interpret_overrides: InterpretOverrides,
     /// Единственный замер на test — только у финального обучения.
     pub(super) final_eval: Option<FinalEval>,
     // Режим и ручная сетка поиска
@@ -286,6 +292,9 @@ impl App {
             search_total: None,
             search_cancelled: false,
             search_stamp: None,
+            interpret_reports: None,
+            interpret_enabled: false,
+            interpret_overrides: InterpretOverrides::default(),
             final_eval: None,
             custom_form: CustomSearchForm::default(),
             mode: TrainingMode::Single,
@@ -355,6 +364,7 @@ impl App {
                     per_output,
                     validation_origin,
                     final_eval,
+                    interpret,
                     cancelled,
                 } => {
                     self.training = false;
@@ -366,6 +376,7 @@ impl App {
                         self.metrics_per_output = per_output;
                         self.validation_origin = validation_origin;
                         self.final_eval = final_eval;
+                        self.interpret_reports = interpret;
                     }
                     self.status = if cancelled {
                         "обучение отменено".to_string()

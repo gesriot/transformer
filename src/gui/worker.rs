@@ -15,8 +15,9 @@ use crate::config::ModelConfig;
 use crate::data::{Normalizer, NumericDataset, OutOfRange, TextDataset};
 use crate::encoders::FeatureSpec;
 use crate::generate::generate;
+use crate::gui::messages::InterpretReports;
 use crate::init::set_init_seed;
-use crate::interpret::InterpretProfile;
+use crate::interpret::{self, InterpretProfile, InterpretReport};
 use crate::markup::TableProfile;
 use crate::metrics::evaluate;
 use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
@@ -36,12 +37,13 @@ use crate::train::{
     TrainConfig,
 };
 use crate::training::{
-    evaluate_on, refit, run_training, Dataset, EvalSchedule, TrainedModel, TrainingSetup,
+    evaluate_on, refit, run_training, Dataset, EvalSchedule, Phase, TrainedModel, TrainingSetup,
 };
 use eframe::egui;
 use ndarray::{Array2, Ix2};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -153,6 +155,7 @@ fn worker_loop(
                 nc,
                 tcfg,
                 eval,
+                interpret,
                 final_phase,
             } => {
                 let origin = data.origin.clone();
@@ -162,6 +165,7 @@ fn worker_loop(
                     &nc,
                     &tcfg,
                     eval,
+                    interpret,
                     final_phase,
                     &evt_tx,
                     &ctx,
@@ -917,6 +921,7 @@ fn train_numeric(
     nc: &NumericConfig,
     tcfg: &TrainConfig,
     eval: EvalSchedule,
+    interpret: Option<InterpretProfile>,
     final_phase: bool,
     evt_tx: &Sender<Event>,
     ctx: &egui::Context,
@@ -944,6 +949,48 @@ fn train_numeric(
 
     let mut setup = TrainingSetup::new(nc.clone(), tcfg.clone());
     setup.eval = eval;
+
+    // Конвейер интерпретации применяется в обеих фазах или нигде: иначе
+    // сохранённая модель отличалась бы от той, по которой принимали решения.
+    // Оба хука пишут в общее состояние конвейера, поэтому оно за RefCell:
+    // одновременно взять два `&mut` на одну переменную нельзя.
+    let pipeline_error: RefCell<Option<String>> = RefCell::new(None);
+    let reports: RefCell<Vec<(Phase, InterpretReport)>> = RefCell::new(Vec::new());
+    let profile = interpret;
+    let mut configure = |_phase: Phase, model: &NumericModel| {
+        if let Some(p) = &profile {
+            if pipeline_error.borrow().is_some() {
+                return;
+            }
+            if let Err(e) = interpret::apply_l1(model, p) {
+                *pipeline_error.borrow_mut() = Some(e);
+            }
+        }
+    };
+    let mut post_train = |phase: Phase,
+                          trained: &mut TrainedModel,
+                          train_data: &NumericDataset,
+                          eval_data: Option<&NumericDataset>| {
+        let Some(p) = &profile else {
+            return;
+        };
+        if pipeline_error.borrow().is_some() {
+            return;
+        }
+        match interpret::run_pipeline(
+            &mut trained.model,
+            train_data,
+            eval_data,
+            &trained.in_norm,
+            &trained.out_norm,
+            tcfg,
+            p,
+            cancel,
+        ) {
+            Ok(report) => reports.borrow_mut().push((phase, report)),
+            Err(e) => *pipeline_error.borrow_mut() = Some(e),
+        }
+    };
     // Ручной запуск заканчивается development-моделью. После поиска выбор уже
     // сделан, поэтому финальный запуск сразу делает refit на всём pool — в том
     // числе при K-fold — и только затем один раз открывает test.
@@ -965,8 +1012,8 @@ fn train_numeric(
                     });
                     ctx.request_repaint();
                 },
-                &mut |_, _| {},
-                &mut |_, _, _, _| {},
+                &mut configure,
+                &mut post_train,
             )?;
             let Some(trained) = outcome.model else {
                 let _ = evt_tx.send(Event::TrainDone {
@@ -974,6 +1021,7 @@ fn train_numeric(
                     per_output: None,
                     validation_origin: None,
                     final_eval: None,
+                    interpret: None,
                     cancelled: true,
                 });
                 ctx.request_repaint();
@@ -1005,8 +1053,8 @@ fn train_numeric(
                     });
                     ctx.request_repaint();
                 },
-                &mut |_, _| {},
-                &mut |_, _, _, _| {},
+                &mut configure,
+                &mut post_train,
             )?;
             if cancel.load(Ordering::Relaxed) {
                 let _ = evt_tx.send(Event::TrainDone {
@@ -1014,6 +1062,7 @@ fn train_numeric(
                     per_output: None,
                     validation_origin: None,
                     final_eval: None,
+                    interpret: None,
                     cancelled: true,
                 });
                 ctx.request_repaint();
@@ -1038,6 +1087,34 @@ fn train_numeric(
         out_norm,
         ..
     } = trained;
+    if let Some(e) = pipeline_error.into_inner() {
+        return Err(e);
+    }
+    let reports = reports.into_inner();
+    // Отчёты по фазам: у development видно влияние прунинга на validation, у
+    // финальной — какой стала структура.
+    let development = reports
+        .iter()
+        .find(|(phase, _)| *phase == Phase::Development)
+        .map(|(_, r)| r.clone());
+    let final_report = reports
+        .iter()
+        .find(|(phase, _)| *phase == Phase::Final)
+        .map(|(_, r)| r.clone());
+    // Прерванный конвейер оставил модель недообученной: сохранять и открывать
+    // test по ней нельзя.
+    if reports.iter().any(|(_, r)| r.cancelled) {
+        let _ = evt_tx.send(Event::TrainDone {
+            metrics: None,
+            per_output: None,
+            validation_origin: None,
+            final_eval: None,
+            interpret: None,
+            cancelled: true,
+        });
+        ctx.request_repaint();
+        return Ok(None);
+    }
     let _ = evt_tx.send(Event::TrainDone {
         metrics,
         per_output,
@@ -1046,6 +1123,12 @@ fn train_numeric(
             init_seed: tcfg.seed,
         }),
         final_eval,
+        interpret: development.clone().map(|development| {
+            Box::new(InterpretReports {
+                development,
+                final_model: final_report,
+            })
+        }),
         cancelled: false,
     });
     ctx.request_repaint();
@@ -1058,7 +1141,9 @@ fn train_numeric(
         out_norm,
         n_inputs,
         n_outputs: n_out,
-        interpret: None,
+        // Профиль запоминается только после успешного конвейера: иначе
+        // checkpoint утверждал бы то, чего с моделью не делали.
+        interpret: profile,
         diag: Some(DiagData {
             nc: nc.clone(),
             origin: prepared.origin.clone(),
@@ -1079,6 +1164,70 @@ mod tests {
     use crate::encoders::ValueEncoderConfig;
     use crate::numeric_model::{KanConfig, ModelKind};
     use crate::train::fit_normalizers;
+
+    /// Отмена во время конвейера обязана прерывать всё: модель не сохраняется,
+    /// test не открывается, а событие честно сообщает об отмене.
+    #[test]
+    fn cancelled_pipeline_yields_no_model_and_no_test() {
+        let data = blackbox::sum().generate(64, 0);
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let prepared = PreparedData {
+            origin: DatasetOrigin::Blackbox("sum".to_string()),
+            data: Arc::new(data),
+            schema,
+        };
+        let config = NumericConfig {
+            kind: ModelKind::Kan,
+            transformer: ModelConfig::default(),
+            value: ValueEncoderConfig::default(),
+            mlp_width: 4,
+            mlp_layers: 1,
+            kan: KanConfig {
+                width: 4,
+                layers: 2,
+                grid: 5,
+            },
+        };
+        let train = TrainConfig {
+            epochs: 1,
+            batch_size: 16,
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        // Отмена взведена заранее: обучение прервётся на первом же батче.
+        let cancel = AtomicBool::new(true);
+
+        let loaded = train_numeric(
+            &prepared,
+            SplitPlan::default(),
+            &config,
+            &train,
+            EvalSchedule::Never,
+            Some(InterpretProfile::v1()),
+            true,
+            &tx,
+            &egui::Context::default(),
+            &cancel,
+        )
+        .unwrap();
+        assert!(loaded.is_none(), "модель не должна сохраняться");
+
+        let done = rx
+            .try_iter()
+            .find_map(|e| match e {
+                Event::TrainDone {
+                    final_eval,
+                    interpret,
+                    cancelled,
+                    ..
+                } => Some((final_eval.is_some(), interpret.is_some(), cancelled)),
+                _ => None,
+            })
+            .expect("событие о завершении");
+        assert!(done.2, "обучение должно быть помечено отменённым");
+        assert!(!done.0, "test открывать нельзя");
+        assert!(!done.1, "отчёт неполного конвейера не публикуется");
+    }
 
     #[test]
     fn final_gui_training_keeps_the_refit_model() {
@@ -1116,6 +1265,7 @@ mod tests {
             &config,
             &train,
             EvalSchedule::Never,
+            None,
             true,
             &tx,
             &egui::Context::default(),
@@ -1183,6 +1333,7 @@ mod tests {
             &config,
             &train,
             EvalSchedule::Never,
+            None,
             false,
             &tx,
             &egui::Context::default(),
