@@ -190,6 +190,31 @@ where
     if !(0.0..=1.0).contains(&alpha) || alpha <= 0.0 {
         return Err("доля шага должна быть в (0, 1]".to_string());
     }
+    if max_pairs == 0 {
+        return Err("число пар должно быть больше нуля".to_string());
+    }
+    let n_features = data.inputs.ncols();
+    let n_outputs = data.outputs.ncols();
+    if specs.len() != n_features {
+        return Err(format!(
+            "спецификации описывают {} входов, а в данных {n_features}",
+            specs.len()
+        ));
+    }
+    if in_norm.n_features() != n_features || in_norm.specs != specs {
+        return Err("нормализатор входов не соответствует данным и их типам".to_string());
+    }
+    if out_norm.n_features() != n_outputs {
+        return Err("нормализатор выходов не соответствует данным".to_string());
+    }
+    if data.inputs.iter().any(|v| !v.is_finite()) {
+        return Err("входные данные содержат NaN или бесконечность".to_string());
+    }
+    if let Some(bb) = reference {
+        if bb.n_inputs() != n_features || bb.n_outputs != n_outputs {
+            return Err("размерность исходного процесса не соответствует данным".to_string());
+        }
+    }
     let continuous: Vec<usize> = specs
         .iter()
         .enumerate()
@@ -199,6 +224,13 @@ where
     let categorical_inputs = specs.len() - continuous.len();
     if continuous.is_empty() {
         return Err("все входы категориальные: возмущать нечего".to_string());
+    }
+    if continuous
+        .iter()
+        .any(|&j| !in_norm.std[j].is_finite() || in_norm.std[j] <= 0.0)
+        || out_norm.std.iter().any(|s| !s.is_finite() || *s <= 0.0)
+    {
+        return Err("нормализатор содержит некорректный масштаб".to_string());
     }
     if data.len() < 2 {
         return Err("нужно хотя бы две строки данных".to_string());
@@ -223,10 +255,9 @@ where
             .sqrt()
     };
 
-    let stride = (data.len() / max_pairs.max(1)).max(1);
     let mut bases = Vec::new();
     let mut neighbours = Vec::new();
-    for base in (0..data.len()).step_by(stride) {
+    for base in distributed_indices(data.len(), max_pairs) {
         let mut best: Option<(usize, f32)> = None;
         for other in 0..data.len() {
             if other == base || !same_categories(base, other) {
@@ -253,7 +284,6 @@ where
     }
 
     // Обе точки каждой пары собираются один раз и отдаются обеим функциям.
-    let n_features = data.inputs.ncols();
     let mut x1 = Array2::<f32>::zeros((bases.len(), n_features));
     let mut x2 = Array2::<f32>::zeros((bases.len(), n_features));
     for (row, (&base, &neighbour)) in bases.iter().zip(neighbours.iter()).enumerate() {
@@ -279,9 +309,10 @@ where
         })
         .collect();
 
-    let model = ratios(&predict(&x1), &predict(&x2), &dx, out_norm)
-        .ok_or_else(|| "пары оказались вырожденными: нулевой шаг по входам".to_string())?;
-    let reference = reference.map(|bb| {
+    let model_y1 = predict(&x1);
+    let model_y2 = predict(&x2);
+    let model = ratios(&model_y1, &model_y2, &dx, out_norm, "модель")?;
+    let reference = reference.map(|bb| -> Result<SensitivityStats, String> {
         let eval_all = |xs: &Array2<f32>| {
             let mut out = Array2::<f32>::zeros((xs.nrows(), bb.n_outputs));
             for r in 0..xs.nrows() {
@@ -292,11 +323,16 @@ where
             }
             out
         };
-        ratios(&eval_all(&x1), &eval_all(&x2), &dx, out_norm)
+        ratios(
+            &eval_all(&x1),
+            &eval_all(&x2),
+            &dx,
+            out_norm,
+            "исходный процесс",
+        )
     });
     let reference = match reference {
-        Some(Some(stats)) => Some(stats),
-        Some(None) => None,
+        Some(stats) => Some(stats?),
         None => None,
     };
 
@@ -309,34 +345,73 @@ where
     })
 }
 
-/// Отношения `||Δy||/||Δx||` по парам; `None` — все шаги вырождены.
+/// Порядок базовых строк: сначала по одной из равномерных корзин по всей
+/// таблице, затем вторые строки тех же корзин и т.д. Если в части страт нельзя
+/// найти соседа с той же категорией, оставшиеся строки дают им замену — без
+/// смещения оценки к началу отсортированного файла.
+fn distributed_indices(n: usize, max_pairs: usize) -> Vec<usize> {
+    let buckets = n.min(max_pairs);
+    let max_bucket_len = n.div_ceil(buckets);
+    let mut indices = Vec::with_capacity(n);
+    for offset in 0..max_bucket_len {
+        for bucket in 0..buckets {
+            let start = bucket * n / buckets;
+            let end = (bucket + 1) * n / buckets;
+            let index = start + offset;
+            if index < end {
+                indices.push(index);
+            }
+        }
+    }
+    indices
+}
+
+/// Отношения `||Δy||/||Δx||` по парам. Формы и конечность проверяются здесь:
+/// evaluator — внешний callback, и его ошибка не должна превращаться в panic
+/// или NaN в публичном отчёте.
 fn ratios(
     y1: &Array2<f32>,
     y2: &Array2<f32>,
     dx: &[f32],
     out_norm: &Normalizer,
-) -> Option<SensitivityStats> {
+    source: &str,
+) -> Result<SensitivityStats, String> {
+    if y1.dim() != y2.dim() || y1.nrows() != dx.len() || y1.ncols() != out_norm.n_features() {
+        return Err(format!(
+            "{source}: форма выходов не соответствует парам и нормализатору"
+        ));
+    }
     let mut values = Vec::with_capacity(dx.len());
     for (r, &step) in dx.iter().enumerate() {
+        if !step.is_finite() {
+            return Err("расстояние между входами не является конечным".to_string());
+        }
         if step <= 1e-9 {
             continue;
         }
-        let dy = (0..y1.ncols())
-            .map(|c| {
-                let d = (y1[[r, c]] - y2[[r, c]]) / out_norm.std[c];
-                d * d
-            })
-            .sum::<f32>()
-            .sqrt();
-        values.push(dy / step);
+        let mut dy2 = 0.0;
+        for c in 0..y1.ncols() {
+            if !y1[[r, c]].is_finite() || !y2[[r, c]].is_finite() {
+                return Err(format!(
+                    "{source}: предсказание содержит NaN или бесконечность"
+                ));
+            }
+            let d = (y1[[r, c]] - y2[[r, c]]) / out_norm.std[c];
+            dy2 += d * d;
+        }
+        let ratio = dy2.sqrt() / step;
+        if !ratio.is_finite() {
+            return Err(format!("{source}: чувствительность не является конечной"));
+        }
+        values.push(ratio);
     }
     if values.is_empty() {
-        return None;
+        return Err("пары оказались вырожденными: нулевой шаг по входам".to_string());
     }
     // Среднее копится в f64: на одинаковых отношениях сумма в f32 округляется
     // так, что среднее оказывается выше максимума, и инвариант ломается.
     let mean = values.iter().map(|v| *v as f64).sum::<f64>() / values.len() as f64;
-    Some(SensitivityStats {
+    Ok(SensitivityStats {
         mean: mean as f32,
         max: values.iter().copied().fold(0.0, f32::max),
     })
@@ -396,13 +471,19 @@ mod tests {
     fn sensitivity_keeps_pairs_on_the_data_manifold() {
         let (data, specs) = simplex_data(40);
         let (in_norm, out_norm) = fit_normalizers(&data, &specs);
+        let observed_sums = std::cell::RefCell::new(Vec::new());
         // Модель, повторяющая зависимость: чувствительность конечна.
         let report = sensitivity(
             &data,
             &specs,
             &in_norm,
             &out_norm,
-            |x| Array2::from_shape_fn((x.nrows(), 1), |(r, _)| x[[r, 0]] * 2.0 + x[[r, 1]]),
+            |x| {
+                observed_sums
+                    .borrow_mut()
+                    .extend(x.rows().into_iter().map(|row| row.sum()));
+                Array2::from_shape_fn((x.nrows(), 1), |(r, _)| x[[r, 0]] * 2.0 + x[[r, 1]])
+            },
             None,
             1.0,
             10,
@@ -413,6 +494,10 @@ mod tests {
         assert_eq!(report.categorical_inputs, 0);
         assert!(report.model.mean.is_finite() && report.model.mean > 0.0);
         assert!(report.model.max >= report.model.mean);
+        assert!(observed_sums
+            .borrow()
+            .iter()
+            .all(|sum| (sum - 100.0).abs() < 1e-4));
         // Процесс не вызываем — расхождение считать не из чего.
         assert!(report.reference.is_none() && report.divergence.is_none());
     }
@@ -511,6 +596,57 @@ mod tests {
         let err =
             sensitivity(&data, &numeric, &in_norm, &out_norm, predict, None, 0.0, 5).unwrap_err();
         assert!(err.contains("доля шага"), "{err}");
+
+        // Нулевой бюджет пар — ошибка, а не одна случайно посчитанная пара.
+        let continuous = vec![FeatureSpec::Continuous];
+        let (in2, out2) = fit_normalizers(&data, &continuous);
+        let err = sensitivity(&data, &continuous, &in2, &out2, predict, None, 1.0, 0).unwrap_err();
+        assert!(err.contains("число пар"), "{err}");
+    }
+
+    #[test]
+    fn sensitivity_rejects_bad_or_non_finite_predictions() {
+        let data = NumericDataset::new(
+            Array2::from_shape_vec((3, 1), vec![0.0, 1.0, 2.0]).unwrap(),
+            Array2::from_shape_vec((3, 1), vec![0.0, 1.0, 2.0]).unwrap(),
+        );
+        let specs = vec![FeatureSpec::Continuous];
+        let (in_norm, out_norm) = fit_normalizers(&data, &specs);
+
+        let err = sensitivity(
+            &data,
+            &specs,
+            &in_norm,
+            &out_norm,
+            |x| Array2::from_elem((x.nrows(), 1), f32::NAN),
+            None,
+            1.0,
+            2,
+        )
+        .unwrap_err();
+        assert!(err.contains("NaN"), "{err}");
+
+        let err = sensitivity(
+            &data,
+            &specs,
+            &in_norm,
+            &out_norm,
+            |x| Array2::zeros((x.nrows(), 2)),
+            None,
+            1.0,
+            2,
+        )
+        .unwrap_err();
+        assert!(err.contains("форма выходов"), "{err}");
+    }
+
+    #[test]
+    fn sensitivity_base_order_covers_the_whole_table() {
+        let order = distributed_indices(10, 3);
+        assert_eq!(&order[..3], &[0, 3, 6]);
+        let mut sorted = order;
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..10).collect::<Vec<_>>());
     }
 
     #[test]
