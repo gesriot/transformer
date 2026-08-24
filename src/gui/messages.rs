@@ -3,6 +3,7 @@
 
 use crate::config::ModelConfig;
 use crate::data::{NumericDataset, OutOfRange};
+use crate::diagnostics::SensitivityReport;
 use crate::interpret::{InterpretProfile, InterpretReport};
 use crate::markup::TableProfile;
 use crate::metrics::Metrics;
@@ -94,7 +95,9 @@ pub struct DiagnosticsResult {
     /// На признак: (доля смен знака остатка, tail/inner).
     pub residuals: Vec<(f32, f32)>,
     /// (среднее, макс) чувствительности — только для blackbox.
-    pub sensitivity: Option<(f32, f32)>,
+    /// Чувствительность модели и — у демо-ящика — исходного процесса.
+    /// `Err` — понятная причина, по которой замер невозможен.
+    pub sensitivity: Result<SensitivityReport, String>,
 }
 
 /// Метаданные KAN, безопасные для передачи из worker в UI. Сами тензоры и

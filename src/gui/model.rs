@@ -471,19 +471,42 @@ impl App {
             ui.label("(высокая смена знака → частота/Fourier; tail/inner>1.5 → масштаб/хвосты)");
 
             ui.separator();
-            match d.sensitivity {
-                Some((mean, max)) => {
+            match &d.sensitivity {
+                Ok(r) => {
                     ui.label(format!(
-                        "Чувствительность ‖Δy‖/‖Δx‖ (норм.): среднее {mean:.2}, макс {max:.2}"
+                        "Чувствительность ‖Δy‖/‖Δx‖ (норм., {} пар соседних строк):",
+                        r.pairs
                     ));
-                    ui.label(if max < 10.0 {
-                        "  → карта гладкая, surrogate надёжен"
-                    } else {
-                        "  → высокая чувствительность/хаос: потолок точности"
-                    });
+                    ui.label(format!(
+                        "  модель: среднее {:.2}, макс {:.2}",
+                        r.model.mean, r.model.max
+                    ));
+                    match (r.reference, r.divergence) {
+                        (Some(reference), Some(divergence)) => {
+                            ui.label(format!(
+                                "  процесс: среднее {:.2}, макс {:.2}",
+                                reference.mean, reference.max
+                            ));
+                            // Диагностика — именно расхождение: чувствительность
+                            // модели сама по себе точности не доказывает.
+                            ui.label(format!(
+                                "  расхождение средних: {divergence:.2} (надёжность \
+                                 видна по нему вместе с метриками на validation)"
+                            ));
+                        }
+                        _ => {
+                            ui.label("  процесс: недоступен (известен только у встроенной задачи)");
+                        }
+                    }
+                    if r.categorical_inputs > 0 {
+                        ui.label(format!(
+                            "  категориальные входы ({}) не возмущались",
+                            r.categorical_inputs
+                        ));
+                    }
                 }
-                None => {
-                    ui.label("Чувствительность: только для blackbox (для .tnum пропущена)");
+                Err(e) => {
+                    ui.label(format!("Чувствительность: не посчитана — {e}"));
                 }
             }
         }

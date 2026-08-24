@@ -8,8 +8,6 @@ use crate::encoders::FeatureSpec;
 use crate::numeric_model::NumericConfig;
 use crate::train::{fit_normalizers, train_surrogate, TrainConfig};
 use ndarray::Array2;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use std::collections::BTreeSet;
 
 /// Overfit-проба ёмкости: свежая модель учится «в лоб» на маленьком подмножестве.
@@ -142,57 +140,206 @@ fn tail_ratio(idx_sorted: &[usize], mag: &[f32]) -> f32 {
     }
 }
 
-/// Локальная чувствительность карты (бедный Ляпунов): близкие входы → насколько
-/// расходятся выходы. Возвращает (среднее, максимум) безразмерного отношения
-/// `||Δy||/||Δx||` в нормализованном (z-score) пространстве. Большой максимум →
-/// области чувствительности / возможный хаос → потолок точности surrogate.
-pub fn sensitivity_probe(
-    bb: &BlackBox,
-    in_norm: &Normalizer,
-    out_norm: &Normalizer,
-    n_pairs: usize,
-    eps_frac: f32,
-    seed: u64,
-) -> (f32, f32) {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let f = bb.n_inputs();
-    let mut ratios = Vec::with_capacity(n_pairs);
-
-    for _ in 0..n_pairs {
-        let mut x = vec![0.0f32; f];
-        let mut x2 = vec![0.0f32; f];
-        for j in 0..f {
-            let (lo, hi) = bb.input_ranges[j];
-            x[j] = rng.gen_range(lo..=hi);
-            let d = eps_frac * (hi - lo);
-            x2[j] = x[j] + if rng.gen::<bool>() { d } else { -d };
-        }
-        let dx = norm_dist(&x, &x2, &in_norm.std);
-        let dy = norm_dist(&bb.eval(&x), &bb.eval(&x2), &out_norm.std);
-        if dx > 1e-9 {
-            ratios.push(dy / dx);
-        }
-    }
-
-    if ratios.is_empty() {
-        return (0.0, 0.0);
-    }
-    let mean = ratios.iter().sum::<f32>() / ratios.len() as f32;
-    let max = ratios.iter().copied().fold(0.0, f32::max);
-    (mean, max)
+/// Статистика чувствительности: `||Δy|| / ||Δx||` в единицах std.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SensitivityStats {
+    pub mean: f32,
+    pub max: f32,
 }
 
-/// Евклидово расстояние в единицах std (per-компонента).
-fn norm_dist(a: &[f32], b: &[f32], std: &[f32]) -> f32 {
-    a.iter()
-        .zip(b)
-        .zip(std)
-        .map(|((&x, &y), &s)| {
-            let d = (x - y) / s;
-            d * d
+/// Чувствительность модели и — если процесс вызываем — исходной функции.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SensitivityReport {
+    /// Сколько пар реальных строк удалось использовать.
+    pub pairs: usize,
+    /// Категориальные входы исключены из возмущения: дробно двигать код нельзя.
+    pub categorical_inputs: usize,
+    /// Чувствительность обученной модели — доступна всегда.
+    pub model: SensitivityStats,
+    /// Чувствительность исходного процесса — только у вызываемого ящика.
+    pub reference: Option<SensitivityStats>,
+    /// Насколько модель разошлась с процессом по средней чувствительности.
+    pub divergence: Option<f32>,
+}
+
+/// Чувствительность по парам РЕАЛЬНЫХ строк.
+///
+/// Возмущать вход независимо нельзя: в данных бывают жёсткие связи (например
+/// доли состава с постоянной суммой), и сдвиг одной координаты уводит точку с
+/// многообразия — модель спрашивают о том, чего в задаче не существует.
+/// Поэтому вторая точка берётся как ближайшая реальная строка с ТЕМИ ЖЕ
+/// категориями: `x₂ = x + α(neighbor − x)`. Так аффинные ограничения данных
+/// сохраняются сами собой.
+///
+/// Модель и процесс получают РОВНО ОДНИ И ТЕ ЖЕ пары: иначе их числа не
+/// сравнимы. Расстояние считается только по непрерывным входам.
+#[allow(clippy::too_many_arguments)]
+pub fn sensitivity<F>(
+    data: &NumericDataset,
+    specs: &[FeatureSpec],
+    in_norm: &Normalizer,
+    out_norm: &Normalizer,
+    predict: F,
+    reference: Option<&BlackBox>,
+    alpha: f32,
+    max_pairs: usize,
+) -> Result<SensitivityReport, String>
+where
+    F: Fn(&Array2<f32>) -> Array2<f32>,
+{
+    if !(0.0..=1.0).contains(&alpha) || alpha <= 0.0 {
+        return Err("доля шага должна быть в (0, 1]".to_string());
+    }
+    let continuous: Vec<usize> = specs
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s, FeatureSpec::Continuous))
+        .map(|(i, _)| i)
+        .collect();
+    let categorical_inputs = specs.len() - continuous.len();
+    if continuous.is_empty() {
+        return Err("все входы категориальные: возмущать нечего".to_string());
+    }
+    if data.len() < 2 {
+        return Err("нужно хотя бы две строки данных".to_string());
+    }
+
+    // Ближайший сосед с теми же категориями. Строк немного, поэтому честный
+    // перебор понятнее и предсказуемее, чем индекс.
+    let same_categories = |a: usize, b: usize| {
+        specs.iter().enumerate().all(|(j, spec)| {
+            matches!(spec, FeatureSpec::Continuous)
+                || (data.inputs[[a, j]] - data.inputs[[b, j]]).abs() < 1e-6
         })
-        .sum::<f32>()
-        .sqrt()
+    };
+    let distance = |a: usize, b: usize| {
+        continuous
+            .iter()
+            .map(|&j| {
+                let d = (data.inputs[[a, j]] - data.inputs[[b, j]]) / in_norm.std[j];
+                d * d
+            })
+            .sum::<f32>()
+            .sqrt()
+    };
+
+    let stride = (data.len() / max_pairs.max(1)).max(1);
+    let mut bases = Vec::new();
+    let mut neighbours = Vec::new();
+    for base in (0..data.len()).step_by(stride) {
+        let mut best: Option<(usize, f32)> = None;
+        for other in 0..data.len() {
+            if other == base || !same_categories(base, other) {
+                continue;
+            }
+            let d = distance(base, other);
+            if d > 1e-9 && best.is_none_or(|(_, bd)| d < bd) {
+                best = Some((other, d));
+            }
+        }
+        if let Some((neighbour, _)) = best {
+            bases.push(base);
+            neighbours.push(neighbour);
+        }
+        if bases.len() >= max_pairs {
+            break;
+        }
+    }
+    if bases.is_empty() {
+        return Err(
+            "не нашлось пар строк с одинаковыми категориями и разными числовыми входами"
+                .to_string(),
+        );
+    }
+
+    // Обе точки каждой пары собираются один раз и отдаются обеим функциям.
+    let n_features = data.inputs.ncols();
+    let mut x1 = Array2::<f32>::zeros((bases.len(), n_features));
+    let mut x2 = Array2::<f32>::zeros((bases.len(), n_features));
+    for (row, (&base, &neighbour)) in bases.iter().zip(neighbours.iter()).enumerate() {
+        for j in 0..n_features {
+            let a = data.inputs[[base, j]];
+            let b = data.inputs[[neighbour, j]];
+            x1[[row, j]] = a;
+            // У категориальных a == b, поэтому шаг их не двигает.
+            x2[[row, j]] = a + alpha * (b - a);
+        }
+    }
+
+    let dx: Vec<f32> = (0..bases.len())
+        .map(|r| {
+            continuous
+                .iter()
+                .map(|&j| {
+                    let d = (x1[[r, j]] - x2[[r, j]]) / in_norm.std[j];
+                    d * d
+                })
+                .sum::<f32>()
+                .sqrt()
+        })
+        .collect();
+
+    let model = ratios(&predict(&x1), &predict(&x2), &dx, out_norm)
+        .ok_or_else(|| "пары оказались вырожденными: нулевой шаг по входам".to_string())?;
+    let reference = reference.map(|bb| {
+        let eval_all = |xs: &Array2<f32>| {
+            let mut out = Array2::<f32>::zeros((xs.nrows(), bb.n_outputs));
+            for r in 0..xs.nrows() {
+                let y = bb.eval(&xs.row(r).to_vec());
+                for (c, v) in y.into_iter().enumerate() {
+                    out[[r, c]] = v;
+                }
+            }
+            out
+        };
+        ratios(&eval_all(&x1), &eval_all(&x2), &dx, out_norm)
+    });
+    let reference = match reference {
+        Some(Some(stats)) => Some(stats),
+        Some(None) => None,
+        None => None,
+    };
+
+    Ok(SensitivityReport {
+        pairs: bases.len(),
+        categorical_inputs,
+        divergence: reference.map(|r| (model.mean - r.mean).abs()),
+        model,
+        reference,
+    })
+}
+
+/// Отношения `||Δy||/||Δx||` по парам; `None` — все шаги вырождены.
+fn ratios(
+    y1: &Array2<f32>,
+    y2: &Array2<f32>,
+    dx: &[f32],
+    out_norm: &Normalizer,
+) -> Option<SensitivityStats> {
+    let mut values = Vec::with_capacity(dx.len());
+    for (r, &step) in dx.iter().enumerate() {
+        if step <= 1e-9 {
+            continue;
+        }
+        let dy = (0..y1.ncols())
+            .map(|c| {
+                let d = (y1[[r, c]] - y2[[r, c]]) / out_norm.std[c];
+                d * d
+            })
+            .sum::<f32>()
+            .sqrt();
+        values.push(dy / step);
+    }
+    if values.is_empty() {
+        return None;
+    }
+    // Среднее копится в f64: на одинаковых отношениях сумма в f32 округляется
+    // так, что среднее оказывается выше максимума, и инвариант ломается.
+    let mean = values.iter().map(|v| *v as f64).sum::<f64>() / values.len() as f64;
+    Some(SensitivityStats {
+        mean: mean as f32,
+        max: values.iter().copied().fold(0.0, f32::max),
+    })
 }
 
 #[cfg(test)]
@@ -226,14 +373,144 @@ mod tests {
         assert_eq!(d2[0].sign_change_rate, 0.0);
     }
 
+    /// Симплекс: доли состава с постоянной суммой. Независимое возмущение
+    /// увело бы точку с многообразия, пара соседних строк — нет.
+    fn simplex_data(n: usize) -> (NumericDataset, Vec<FeatureSpec>) {
+        let mut inputs = Array2::<f32>::zeros((n, 3));
+        let mut outputs = Array2::<f32>::zeros((n, 1));
+        for i in 0..n {
+            let x0 = 1.0 + i as f32;
+            let x1 = 3.0 + (i % 7) as f32;
+            inputs[[i, 0]] = x0;
+            inputs[[i, 1]] = x1;
+            inputs[[i, 2]] = 100.0 - x0 - x1;
+            outputs[[i, 0]] = x0 * 2.0 + x1;
+        }
+        (
+            NumericDataset::new(inputs, outputs),
+            vec![FeatureSpec::Continuous; 3],
+        )
+    }
+
     #[test]
-    fn sensitivity_probe_runs() {
+    fn sensitivity_keeps_pairs_on_the_data_manifold() {
+        let (data, specs) = simplex_data(40);
+        let (in_norm, out_norm) = fit_normalizers(&data, &specs);
+        // Модель, повторяющая зависимость: чувствительность конечна.
+        let report = sensitivity(
+            &data,
+            &specs,
+            &in_norm,
+            &out_norm,
+            |x| Array2::from_shape_fn((x.nrows(), 1), |(r, _)| x[[r, 0]] * 2.0 + x[[r, 1]]),
+            None,
+            1.0,
+            10,
+        )
+        .unwrap();
+
+        assert!(report.pairs > 0);
+        assert_eq!(report.categorical_inputs, 0);
+        assert!(report.model.mean.is_finite() && report.model.mean > 0.0);
+        assert!(report.model.max >= report.model.mean);
+        // Процесс не вызываем — расхождение считать не из чего.
+        assert!(report.reference.is_none() && report.divergence.is_none());
+    }
+
+    /// Модель и процесс меряются на ОДНИХ И ТЕХ ЖЕ парах, поэтому совпадающая
+    /// с процессом модель даёт нулевое расхождение.
+    #[test]
+    fn model_and_reference_share_the_same_pairs() {
         let bb = blackbox::sum();
         let data = bb.generate(64, 0);
-        let in_norm = Normalizer::fit(&data.inputs, &Normalizer::all_continuous(2));
-        let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
-        let (mean, max) = sensitivity_probe(&bb, &in_norm, &out_norm, 100, 0.01, 0);
-        assert!(mean.is_finite() && max >= mean && mean > 0.0);
+        let specs = vec![FeatureSpec::Continuous; 2];
+        let (in_norm, out_norm) = fit_normalizers(&data, &specs);
+        let report = sensitivity(
+            &data,
+            &specs,
+            &in_norm,
+            &out_norm,
+            |x| Array2::from_shape_fn((x.nrows(), 1), |(r, _)| bb.eval(&x.row(r).to_vec())[0]),
+            Some(&bb),
+            1.0,
+            20,
+        )
+        .unwrap();
+        let reference = report.reference.expect("процесс вызываем");
+        assert!((report.model.mean - reference.mean).abs() < 1e-5);
+        assert!(report.divergence.unwrap() < 1e-5);
+    }
+
+    #[test]
+    fn categorical_inputs_are_excluded_and_counted() {
+        // Категория во втором столбце: сосед ищется только среди строк с тем же
+        // кодом, и шаг её не двигает.
+        let mut inputs = Array2::<f32>::zeros((20, 2));
+        let mut outputs = Array2::<f32>::zeros((20, 1));
+        for i in 0..20 {
+            inputs[[i, 0]] = i as f32;
+            inputs[[i, 1]] = (i % 2) as f32;
+            outputs[[i, 0]] = i as f32 * 0.5;
+        }
+        let data = NumericDataset::new(inputs, outputs);
+        let specs = vec![
+            FeatureSpec::Continuous,
+            FeatureSpec::Categorical { cardinality: 2 },
+        ];
+        let (in_norm, out_norm) = fit_normalizers(&data, &specs);
+        let seen_codes = std::cell::RefCell::new(Vec::new());
+        let report = sensitivity(
+            &data,
+            &specs,
+            &in_norm,
+            &out_norm,
+            |x| {
+                for r in 0..x.nrows() {
+                    seen_codes.borrow_mut().push(x[[r, 1]]);
+                }
+                Array2::from_shape_fn((x.nrows(), 1), |(r, _)| x[[r, 0]] * 0.5)
+            },
+            None,
+            1.0,
+            5,
+        )
+        .unwrap();
+        assert_eq!(report.categorical_inputs, 1);
+        assert!(report.pairs > 0);
+        // Коды остались целыми: дробного шага по категории не было.
+        assert!(seen_codes.borrow().iter().all(|c| *c == 0.0 || *c == 1.0));
+    }
+
+    /// Отказ должен объяснять причину, а не возвращать NaN.
+    #[test]
+    fn impossible_cases_explain_themselves() {
+        let data = NumericDataset::new(
+            Array2::from_shape_vec((2, 1), vec![0.0, 1.0]).unwrap(),
+            Array2::from_shape_vec((2, 1), vec![0.0, 1.0]).unwrap(),
+        );
+        let specs = vec![FeatureSpec::Categorical { cardinality: 2 }];
+        let (in_norm, out_norm) = fit_normalizers(&data, &specs);
+        let predict = |x: &Array2<f32>| Array2::<f32>::zeros((x.nrows(), 1));
+
+        // Непрерывных входов нет вовсе.
+        let err =
+            sensitivity(&data, &specs, &in_norm, &out_norm, predict, None, 1.0, 5).unwrap_err();
+        assert!(err.contains("категориальные"), "{err}");
+
+        // Пары не находятся: у каждой строки свой код.
+        let numeric = vec![FeatureSpec::Continuous];
+        let single = NumericDataset::new(
+            Array2::from_shape_vec((1, 1), vec![0.0]).unwrap(),
+            Array2::from_shape_vec((1, 1), vec![0.0]).unwrap(),
+        );
+        let (in1, out1) = fit_normalizers(&single, &numeric);
+        let err = sensitivity(&single, &numeric, &in1, &out1, predict, None, 1.0, 5).unwrap_err();
+        assert!(err.contains("две строки"), "{err}");
+
+        // Некорректная доля шага.
+        let err =
+            sensitivity(&data, &numeric, &in_norm, &out_norm, predict, None, 0.0, 5).unwrap_err();
+        assert!(err.contains("доля шага"), "{err}");
     }
 
     #[test]

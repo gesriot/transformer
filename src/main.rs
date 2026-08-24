@@ -902,21 +902,58 @@ fn run_diagnostics(
     }
     println!("  (высокая смена знака -> частота/Fourier; tail/inner>1.5 -> масштаб/хвосты)");
 
-    // 4. Чувствительность карты — только при вызываемом чёрном ящике.
-    match bb {
-        Some(bb) => {
-            let (mean, max) = diagnostics::sensitivity_probe(bb, in_norm, out_norm, 300, 0.01, 0);
-            println!("Чувствительность ||Δy||/||Δx|| (норм.): среднее {mean:.2}, макс {max:.2}");
+    // 4. Чувствительность: модель — всегда, исходный процесс — только у демо.
+    let report = diagnostics::sensitivity(
+        val,
+        specs,
+        in_norm,
+        out_norm,
+        |inputs| {
+            let ds =
+                NumericDataset::new(inputs.clone(), Array2::zeros((inputs.nrows(), n_outputs)));
+            predict_dataset(model, &ds, in_norm, out_norm)
+        },
+        bb,
+        1.0,
+        300,
+    );
+    match report {
+        Ok(r) => {
             println!(
-                "  -> {}",
-                if max < 10.0 {
-                    "карта гладкая, surrogate надёжен"
-                } else {
-                    "высокая: чувствительность/возможен хаос -> потолок точности"
-                }
+                "Чувствительность ||Δy||/||Δx|| (норм., {} пар соседних строк):",
+                r.pairs
             );
+            println!(
+                "  модель:  среднее {:.2}, макс {:.2}",
+                r.model.mean, r.model.max
+            );
+            match (r.reference, r.divergence) {
+                (Some(reference), Some(divergence)) => {
+                    println!(
+                        "  процесс: среднее {:.2}, макс {:.2}",
+                        reference.mean, reference.max
+                    );
+                    // Расхождение — это и есть диагностика: сама по себе
+                    // чувствительность модели точности не доказывает.
+                    println!(
+                        "  расхождение средних: {divergence:.2} (надёжность видна по нему \
+                         вместе с метриками на validation)"
+                    );
+                }
+                _ => println!(
+                    "  процесс: недоступен (чувствительность исходной функции \
+                     известна только у встроенной задачи)"
+                ),
+            }
+            if r.categorical_inputs > 0 {
+                println!(
+                    "  категориальные входы ({}) не возмущались: дробный шаг по коду \
+                     не имеет смысла",
+                    r.categorical_inputs
+                );
+            }
         }
-        None => println!("Чувствительность: пропущена (нет вызываемого чёрного ящика)"),
+        Err(e) => println!("Чувствительность: не посчитана — {e}"),
     }
 }
 

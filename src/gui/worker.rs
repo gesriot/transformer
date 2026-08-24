@@ -609,12 +609,23 @@ fn diagnose(l: &Loaded) -> Result<DiagnosticsResult, String> {
         .map(|r| (r.sign_change_rate, r.tail_ratio))
         .collect();
 
-    // Чувствительность исходного процесса известна только у демо-ящика.
-    let sensitivity = d.origin.blackbox().and_then(|name| {
-        blackbox::by_name(name).map(|bb| {
-            crate::diagnostics::sensitivity_probe(&bb, &l.in_norm, &l.out_norm, 300, 0.01, 0)
-        })
-    });
+    // Чувствительность модели считается всегда; исходного процесса — только у
+    // демо-ящика, и на тех же самых парах точек.
+    let reference = d.origin.blackbox().and_then(blackbox::by_name);
+    let sensitivity = crate::diagnostics::sensitivity(
+        &d.eval,
+        &d.in_specs,
+        &l.in_norm,
+        &l.out_norm,
+        |inputs| {
+            let ds =
+                NumericDataset::new(inputs.clone(), Array2::zeros((inputs.nrows(), l.n_outputs)));
+            predict_dataset(&l.model, &ds, &l.in_norm, &l.out_norm)
+        },
+        reference.as_ref(),
+        1.0,
+        300,
+    );
 
     Ok(DiagnosticsResult {
         overfit_loss,
