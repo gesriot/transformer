@@ -1,25 +1,24 @@
-//! Пакетный Predict для Excel: первый лист `.xlsx`, заголовки `x0..xN` и
-//! `y0..yM`, заполнение выходных колонок предсказаниями.
+//! Экспорт таблицы с прогнозами по именам колонок из схемы модели.
 //!
-//! Writer намеренно минимальный: сохраняет значения первого листа без стилей,
-//! формул и дополнительных листов. Это достаточно для сценария "вставить
-//! предсказанные y-колонки в расчетную таблицу".
+//! Writer намеренно создаёт новую минимальную книгу: значения первого листа
+//! сохраняются, стили, формулы и дополнительные листы — нет.
 
 use crate::predict::{parse_rows, Predictions};
 use crate::schema::ModelSchema;
 use crate::table::{Delimiter, Table};
 use ndarray::Array2;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Seek, Write};
+use std::path::Path;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum SheetCell {
+enum SheetCell {
     Blank,
     Text(String),
     Number(f64),
-    Bool(bool),
 }
 
 impl SheetCell {
@@ -27,102 +26,8 @@ impl SheetCell {
         match self {
             SheetCell::Blank => true,
             SheetCell::Text(s) => s.trim().is_empty(),
-            SheetCell::Number(_) | SheetCell::Bool(_) => false,
+            SheetCell::Number(_) => false,
         }
-    }
-
-    fn as_f32(&self, row: usize, col: usize) -> Result<f32, String> {
-        match self {
-            SheetCell::Number(v) => {
-                if v.is_finite() {
-                    Ok(*v as f32)
-                } else {
-                    Err(format!("строка {row}, колонка {col}: число не конечно"))
-                }
-            }
-            SheetCell::Text(s) => {
-                let trimmed = s.trim();
-                if trimmed.is_empty() {
-                    return Err(format!("строка {row}, колонка {col}: пустой вход"));
-                }
-                let v: f32 = trimmed
-                    .parse()
-                    .map_err(|_| format!("строка {row}, колонка {col}: '{s}' не число"))?;
-                if v.is_finite() {
-                    Ok(v)
-                } else {
-                    Err(format!("строка {row}, колонка {col}: число не конечно"))
-                }
-            }
-            SheetCell::Bool(v) => Ok(if *v { 1.0 } else { 0.0 }),
-            SheetCell::Blank => Err(format!("строка {row}, колонка {col}: пустой вход")),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct PredictionSheet {
-    pub headers: Vec<String>,
-    pub rows: Vec<Vec<SheetCell>>,
-    input_cols: Vec<usize>,
-    output_cols: Vec<usize>,
-}
-
-impl PredictionSheet {
-    pub fn input_rows(&self) -> Result<Vec<Vec<f32>>, String> {
-        let mut out = Vec::new();
-        for (r, row) in self.rows.iter().enumerate() {
-            if row.iter().all(SheetCell::is_blank) {
-                continue;
-            }
-            let excel_row = r + 2;
-            let mut values = Vec::with_capacity(self.input_cols.len());
-            for &col in &self.input_cols {
-                let cell = row.get(col).unwrap_or(&SheetCell::Blank);
-                values.push(cell.as_f32(excel_row, col + 1)?);
-            }
-            out.push(values);
-        }
-        Ok(out)
-    }
-
-    pub fn fill_outputs(&self, predictions: &[Vec<f32>]) -> Result<PredictionSheet, String> {
-        let rows_to_fill = self
-            .rows
-            .iter()
-            .filter(|row| !row.iter().all(SheetCell::is_blank))
-            .count();
-        if predictions.len() != rows_to_fill {
-            return Err(format!(
-                "ожидалось {rows_to_fill} строк предсказаний, получено {}",
-                predictions.len()
-            ));
-        }
-
-        let mut out = self.clone();
-        let width = out.headers.len();
-        let mut pred_idx = 0;
-        for row in &mut out.rows {
-            if row.iter().all(SheetCell::is_blank) {
-                continue;
-            }
-            if predictions[pred_idx].len() != out.output_cols.len() {
-                return Err(format!(
-                    "строка предсказания {}: ожидалось {} выходов, получено {}",
-                    pred_idx + 1,
-                    out.output_cols.len(),
-                    predictions[pred_idx].len()
-                ));
-            }
-            if row.len() < width {
-                row.resize(width, SheetCell::Blank);
-            }
-            for (j, &col) in out.output_cols.iter().enumerate() {
-                row[col] = SheetCell::Number(predictions[pred_idx][j] as f64);
-            }
-            pred_idx += 1;
-        }
-        Ok(out)
     }
 }
 
@@ -155,6 +60,12 @@ pub fn export_predictions<F>(
 where
     F: Fn(&Array2<f32>) -> Result<Predictions, String>,
 {
+    if same_path(input, output) {
+        return Err(
+            "входной и выходной путь совпадают: экспорт не должен перезаписывать исходную книгу"
+                .to_string(),
+        );
+    }
     let table = Table::read_path(input, Delimiter::Auto, true)?;
     let header = table
         .header()
@@ -162,12 +73,13 @@ where
         .to_vec();
 
     // Связывание по именам: без него таблица и модель молча разошлись бы.
-    let column_of = |name: &str| header.iter().position(|h| h.trim() == name);
+    // Дубликат — ошибка, иначе `position()` молча выбрал бы первую колонку.
+    let index = header_index(&header).map_err(|e| format!("{input}: {e}"))?;
     let input_cols = schema
         .input_names()
         .iter()
         .map(|name| {
-            column_of(name).ok_or_else(|| {
+            index.get(name).copied().ok_or_else(|| {
                 format!(
                     "{input}: нет колонки '{name}'. Модель ждёт входы: {}. В таблице: {}",
                     schema.input_names().join(", "),
@@ -190,6 +102,15 @@ where
     }
     let inputs = parse_rows(schema, &cells, &labels).map_err(|e| format!("{input}: {e}"))?;
     let predictions = predict(&inputs)?;
+    if predictions.outputs.dim() != (table.n_rows(), schema.n_outputs()) {
+        return Err(format!(
+            "прогноз имеет форму {}×{}, ожидалось {}×{}",
+            predictions.outputs.nrows(),
+            predictions.outputs.ncols(),
+            table.n_rows(),
+            schema.n_outputs()
+        ));
+    }
 
     // Выходные колонки: существующие заменяем, недостающие добавляем справа.
     let mut headers = header.clone();
@@ -197,10 +118,13 @@ where
     let mut added = Vec::new();
     let mut output_cols = Vec::with_capacity(schema.n_outputs());
     for name in schema.output_names() {
-        match column_of(name) {
+        match index.get(name).copied() {
             Some(col) => {
                 replaced.push(name.to_string());
                 output_cols.push(col);
+                // Имя в новой книге каноническое, даже если в исходной вокруг
+                // него были пробелы.
+                headers[col] = name.to_string();
             }
             None => {
                 added.push(name.to_string());
@@ -238,6 +162,30 @@ where
         replaced,
         added,
     })
+}
+
+fn same_path(input: &str, output: &str) -> bool {
+    if Path::new(input) == Path::new(output) {
+        return true;
+    }
+    match (std::fs::canonicalize(input), std::fs::canonicalize(output)) {
+        (Ok(input), Ok(output)) => input == output,
+        _ => false,
+    }
+}
+
+fn header_index(headers: &[String]) -> Result<HashMap<&str, usize>, String> {
+    let mut index = HashMap::with_capacity(headers.len());
+    for (column, header) in headers.iter().enumerate() {
+        let name = header.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if index.insert(name, column).is_some() {
+            return Err(format!("дублирующийся заголовок '{name}'"));
+        }
+    }
+    Ok(index)
 }
 
 /// Записать минимальную книгу: один лист, только значения.
@@ -296,12 +244,6 @@ fn write_row(xml: &mut String, row_num: usize, cells: &[SheetCell]) {
                 if v.is_finite() {
                     xml.push_str(&format!(r#"<c r="{r}"><v>{v}</v></c>"#));
                 }
-            }
-            SheetCell::Bool(v) => {
-                xml.push_str(&format!(
-                    r#"<c r="{r}" t="b"><v>{}</v></c>"#,
-                    if *v { 1 } else { 0 }
-                ));
             }
         }
     }
@@ -522,6 +464,63 @@ mod tests {
 
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn export_rejects_ambiguous_headers_and_bad_prediction_shapes() {
+        let duplicate = tmp_path("duplicate.csv");
+        std::fs::write(
+            &duplicate,
+            "температура,материал,температура\n70,глина,80\n",
+        )
+        .unwrap();
+        let err = export_predictions(
+            duplicate.to_str().unwrap(),
+            tmp_path("unused_duplicate.xlsx").to_str().unwrap(),
+            &schema(),
+            double,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("дублирующийся заголовок 'температура'"),
+            "{err}"
+        );
+
+        let valid = tmp_path("bad_shape.csv");
+        std::fs::write(&valid, "температура,материал\n70,глина\n").unwrap();
+        let err = export_predictions(
+            valid.to_str().unwrap(),
+            tmp_path("unused_shape.xlsx").to_str().unwrap(),
+            &schema(),
+            |inputs| {
+                Ok(Predictions {
+                    outputs: Array2::zeros((inputs.nrows(), 1)),
+                    warnings: Vec::new(),
+                })
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("ожидалось 1×2"), "{err}");
+
+        let _ = std::fs::remove_file(duplicate);
+        let _ = std::fs::remove_file(valid);
+    }
+
+    #[test]
+    fn export_refuses_to_overwrite_the_source() {
+        let input = tmp_path("same_path.csv");
+        let contents = "температура,материал\n70,глина\n";
+        std::fs::write(&input, contents).unwrap();
+        let err = export_predictions(
+            input.to_str().unwrap(),
+            input.to_str().unwrap(),
+            &schema(),
+            double,
+        )
+        .unwrap_err();
+        assert!(err.contains("не должен перезаписывать"), "{err}");
+        assert_eq!(std::fs::read_to_string(&input).unwrap(), contents);
+        let _ = std::fs::remove_file(input);
     }
 
     #[test]

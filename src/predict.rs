@@ -86,6 +86,13 @@ pub fn predict_rows(
             inputs.nrows()
         ));
     }
+    if normalized.ncols() != out_norm.n_features() {
+        return Err(format!(
+            "модель вернула {} выходов вместо {}",
+            normalized.ncols(),
+            out_norm.n_features()
+        ));
+    }
     let outputs = out_norm.inverse_transform(&normalized);
     if let Some(((r, c), _)) = outputs.indexed_iter().find(|(_, v)| !v.is_finite()) {
         return Err(format!(
@@ -255,6 +262,14 @@ mod tests {
         let nan = Array2::from_shape_vec((1, 2), vec![f32::NAN, 0.0]).unwrap();
         let err = predict_rows(&model, &in_norm, &out_norm, &nan).unwrap_err();
         assert!(err.contains("не конечно"), "{err}");
+
+        let wrong_outputs = Normalizer::fit(
+            &Array2::from_shape_vec((2, 2), vec![0.0, 0.0, 1.0, 1.0]).unwrap(),
+            &Normalizer::all_continuous(2),
+        );
+        let err =
+            predict_rows(&model, &in_norm, &wrong_outputs, &Array2::zeros((1, 2))).unwrap_err();
+        assert!(err.contains("1 выходов вместо 2"), "{err}");
     }
 
     #[test]
