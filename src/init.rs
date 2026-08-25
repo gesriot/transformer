@@ -3,7 +3,7 @@
 //! Случайность при построении модели — только в `Linear`/`Embedding`. Они
 //! рисуют веса через `rand_uniform`, который берёт сидируемый thread-local RNG,
 //! если задан `set_init_seed`, иначе — энтропию (`thread_rng`). Это делает
-//! `sweep` (per-seed) и `numeric --seed`/`epoch-sweep` воспроизводимыми, не
+//! `search` (per-seed) и `train --seed`/validation-кривые воспроизводимыми, не
 //! протягивая RNG через все конструкторы.
 
 use ndarray::{Array, ArrayD, IxDyn};

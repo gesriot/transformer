@@ -54,14 +54,15 @@ use transformer::training::{
 };
 
 /// Разобранные аргументы: `--key value` во flags, остальное — позиционные.
+#[derive(Debug)]
 struct Flags {
     flags: HashMap<String, String>,
     positionals: Vec<String>,
 }
 
-/// Допустимые флаги для numeric / numeric-file. Неизвестный флаг отвергается,
+/// Допустимые флаги для train. Неизвестный флаг отвергается,
 /// чтобы опечатка не привела к молчаливому обучению дефолтной конфигурации.
-const NUMERIC_FLAGS: &[&str] = &[
+const TRAIN_FLAGS: &[&str] = &[
     "epochs",
     "eval-every",
     "model",
@@ -92,7 +93,7 @@ const NUMERIC_FLAGS: &[&str] = &[
 ];
 
 /// Булевы флаги (без значения).
-const NUMERIC_BOOL_FLAGS: &[&str] = &["diagnose", "kan-symbolic", "kan-compact", "interpret"];
+const TRAIN_BOOL_FLAGS: &[&str] = &["diagnose", "kan-symbolic", "kan-compact", "interpret"];
 
 /// Флаги подкоманды predict: табличная форма.
 const PREDICT_FLAGS: &[&str] = &["table", "out"];
@@ -101,8 +102,8 @@ const PREDICT_FLAGS: &[&str] = &["table", "out"];
 const PREPARE_FLAGS: &[&str] = &["inputs", "outputs", "delimiter", "categorical"];
 const PREPARE_BOOL_FLAGS: &[&str] = &["has-header"];
 
-/// Флаги подкоманды sweep (оси — CSV-списки).
-const SWEEP_FLAGS: &[&str] = &[
+/// Флаги подкоманды search (оси — CSV-списки).
+const SEARCH_FLAGS: &[&str] = &[
     "model-kinds",
     "seeds",
     "d-models",
@@ -136,6 +137,9 @@ impl Flags {
         let mut i = 0;
         while i < rest.len() {
             if let Some(key) = rest[i].strip_prefix("--") {
+                if flags.contains_key(key) {
+                    return Err(format!("флаг --{key} указан повторно"));
+                }
                 if bool_flags.contains(&key) {
                     flags.insert(key.to_string(), "true".to_string());
                     i += 1;
@@ -185,6 +189,16 @@ impl Flags {
     }
     fn pos(&self, i: usize) -> Option<&str> {
         self.positionals.get(i).map(String::as_str)
+    }
+
+    fn require_positionals(&self, min: usize, max: usize, usage: &str) -> Result<(), String> {
+        if (min..=max).contains(&self.positionals.len()) {
+            return Ok(());
+        }
+        Err(format!(
+            "неверное число позиционных аргументов (получено {}): ожидается {usage}",
+            self.positionals.len(),
+        ))
     }
 }
 
@@ -535,10 +549,7 @@ fn print_config(nc: &NumericConfig, tcfg: &TrainConfig) {
 /// MLP и KAN получают категориальный код как обычное число и неявно считают,
 /// что код 3 «между» 2 и 4. Embedding есть только у transformer, поэтому здесь
 /// предупреждение, а не тихое обучение на ложной геометрии.
-fn warn_categorical_without_embedding(nc: &NumericConfig, schema: &ModelSchema) {
-    if nc.kind == ModelKind::Transformer {
-        return;
-    }
+fn categorical_embedding_warning(kinds: &[ModelKind], schema: &ModelSchema) -> Option<String> {
     let categorical: Vec<&str> = schema
         .inputs()
         .iter()
@@ -546,19 +557,39 @@ fn warn_categorical_without_embedding(nc: &NumericConfig, schema: &ModelSchema) 
         .map(|c| c.name())
         .collect();
     if categorical.is_empty() {
-        return;
+        return None;
     }
-    println!(
-        "ВНИМАНИЕ: категориальные входы ({}) в модели {} кодируются числами —\n\
-         \x20 порядок кодов будет воспринят как расстояние. Embedding категорий\n\
-         \x20 есть только у transformer.",
-        categorical.join(", "),
-        match nc.kind {
+    let mut risky = Vec::new();
+    for kind in kinds {
+        let name = match kind {
+            ModelKind::Transformer => continue,
             ModelKind::Mlp => "mlp",
             ModelKind::Kan => "kan",
-            ModelKind::Transformer => unreachable!("проверено выше"),
+        };
+        if !risky.contains(&name) {
+            risky.push(name);
         }
-    );
+    }
+    if risky.is_empty() {
+        return None;
+    }
+    let models = if risky.len() == 1 {
+        format!("модели {}", risky[0])
+    } else {
+        format!("моделях {}", risky.join(", "))
+    };
+    Some(format!(
+        "ВНИМАНИЕ: категориальные входы ({}) в {models} кодируются числами —\n\
+         \x20 порядок кодов будет воспринят как расстояние. Embedding категорий\n\
+         \x20 есть только у transformer.",
+        categorical.join(", ")
+    ))
+}
+
+fn warn_categorical_without_embedding(kinds: &[ModelKind], schema: &ModelSchema) {
+    if let Some(warning) = categorical_embedding_warning(kinds, schema) {
+        println!("{warning}");
+    }
 }
 
 /// Печать метрик с явным указанием, откуда они взяты. Выходы называются по
@@ -599,12 +630,12 @@ fn print_metrics(title: &str, m: &Metrics, per: &[Metrics], schema: &ModelSchema
     }
 }
 
-/// Общий поток обучения для `numeric` и `numeric-file`.
+/// Общий поток обучения для файла и встроенной демонстрационной задачи.
 ///
 /// Сам сценарий живёт в [`transformer::training`]: здесь остаются только
 /// печать и KAN-конвейер, который подключается хуком и потому применяется
 /// одинаково к модели разработки и к финальной.
-fn run_numeric_flow(
+fn run_train_flow(
     f: &Flags,
     data: NumericDataset,
     schema: ModelSchema,
@@ -632,7 +663,7 @@ fn run_numeric_flow(
     drop(preview);
 
     print_config(&nc, &tcfg);
-    warn_categorical_without_embedding(&nc, dataset.schema());
+    warn_categorical_without_embedding(&[nc.kind], dataset.schema());
     let interpret = interpret_from(f, &nc).unwrap_or_else(|e| fail(&e));
     if let Some(profile) = &interpret {
         println!("Конвейер интерпретации {}", profile.describe());
@@ -690,11 +721,14 @@ fn run_numeric_flow(
                 Phase::Final => &final_tcfg,
             };
             apply_kan_pipeline(trained, train_data, eval, &interpret, phase_tcfg);
+            // Рекомендация должна быть видна между development и refit, а не
+            // после того, как финальная модель уже обучена и test открыт.
+            if phase == Phase::Development {
+                print_val_curve(&trained.history);
+            }
         },
     )
     .unwrap_or_else(|e| fail(&e));
-
-    print_val_curve(&outcome.development.history);
 
     // Метрики фазы разработки: validation той же модели, что прошла конвейер.
     let dev_split = plan.prepare(dataset.data()).unwrap_or_else(|e| fail(&e));
@@ -801,8 +835,23 @@ fn require_data_file(path: &str) {
     ));
 }
 
+fn validate_train_positionals(f: &Flags) -> Result<(), String> {
+    f.require_positionals(1, 3, "<источник> [эпохи] [модель.bin]")?;
+    if f.has("epochs") && f.pos(1).is_some() {
+        return Err("эпохи заданы и позиционно, и через --epochs".to_string());
+    }
+    if f.has("model") && f.pos(2).is_some() {
+        return Err("путь модели задан и позиционно, и через --model".to_string());
+    }
+    Ok(())
+}
+
 fn run_demo_train(rest: &[String]) {
-    let f = Flags::parse(rest, NUMERIC_FLAGS, NUMERIC_BOOL_FLAGS).unwrap_or_else(|e| fail(&e));
+    let f = Flags::parse(rest, TRAIN_FLAGS, TRAIN_BOOL_FLAGS).unwrap_or_else(|e| fail(&e));
+    // Имя ящика можно опустить: `demo train` остаётся коротким запуском sum.
+    if !f.positionals.is_empty() {
+        validate_train_positionals(&f).unwrap_or_else(|e| fail(&e));
+    }
     let name = f.pos(0).unwrap_or("sum");
 
     let bb = match blackbox::by_name(name) {
@@ -825,11 +874,12 @@ fn run_demo_train(rest: &[String]) {
     let data = bb.generate(2000, DEFAULT_DATA_SEED);
     // У встроенного ящика имён нет — схема синтетическая и это осознанно.
     let schema = ModelSchema::synthetic(bb.n_inputs(), bb.n_outputs).unwrap_or_else(|e| fail(&e));
-    run_numeric_flow(&f, data, schema, Some(&bb));
+    run_train_flow(&f, data, schema, Some(&bb));
 }
 
 fn run_train(rest: &[String]) {
-    let f = Flags::parse(rest, NUMERIC_FLAGS, NUMERIC_BOOL_FLAGS).unwrap_or_else(|e| fail(&e));
+    let f = Flags::parse(rest, TRAIN_FLAGS, TRAIN_BOOL_FLAGS).unwrap_or_else(|e| fail(&e));
+    validate_train_positionals(&f).unwrap_or_else(|e| fail(&e));
     let path = f
         .pos(0)
         .unwrap_or_else(|| fail("укажите данные: transformer train <файл>"));
@@ -848,7 +898,7 @@ fn run_train(rest: &[String]) {
         data.inputs.ncols(),
         data.outputs.ncols()
     );
-    run_numeric_flow(&f, data, schema, None);
+    run_train_flow(&f, data, schema, None);
 }
 
 fn save_and_verify(
@@ -1081,7 +1131,7 @@ fn run_predict(rest: &[String]) {
         }
     };
     let schema = &checkpoint.schema;
-    warn_categorical_without_embedding(&checkpoint.config, schema);
+    warn_categorical_without_embedding(&[checkpoint.config.kind], schema);
 
     // Таблица и одна строка идут через один слой схемы и одно ядро прогноза.
     let row = match &form {
@@ -1142,7 +1192,7 @@ fn run_predict(rest: &[String]) {
     }
 }
 
-// --- epoch-sweep (свип по эпохам), CLI-only ---
+// --- validation-кривая по эпохам ---
 
 /// Кривая validation по эпохам и рекомендованная остановка. Печатается только
 /// при `--eval-every`: без замеров точек нет.
@@ -1155,7 +1205,10 @@ fn print_val_curve(history: &TrainingHistory) {
     if measured.is_empty() {
         return;
     }
-    println!("\nКривая по эпохам ({}):", history.source.label());
+    println!(
+        "\nКривая development по эпохам ({}; до post-train конвейера):",
+        history.source.label()
+    );
     println!("epochs  train_loss     RMSE       MAE      rel.err        R²");
     for (epoch, loss, m) in &measured {
         println!(
@@ -1223,6 +1276,8 @@ fn run_gui_cmd() {
 
 fn run_prepare(rest: &[String]) {
     let f = Flags::parse(rest, PREPARE_FLAGS, PREPARE_BOOL_FLAGS).unwrap_or_else(|e| fail(&e));
+    f.require_positionals(2, 2, "prepare <input> <out.tnum>")
+        .unwrap_or_else(|e| fail(&e));
     let input = f
         .pos(0)
         .unwrap_or_else(|| fail("укажите входную таблицу: prepare <input> <out.tnum>"));
@@ -1286,7 +1341,7 @@ fn run_prepare(rest: &[String]) {
     println!("Записано {output}: {rows} строк, {n_inputs} вход -> {n_outputs} выход");
 }
 
-// --- sweep ---
+// --- search ---
 
 fn csv_usize(f: &Flags, key: &str, default: &str) -> Vec<usize> {
     f.get(key)
@@ -1347,7 +1402,9 @@ fn parse_sched(s: &str) -> LrSchedule {
 /// Поиск на своих данных: та же сетка, что и в demo, но датасет читается из
 /// файла и разбивается общим протоколом.
 fn run_search(rest: &[String]) {
-    let f = Flags::parse(rest, SWEEP_FLAGS, &[]).unwrap_or_else(|e| fail(&e));
+    let f = Flags::parse(rest, SEARCH_FLAGS, &[]).unwrap_or_else(|e| fail(&e));
+    f.require_positionals(1, 1, "search <файл>")
+        .unwrap_or_else(|e| fail(&e));
     let path = f
         .pos(0)
         .unwrap_or_else(|| fail("укажите данные: transformer search <файл>"));
@@ -1359,6 +1416,7 @@ fn run_search(rest: &[String]) {
         .unwrap_or_else(|e| fail(&e));
 
     let axes = axes_from(&f);
+    warn_categorical_without_embedding(&axes.model_kinds, dataset.schema());
     announce_search(path, &axes);
     let never = std::sync::atomic::AtomicBool::new(false);
     let result = sweep_core::run_sweep(
@@ -1374,7 +1432,9 @@ fn run_search(rest: &[String]) {
 }
 
 fn run_demo_search(rest: &[String]) {
-    let f = Flags::parse(rest, SWEEP_FLAGS, &[]).unwrap_or_else(|e| fail(&e));
+    let f = Flags::parse(rest, SEARCH_FLAGS, &[]).unwrap_or_else(|e| fail(&e));
+    f.require_positionals(1, 1, "demo search <чёрный ящик>")
+        .unwrap_or_else(|e| fail(&e));
     let name = f
         .pos(0)
         .unwrap_or_else(|| fail("укажите чёрный ящик: demo search <blackbox>"));
@@ -1508,6 +1568,9 @@ fn run_demo(rest: &[String]) {
 }
 
 fn run_demo_text(rest: &[String]) {
+    if !(1..=2).contains(&rest.len()) {
+        fail("ожидалось: demo text <файл.txt> [steps]");
+    }
     let path = match rest.first() {
         Some(p) => p,
         None => {
@@ -1515,7 +1578,13 @@ fn run_demo_text(rest: &[String]) {
             std::process::exit(1);
         }
     };
-    let steps: usize = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(2000);
+    let steps: usize = rest
+        .get(1)
+        .map(|s| {
+            s.parse()
+                .unwrap_or_else(|_| fail(&format!("steps: ожидалось целое, получено '{s}'")))
+        })
+        .unwrap_or(2000);
 
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -1598,6 +1667,40 @@ mod tests {
         for live in ["train", "search", "predict", "prepare", "demo", "gui"] {
             assert!(renamed_command(live).is_none(), "{live}");
         }
+    }
+
+    #[test]
+    fn cli_rejects_duplicate_flags_and_extra_positionals() {
+        let duplicate = row(&["data.tnum", "--epochs", "2", "--epochs", "3"]);
+        let err = Flags::parse(&duplicate, TRAIN_FLAGS, TRAIN_BOOL_FLAGS).unwrap_err();
+        assert!(err.contains("указан повторно"), "{err}");
+
+        let search = Flags::parse(&row(&["data.tnum", "лишнее"]), SEARCH_FLAGS, &[]).unwrap();
+        let err = search
+            .require_positionals(1, 1, "search <файл>")
+            .unwrap_err();
+        assert!(err.contains("получено 2"), "{err}");
+
+        let mixed = Flags::parse(
+            &row(&["data.tnum", "20", "--epochs", "40"]),
+            TRAIN_FLAGS,
+            TRAIN_BOOL_FLAGS,
+        )
+        .unwrap();
+        let err = validate_train_positionals(&mixed).unwrap_err();
+        assert!(err.contains("и позиционно, и через --epochs"), "{err}");
+    }
+
+    #[test]
+    fn file_search_warns_about_categorical_codes_in_mlp_and_kan() {
+        let schema =
+            ModelSchema::synthetic_from_specs(&[FeatureSpec::Categorical { cardinality: 3 }], 1)
+                .unwrap();
+        assert!(categorical_embedding_warning(&[ModelKind::Transformer], &schema).is_none());
+        let warning =
+            categorical_embedding_warning(&[ModelKind::Mlp, ModelKind::Kan], &schema).unwrap();
+        assert!(warning.contains("mlp, kan"), "{warning}");
+        assert!(warning.contains("x0"), "{warning}");
     }
 
     #[test]

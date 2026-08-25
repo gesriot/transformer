@@ -124,7 +124,7 @@ pub fn train_surrogate(
 }
 
 /// Как `train_surrogate`, но зовёт `on_epoch(epoch_index_0based, mean_loss)` после
-/// каждой эпохи (живая кривая GUI / снапшоты epoch-sweep) и проверяет `cancel`
+/// каждой эпохи (живая validation-кривая GUI/CLI) и проверяет `cancel`
 /// ВНУТРИ батч-цикла — при взводе флага обучение прерывается на ближайшем
 /// minibatch (а не ждёт конца эпохи) и возвращает накопленную историю.
 ///
