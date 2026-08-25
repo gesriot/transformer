@@ -7,6 +7,7 @@
 //!   transformer numeric-file <data> [--epochs N] [--model out.bin] [флаги]
 //!   transformer text <file.txt> [steps]
 //!   transformer predict <model.bin> <v1> <v2> ...
+//!   transformer predict <model.bin> --table <вход> --out <выход>
 //!
 //! Конфиг-флаги: --d-model --heads --layers --enc-layers --dec-layers --d-ff
 //!               --lr --batch-size --seed
@@ -16,6 +17,7 @@ use ndarray::Array2;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::collections::HashMap;
+use transformer::batch_predict;
 use transformer::blackbox;
 use transformer::config::ModelConfig;
 use transformer::data::{Normalizer, NumericDataset, TextDataset};
@@ -89,6 +91,9 @@ const NUMERIC_FLAGS: &[&str] = &[
 
 /// Булевы флаги (без значения).
 const NUMERIC_BOOL_FLAGS: &[&str] = &["diagnose", "kan-symbolic", "kan-compact", "interpret"];
+
+/// Флаги подкоманды predict: табличная форма.
+const PREDICT_FLAGS: &[&str] = &["table", "out"];
 
 /// Флаги подкоманды prepare (таблица -> .tnum).
 const PREPARE_FLAGS: &[&str] = &["inputs", "outputs", "delimiter", "categorical"];
@@ -455,6 +460,7 @@ fn print_usage() {
     );
     eprintln!("  transformer text <file.txt> [steps]");
     eprintln!("  transformer predict <model.bin> <v1> <v2> ...");
+    eprintln!("  transformer predict <model.bin> --table <вход> --out <выход.xlsx>");
     eprintln!("  флаги: --d-model --heads --layers --d-ff --lr --batch-size --seed");
     eprintln!("         --model-kind transformer|mlp|kan --mlp-width --mlp-layers");
     eprintln!("         --kan-width --kan-layers --kan-grid");
@@ -957,6 +963,62 @@ fn run_diagnostics(
     }
 }
 
+/// Форма подкоманды predict. Их две, и они не смешиваются: «--table вместе со
+/// значениями» — две разные просьбы в одной команде, и угадывать настоящую
+/// нельзя.
+#[derive(Debug)]
+enum PredictForm {
+    Table { input: String, output: String },
+    Row(Vec<String>),
+}
+
+fn predict_form(
+    table: Option<&str>,
+    out: Option<&str>,
+    positionals: &[String],
+) -> Result<PredictForm, String> {
+    match (table, out) {
+        (Some(input), Some(output)) if positionals.is_empty() => Ok(PredictForm::Table {
+            input: input.to_string(),
+            output: output.to_string(),
+        }),
+        (Some(_), Some(_)) => Err("нельзя смешивать формы: либо --table и --out для \
+             таблицы, либо значения одной строки"
+            .to_string()),
+        (Some(_), None) | (None, Some(_)) => {
+            Err("для таблицы нужны оба флага: --table вход и --out выход".to_string())
+        }
+        (None, None) if positionals.is_empty() => Err(
+            "укажите значения одной строки (predict model.bin 70 глина) или таблицу \
+                 (predict model.bin --table вход.xlsx --out прогноз.xlsx)"
+                .to_string(),
+        ),
+        (None, None) => Ok(PredictForm::Row(positionals.to_vec())),
+    }
+}
+
+/// Отчёт об экспорте: сколько строк, что заменено и что добавлено.
+fn print_export_summary(output: &str, summary: &batch_predict::ExportSummary) {
+    println!("Таблица с прогнозами записана в {output}");
+    println!("  строк: {}", summary.rows);
+    if summary.extrapolated_rows > 0 {
+        println!(
+            "  вне обученного диапазона: {} строк",
+            summary.extrapolated_rows
+        );
+    }
+    if !summary.replaced.is_empty() {
+        println!("  колонки заменены: {}", summary.replaced.join(", "));
+    }
+    if !summary.added.is_empty() {
+        println!("  колонки добавлены: {}", summary.added.join(", "));
+    }
+    println!(
+        "  результат — новая книга только со значениями: стили, формулы, другие \
+         листы и структура исходного файла не сохраняются"
+    );
+}
+
 fn run_predict(args: &[String]) {
     let path = match args.get(2) {
         Some(p) => p,
@@ -965,10 +1027,9 @@ fn run_predict(args: &[String]) {
             std::process::exit(1);
         }
     };
-    let raw_args = &args[3..];
-    if raw_args.is_empty() {
-        fail("укажите входные значения: transformer predict model.bin v1 v2 ...");
-    }
+    let f = Flags::parse(&args[3..], PREDICT_FLAGS, &[]).unwrap_or_else(|e| fail(&e));
+    let form =
+        predict_form(f.get("table"), f.get("out"), &f.positionals).unwrap_or_else(|e| fail(&e));
 
     let checkpoint = match load_numeric_full(path) {
         Ok(c) => c,
@@ -980,9 +1041,25 @@ fn run_predict(args: &[String]) {
     let schema = &checkpoint.schema;
     warn_categorical_without_embedding(&checkpoint.config, schema);
 
-    // Разбор и прогноз — тем же слоем и ядром, что и таблица: короткая форма
-    // это пакет из одной строки.
-    let cells: Vec<&str> = raw_args.iter().map(String::as_str).collect();
+    // Таблица и одна строка идут через один слой схемы и одно ядро прогноза.
+    let row = match &form {
+        PredictForm::Table { input, output } => {
+            let summary = batch_predict::export_predictions(input, output, schema, |inputs| {
+                predict::predict_rows(
+                    &checkpoint.model,
+                    &checkpoint.in_norm,
+                    &checkpoint.out_norm,
+                    inputs,
+                )
+            })
+            .unwrap_or_else(|e| fail(&e));
+            print_export_summary(output, &summary);
+            return;
+        }
+        PredictForm::Row(values) => values,
+    };
+
+    let cells: Vec<&str> = row.iter().map(String::as_str).collect();
     let values = predict::parse_row(schema, &cells, "").unwrap_or_else(|e| fail(&e));
     let inputs = Array2::from_shape_vec((1, values.len()), values.clone())
         .expect("одна строка нужной ширины");
@@ -1000,7 +1077,7 @@ fn run_predict(args: &[String]) {
             Some(_) => println!(
                 "  {} = {} (код {})",
                 column.display_name(),
-                raw_args[i],
+                row[i],
                 values[i] as usize
             ),
             None => println!("  {} = {}", column.display_name(), values[i]),
@@ -1456,4 +1533,45 @@ fn run_text(args: &[String]) {
 
     println!("\n--- Затравка ---\n{seed}");
     println!("\n--- Генерация ---\n{seed}{sample}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn table_form_needs_both_flags_and_no_values() {
+        let both = predict_form(Some("in.xlsx"), Some("out.xlsx"), &[]).unwrap();
+        match both {
+            PredictForm::Table { input, output } => {
+                assert_eq!((input.as_str(), output.as_str()), ("in.xlsx", "out.xlsx"));
+            }
+            PredictForm::Row(_) => panic!("ожидалась табличная форма"),
+        }
+        for (t, o) in [(Some("in.xlsx"), None), (None, Some("out.xlsx"))] {
+            let e = predict_form(t, o, &[]).unwrap_err();
+            assert!(e.contains("оба флага"), "{e}");
+        }
+    }
+
+    #[test]
+    fn forms_do_not_mix() {
+        let e = predict_form(Some("in.xlsx"), Some("out.xlsx"), &row(&["70"])).unwrap_err();
+        assert!(e.contains("смешивать"), "{e}");
+        let e = predict_form(Some("in.xlsx"), None, &row(&["70"])).unwrap_err();
+        assert!(e.contains("оба флага"), "{e}");
+    }
+
+    #[test]
+    fn short_form_keeps_its_values_and_rejects_an_empty_call() {
+        match predict_form(None, None, &row(&["70", "глина"])).unwrap() {
+            PredictForm::Row(values) => assert_eq!(values, row(&["70", "глина"])),
+            PredictForm::Table { .. } => panic!("ожидалась короткая форма"),
+        }
+        assert!(predict_form(None, None, &[]).is_err());
+    }
 }
