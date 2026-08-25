@@ -9,7 +9,7 @@ use super::messages::{
     Command, DatasetOrigin, DiagnosticsResult, Event, KanModelInfo, KanSymbolicInfo, KanWeakEdge,
     PreparedData, ValidationOrigin,
 };
-use crate::batch_predict::{read_prediction_xlsx, write_prediction_xlsx};
+use crate::batch_predict::{export_predictions, ExportSummary};
 use crate::blackbox;
 use crate::config::ModelConfig;
 use crate::data::{Normalizer, NumericDataset, OutOfRange, TextDataset};
@@ -21,13 +21,13 @@ use crate::interpret::{self, InterpretProfile, InterpretReport};
 use crate::markup::TableProfile;
 use crate::metrics::evaluate;
 use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
+use crate::predict::predict_rows;
 use crate::schema::ModelSchema;
 use crate::serialize::{calibration_sample, load_numeric_full, save_numeric};
 use crate::split::{SplitPlan, DEFAULT_DATA_SEED, DEFAULT_FINAL_INIT_SEED};
 use crate::sweep::{self, SweepAxes, SweepObjective};
 use crate::symbolic;
 use crate::table::{Delimiter, Table};
-use crate::tensor::Tensor;
 use crate::textmodel::TextModel;
 use crate::tnum::{
     infer_prepare_spec_from_table, read_numeric_source, table_path_to_tnum, PrepareSpec,
@@ -40,7 +40,7 @@ use crate::training::{
     evaluate_on, refit, run_training, Dataset, EvalSchedule, Phase, TrainedModel, TrainingSetup,
 };
 use eframe::egui;
-use ndarray::{Array2, Ix2};
+use ndarray::Array2;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::cell::RefCell;
@@ -271,15 +271,11 @@ fn worker_loop(
                 }
                 ctx.request_repaint();
             }
-            Command::PredictFile { input, output } => {
+            Command::ExportPredictions { input, output } => {
                 match &current {
-                    Some(l) => match do_predict_file(l, &input, &output) {
-                        Ok((rows, extrapolation_rows)) => {
-                            let _ = evt_tx.send(Event::PredictFileDone {
-                                output,
-                                rows,
-                                extrapolation_rows,
-                            });
+                    Some(l) => match do_export(l, &input, &output) {
+                        Ok(summary) => {
+                            let _ = evt_tx.send(Event::ExportDone { output, summary });
                         }
                         Err(e) => {
                             let _ = evt_tx.send(Event::Error(e));
@@ -637,6 +633,7 @@ fn diagnose(l: &Loaded) -> Result<DiagnosticsResult, String> {
     })
 }
 
+/// Единичный прогноз — тот же пакет из одной строки.
 fn do_predict(l: &Loaded, values: &[f32]) -> Result<(Vec<f32>, Vec<OutOfRange>), String> {
     if values.len() != l.n_inputs {
         return Err(format!(
@@ -645,39 +642,21 @@ fn do_predict(l: &Loaded, values: &[f32]) -> Result<(Vec<f32>, Vec<OutOfRange>),
             values.len()
         ));
     }
-    let raw = Array2::from_shape_vec((1, l.n_inputs), values.to_vec()).unwrap();
-    let extrapolation = l.in_norm.out_of_range_details(values);
-    let x = Tensor::constant(l.in_norm.transform(&raw).into_dyn());
-    let pred_norm = l
-        .model
-        .predict(&x)
-        .data()
-        .into_dimensionality::<Ix2>()
-        .map_err(|_| "predict вернул неверную форму".to_string())?;
-    let pred = l.out_norm.inverse_transform(&pred_norm);
-    Ok((pred.row(0).to_vec(), extrapolation))
+    let inputs = Array2::from_shape_vec((1, l.n_inputs), values.to_vec())
+        .expect("одна строка нужной ширины");
+    let result = predict_rows(&l.model, &l.in_norm, &l.out_norm, &inputs)?;
+    let extrapolation = result
+        .warnings
+        .first()
+        .map(|w| w.details.clone())
+        .unwrap_or_default();
+    Ok((result.outputs.row(0).to_vec(), extrapolation))
 }
 
-fn do_predict_file(l: &Loaded, input: &str, output: &str) -> Result<(usize, usize), String> {
-    let sheet = read_prediction_xlsx(input, l.n_inputs, l.n_outputs)?;
-    let input_rows = sheet.input_rows()?;
-    if input_rows.is_empty() {
-        return Err("Excel-файл не содержит строк с входами".to_string());
-    }
-
-    let mut predictions = Vec::with_capacity(input_rows.len());
-    let mut extrapolation_rows = 0;
-    for values in &input_rows {
-        let (pred, extrapolation) = do_predict(l, values)?;
-        if !extrapolation.is_empty() {
-            extrapolation_rows += 1;
-        }
-        predictions.push(pred);
-    }
-
-    let filled = sheet.fill_outputs(&predictions)?;
-    write_prediction_xlsx(output, &filled)?;
-    Ok((predictions.len(), extrapolation_rows))
+fn do_export(l: &Loaded, input: &str, output: &str) -> Result<ExportSummary, String> {
+    export_predictions(input, output, &l.schema, |inputs| {
+        predict_rows(&l.model, &l.in_norm, &l.out_norm, inputs)
+    })
 }
 
 /// Поиск конфигурации на активном наборе данных.

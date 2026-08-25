@@ -12,7 +12,7 @@
 //!               --lr --batch-size --seed
 //! Старая позиционная форма (`numeric-file f.tnum 40 out.bin`) тоже работает.
 
-use ndarray::{Array2, Ix2};
+use ndarray::Array2;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::collections::HashMap;
@@ -29,6 +29,7 @@ use transformer::metrics::{evaluate, Metrics};
 use transformer::numeric_model::{
     validate_numeric, KanConfig, ModelKind, NumericConfig, NumericModel,
 };
+use transformer::predict;
 use transformer::schema::ModelSchema;
 use transformer::serialize::{calibration_sample, load_numeric_full, save_numeric};
 use transformer::split::{
@@ -36,7 +37,6 @@ use transformer::split::{
 };
 use transformer::sweep as sweep_core;
 use transformer::symbolic;
-use transformer::tensor::Tensor;
 use transformer::textmodel::TextModel;
 use transformer::tnum::{
     infer_prepare_spec_from_path, parse_categorical, read_numeric_source, table_path_to_tnum,
@@ -980,56 +980,19 @@ fn run_predict(args: &[String]) {
     let schema = &checkpoint.schema;
     warn_categorical_without_embedding(&checkpoint.config, schema);
 
-    if raw_args.len() != schema.n_inputs() {
-        fail(&format!(
-            "модель ожидает {} входов ({}), получено {}",
-            schema.n_inputs(),
-            schema
-                .input_names()
-                .iter()
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-            raw_args.len()
-        ));
-    }
-
-    // Категориальный вход задаётся ПОДПИСЬЮ уровня, а не кодом: у старых
-    // моделей подписи и есть коды («0», «1»), поэтому прежние команды работают.
-    let mut values = Vec::with_capacity(raw_args.len());
-    for (i, arg) in raw_args.iter().enumerate() {
-        let column = &schema.inputs()[i];
-        let value = match column.cardinality() {
-            Some(_) => column.category_code(arg).unwrap_or_else(|e| fail(&e)) as f32,
-            None => {
-                let value = arg.parse::<f32>().unwrap_or_else(|_| {
-                    fail(&format!(
-                        "вход '{}' = '{arg}': ожидалось число",
-                        column.name()
-                    ))
-                });
-                if !value.is_finite() {
-                    fail(&format!(
-                        "вход '{}' = '{arg}': число должно быть конечным",
-                        column.name()
-                    ));
-                }
-                value
-            }
-        };
-        values.push(value);
-    }
-
-    let f = values.len();
-    let raw = Array2::from_shape_vec((1, f), values.clone()).unwrap();
-    let x = Tensor::constant(checkpoint.in_norm.transform(&raw).into_dyn());
-    let pred_norm = checkpoint
-        .model
-        .predict(&x)
-        .data()
-        .into_dimensionality::<Ix2>()
-        .expect("predict возвращает [1, O]");
-    let pred = checkpoint.out_norm.inverse_transform(&pred_norm);
+    // Разбор и прогноз — тем же слоем и ядром, что и таблица: короткая форма
+    // это пакет из одной строки.
+    let cells: Vec<&str> = raw_args.iter().map(String::as_str).collect();
+    let values = predict::parse_row(schema, &cells, "").unwrap_or_else(|e| fail(&e));
+    let inputs = Array2::from_shape_vec((1, values.len()), values.clone())
+        .expect("одна строка нужной ширины");
+    let result = predict::predict_rows(
+        &checkpoint.model,
+        &checkpoint.in_norm,
+        &checkpoint.out_norm,
+        &inputs,
+    )
+    .unwrap_or_else(|e| fail(&e));
 
     println!("Вход:");
     for (i, column) in schema.inputs().iter().enumerate() {
@@ -1045,7 +1008,18 @@ fn run_predict(args: &[String]) {
     }
     println!("Выход:");
     for (j, column) in schema.outputs().iter().enumerate() {
-        println!("  {} = {}", column.display_name(), pred[[0, j]]);
+        println!("  {} = {}", column.display_name(), result.outputs[[0, j]]);
+    }
+    for warning in &result.warnings {
+        for d in &warning.details {
+            println!(
+                "ВНИМАНИЕ: {} = {} вне обученного диапазона [{}, {}]",
+                schema.inputs()[d.feature].display_name(),
+                d.value,
+                d.min,
+                d.max
+            );
+        }
     }
 }
 

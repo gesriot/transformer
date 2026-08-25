@@ -6,9 +6,14 @@ use crate::schema::ColumnType;
 use eframe::egui;
 
 impl App {
-    pub(super) fn batch_predict_dialog(&mut self) {
+    /// Экспорт таблицы с прогнозами. Именно экспорт: исходная книга не
+    /// сохраняется, результат — новая минимальная книга со значениями.
+    pub(super) fn export_predictions_dialog(&mut self) {
         let Some(input) = rfd::FileDialog::new()
-            .add_filter("Excel", &["xlsx"])
+            .add_filter(
+                "таблицы",
+                &["xlsx", "xlsm", "xlsb", "xls", "ods", "csv", "tsv"],
+            )
             .pick_file()
         else {
             return;
@@ -16,7 +21,7 @@ impl App {
         let default_name = input
             .file_stem()
             .and_then(|s| s.to_str())
-            .map(|s| format!("{s}_predicted.xlsx"))
+            .map(|s| format!("{s}_прогноз.xlsx"))
             .unwrap_or_else(|| "predicted.xlsx".to_string());
         let Some(output) = rfd::FileDialog::new()
             .add_filter("Excel", &["xlsx"])
@@ -26,8 +31,8 @@ impl App {
             return;
         };
         self.batch_predicting = true;
-        self.status = "заполнение Excel…".to_string();
-        self.worker.send(Command::PredictFile {
+        self.status = "экспорт таблицы с прогнозами…".to_string();
+        self.worker.send(Command::ExportPredictions {
             input: input.display().to_string(),
             output: output.display().to_string(),
         });
@@ -125,20 +130,28 @@ impl App {
                 }
 
                 ui.separator();
-                ui.label("Пакетный прогноз из Excel");
+                ui.label("Прогноз по таблице");
                 ui.label(format!(
-                    "Ожидается первый лист с колонками x0..x{} и y0..y{}; y-колонки будут перезаписаны.",
-                    n_in.saturating_sub(1),
-                    n_out.saturating_sub(1)
+                    "Колонки входов ищутся по именам: {}. Колонки выходов ({}) \
+                     заменяются, если есть, и добавляются, если нет; посторонние \
+                     колонки переносятся как значения.",
+                    info.schema.input_names().join(", "),
+                    info.schema.output_names().join(", ")
                 ));
+                // Про потерю оформления говорим прямо: это экспорт, а не
+                // правка исходной книги.
+                ui.label(
+                    "Результат — НОВАЯ книга только со значениями: стили, формулы, \
+                     другие листы и структура исходного файла не сохраняются.",
+                );
                 if ui
                     .add_enabled(
                         !self.busy() && self.model_info.is_some(),
-                        egui::Button::new("Заполнить Excel (.xlsx)…"),
+                        egui::Button::new("Экспортировать таблицу с прогнозами…"),
                     )
                     .clicked()
                 {
-                    self.batch_predict_dialog();
+                    self.export_predictions_dialog();
                 }
             }
         }

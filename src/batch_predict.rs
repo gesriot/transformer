@@ -5,11 +5,12 @@
 //! формул и дополнительных листов. Это достаточно для сценария "вставить
 //! предсказанные y-колонки в расчетную таблицу".
 
-use calamine::{open_workbook_auto, Data, Reader};
-use std::collections::HashMap;
+use crate::predict::{parse_rows, Predictions};
+use crate::schema::ModelSchema;
+use crate::table::{Delimiter, Table};
+use ndarray::Array2;
 use std::fs::File;
 use std::io::{Seek, Write};
-use std::path::Path;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -27,15 +28,6 @@ impl SheetCell {
             SheetCell::Blank => true,
             SheetCell::Text(s) => s.trim().is_empty(),
             SheetCell::Number(_) | SheetCell::Bool(_) => false,
-        }
-    }
-
-    fn header_text(&self) -> Option<String> {
-        match self {
-            SheetCell::Text(s) => Some(s.trim().to_string()),
-            SheetCell::Number(v) => Some(v.to_string()),
-            SheetCell::Bool(v) => Some(if *v { "true" } else { "false" }.to_string()),
-            SheetCell::Blank => None,
         }
     }
 
@@ -134,153 +126,143 @@ impl PredictionSheet {
     }
 }
 
-pub fn read_prediction_xlsx(
-    path: &str,
-    n_inputs: usize,
-    n_outputs: usize,
-) -> Result<PredictionSheet, String> {
-    let path_ref = Path::new(path);
-    let mut workbook =
-        open_workbook_auto(path_ref).map_err(|e| format!("чтение {}: {e}", path_ref.display()))?;
-    let sheet_name = workbook
-        .sheet_names()
-        .first()
-        .cloned()
-        .ok_or_else(|| format!("{}: workbook без листов", path_ref.display()))?;
-    let range = workbook
-        .worksheet_range(&sheet_name)
-        .map_err(|e| format!("чтение листа '{sheet_name}': {e}"))?;
+/// Что получилось при экспорте — для отчёта пользователю.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExportSummary {
+    pub rows: usize,
+    pub extrapolated_rows: usize,
+    /// Колонки выходов, которые уже были в таблице и перезаписаны.
+    pub replaced: Vec<String>,
+    /// Колонки выходов, которых не было и которые добавлены справа.
+    pub added: Vec<String>,
+}
 
-    let mut rows: Vec<Vec<SheetCell>> = range
-        .rows()
-        .map(|row| row.iter().map(data_to_cell).collect())
-        .collect();
-    trim_empty_edges(&mut rows);
-    if rows.is_empty() {
-        return Err(format!("{}: лист пуст", path_ref.display()));
-    }
+/// Прочитать таблицу, посчитать прогноз и записать НОВУЮ книгу.
+///
+/// Входные колонки связываются по настоящим именам из [`ModelSchema`]: у
+/// модели без имён это по-прежнему `x0…xN`. Выходные колонки называются по
+/// схеме — существующие заменяются, отсутствующие добавляются; посторонние
+/// колонки сохраняются как значения.
+///
+/// Исходная книга НЕ сохраняется: стили, формулы, дополнительные листы и
+/// структура теряются, результат — минимальная новая книга.
+pub fn export_predictions<F>(
+    input: &str,
+    output: &str,
+    schema: &ModelSchema,
+    predict: F,
+) -> Result<ExportSummary, String>
+where
+    F: Fn(&Array2<f32>) -> Result<Predictions, String>,
+{
+    let table = Table::read_path(input, Delimiter::Auto, true)?;
+    let header = table
+        .header()
+        .ok_or_else(|| format!("{input}: нужна строка заголовков с именами колонок"))?
+        .to_vec();
 
-    let raw_headers = rows.remove(0);
-    let mut headers = Vec::new();
-    for (i, cell) in raw_headers.iter().enumerate() {
-        let header = cell
-            .header_text()
-            .ok_or_else(|| format!("заголовок в колонке {} пуст", i + 1))?;
-        headers.push(header);
-    }
-    while headers.last().is_some_and(|h| h.trim().is_empty()) {
-        headers.pop();
-    }
-    if headers.is_empty() {
-        return Err("строка заголовков пуста".to_string());
-    }
-
-    let index = header_index(&headers)?;
-    let input_cols = collect_cols(&index, 'x', n_inputs)?;
-    let output_cols = collect_cols(&index, 'y', n_outputs)?;
-    let max_col = input_cols
+    // Связывание по именам: без него таблица и модель молча разошлись бы.
+    let column_of = |name: &str| header.iter().position(|h| h.trim() == name);
+    let input_cols = schema
+        .input_names()
         .iter()
-        .chain(output_cols.iter())
-        .copied()
-        .max()
-        .unwrap_or(0);
-    if headers.len() <= max_col {
-        headers.resize_with(max_col + 1, String::new);
+        .map(|name| {
+            column_of(name).ok_or_else(|| {
+                format!(
+                    "{input}: нет колонки '{name}'. Модель ждёт входы: {}. В таблице: {}",
+                    schema.input_names().join(", "),
+                    header.join(", ")
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Разбор — слоем схемы: подписи категорий и адресные ошибки.
+    let mut cells = Vec::with_capacity(table.n_rows());
+    let mut labels = Vec::with_capacity(table.n_rows());
+    for (r, row) in table.rows().iter().enumerate() {
+        let picked = input_cols
+            .iter()
+            .map(|&c| row.get(c).cloned().unwrap_or_default())
+            .collect::<Vec<_>>();
+        cells.push(picked);
+        labels.push(table.file_row(r));
+    }
+    let inputs = parse_rows(schema, &cells, &labels).map_err(|e| format!("{input}: {e}"))?;
+    let predictions = predict(&inputs)?;
+
+    // Выходные колонки: существующие заменяем, недостающие добавляем справа.
+    let mut headers = header.clone();
+    let mut replaced = Vec::new();
+    let mut added = Vec::new();
+    let mut output_cols = Vec::with_capacity(schema.n_outputs());
+    for name in schema.output_names() {
+        match column_of(name) {
+            Some(col) => {
+                replaced.push(name.to_string());
+                output_cols.push(col);
+            }
+            None => {
+                added.push(name.to_string());
+                output_cols.push(headers.len());
+                headers.push(name.to_string());
+            }
+        }
     }
 
-    Ok(PredictionSheet {
-        headers,
-        rows,
-        input_cols,
-        output_cols,
+    let width = headers.len();
+    let mut rows = Vec::with_capacity(table.n_rows());
+    for (r, row) in table.rows().iter().enumerate() {
+        let mut cells: Vec<SheetCell> = (0..width)
+            .map(|c| match row.get(c) {
+                // Посторонние колонки переносятся как значения.
+                Some(text) if !text.trim().is_empty() => match text.trim().parse::<f64>() {
+                    Ok(v) if v.is_finite() => SheetCell::Number(v),
+                    _ => SheetCell::Text(text.clone()),
+                },
+                _ => SheetCell::Blank,
+            })
+            .collect();
+        for (slot, &col) in output_cols.iter().enumerate() {
+            cells[col] = SheetCell::Number(predictions.outputs[[r, slot]] as f64);
+        }
+        rows.push(cells);
+    }
+
+    write_sheet(output, &headers, &rows)?;
+    Ok(ExportSummary {
+        rows: predictions.rows(),
+        extrapolated_rows: predictions.extrapolated_rows(),
+        replaced,
+        added,
     })
 }
 
-pub fn write_prediction_xlsx(path: &str, sheet: &PredictionSheet) -> Result<(), String> {
+/// Записать минимальную книгу: один лист, только значения.
+fn write_sheet(path: &str, headers: &[String], rows: &[Vec<SheetCell>]) -> Result<(), String> {
     let file = File::create(path).map_err(|e| format!("создание {path}: {e}"))?;
     let mut zip = ZipWriter::new(file);
     add_zip_file(&mut zip, "[Content_Types].xml", CONTENT_TYPES)?;
     add_zip_file(&mut zip, "_rels/.rels", ROOT_RELS)?;
     add_zip_file(&mut zip, "xl/workbook.xml", WORKBOOK)?;
     add_zip_file(&mut zip, "xl/_rels/workbook.xml.rels", WORKBOOK_RELS)?;
-    let worksheet = worksheet_xml(sheet);
-    add_zip_file(&mut zip, "xl/worksheets/sheet1.xml", &worksheet)?;
+    add_zip_file(
+        &mut zip,
+        "xl/worksheets/sheet1.xml",
+        &worksheet_xml(headers, rows),
+    )?;
     zip.finish()
         .map_err(|e| format!("завершение xlsx {path}: {e}"))?;
     Ok(())
 }
 
-fn data_to_cell(cell: &Data) -> SheetCell {
-    match cell {
-        Data::Empty => SheetCell::Blank,
-        Data::String(s) => {
-            if s.trim().is_empty() {
-                SheetCell::Blank
-            } else {
-                SheetCell::Text(s.clone())
-            }
-        }
-        Data::Float(v) => SheetCell::Number(*v),
-        Data::Int(v) => SheetCell::Number(*v as f64),
-        Data::Bool(v) => SheetCell::Bool(*v),
-        Data::DateTime(v) => SheetCell::Text(v.to_string()),
-        Data::DateTimeIso(s) | Data::DurationIso(s) => SheetCell::Text(s.clone()),
-        Data::Error(e) => SheetCell::Text(format!("{e}")),
-    }
-}
-
-fn trim_empty_edges(rows: &mut Vec<Vec<SheetCell>>) {
-    for row in rows.iter_mut() {
-        while row.last().is_some_and(SheetCell::is_blank) {
-            row.pop();
-        }
-    }
-    while rows
-        .last()
-        .is_some_and(|row| row.iter().all(SheetCell::is_blank))
-    {
-        rows.pop();
-    }
-}
-
-fn header_index(headers: &[String]) -> Result<HashMap<String, usize>, String> {
-    let mut out = HashMap::new();
-    for (i, header) in headers.iter().enumerate() {
-        let key = header.trim().to_ascii_lowercase();
-        if key.is_empty() {
-            continue;
-        }
-        if out.insert(key.clone(), i).is_some() {
-            return Err(format!("дублирующийся заголовок '{key}'"));
-        }
-    }
-    Ok(out)
-}
-
-fn collect_cols(
-    index: &HashMap<String, usize>,
-    prefix: char,
-    count: usize,
-) -> Result<Vec<usize>, String> {
-    let mut cols = Vec::with_capacity(count);
-    for i in 0..count {
-        let name = format!("{prefix}{i}");
-        let col = index
-            .get(&name)
-            .copied()
-            .ok_or_else(|| format!("в Excel-файле нет колонки '{name}'"))?;
-        cols.push(col);
-    }
-    Ok(cols)
-}
-
-fn worksheet_xml(sheet: &PredictionSheet) -> String {
+fn worksheet_xml(headers: &[String], rows: &[Vec<SheetCell>]) -> String {
     let mut xml = String::from(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#);
     xml.push_str(
         r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>"#,
     );
-    write_row(&mut xml, 1, &header_cells(&sheet.headers));
-    for (i, row) in sheet.rows.iter().enumerate() {
+    write_row(&mut xml, 1, &header_cells(headers));
+    for (i, row) in rows.iter().enumerate() {
         write_row(&mut xml, i + 2, row);
     }
     xml.push_str("</sheetData></worksheet>");
@@ -405,6 +387,7 @@ const WORKBOOK_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::{Column, ColumnRole};
 
     #[test]
     fn cell_refs_cover_excel_columns() {
@@ -414,58 +397,145 @@ mod tests {
         assert_eq!(cell_ref(27, 3), "AB3");
     }
 
+    fn schema() -> ModelSchema {
+        ModelSchema::new(
+            vec![
+                Column::numeric("температура", ColumnRole::Input).unwrap(),
+                Column::categorical(
+                    "материал",
+                    ColumnRole::Input,
+                    vec!["песок".into(), "глина".into()],
+                )
+                .unwrap(),
+            ],
+            vec![
+                Column::numeric("влажность", ColumnRole::Output).unwrap(),
+                Column::numeric("плотность", ColumnRole::Output).unwrap(),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Прогноз по каждой строке: сумма входов и их разность — так по значению
+    /// в ячейке видно, что предсказание попало в свою строку и колонку.
+    fn double(inputs: &Array2<f32>) -> Result<Predictions, String> {
+        let outputs = Array2::from_shape_fn((inputs.nrows(), 2), |(r, c)| {
+            if c == 0 {
+                inputs[[r, 0]] + inputs[[r, 1]]
+            } else {
+                inputs[[r, 0]] - inputs[[r, 1]]
+            }
+        });
+        Ok(Predictions {
+            outputs,
+            warnings: Vec::new(),
+        })
+    }
+
+    fn read_back(path: &std::path::Path) -> (Vec<String>, Vec<Vec<String>>) {
+        let table = Table::read_path(path, Delimiter::Auto, true).unwrap();
+        (table.header().unwrap().to_vec(), table.rows().to_vec())
+    }
+
+    /// Колонки связываются по именам, а не по позиции: порядок в таблице свой,
+    /// посторонняя колонка сохраняется, отсутствующий выход добавляется.
     #[test]
-    fn xlsx_roundtrip_fills_outputs() {
-        let input = tmp_path("input.xlsx");
+    fn export_binds_columns_by_name() {
+        let input = tmp_path("input.csv");
         let output = tmp_path("output.xlsx");
-        let sheet = PredictionSheet {
-            headers: vec![
-                "x0".to_string(),
-                "x1".to_string(),
-                "note".to_string(),
-                "y0".to_string(),
-                "y1".to_string(),
-            ],
-            rows: vec![
-                vec![
-                    SheetCell::Number(1.0),
-                    SheetCell::Number(2.0),
-                    SheetCell::Text("a".to_string()),
-                    SheetCell::Blank,
-                    SheetCell::Blank,
-                ],
-                vec![
-                    SheetCell::Text("3.5".to_string()),
-                    SheetCell::Number(4.0),
-                    SheetCell::Text("b".to_string()),
-                    SheetCell::Blank,
-                    SheetCell::Blank,
-                ],
-            ],
-            input_cols: vec![0, 1],
-            output_cols: vec![3, 4],
-        };
-        write_prediction_xlsx(input.to_str().unwrap(), &sheet).unwrap();
+        std::fs::write(
+            &input,
+            "заметка,материал,температура,влажность
+хорошо,глина,70,0
+плохо,песок,60,0
+",
+        )
+        .unwrap();
 
-        let read = read_prediction_xlsx(input.to_str().unwrap(), 2, 2).unwrap();
+        let summary = export_predictions(
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            &schema(),
+            double,
+        )
+        .unwrap();
+
+        assert_eq!(summary.rows, 2);
+        assert_eq!(summary.replaced, vec!["влажность"]);
+        assert_eq!(summary.added, vec!["плотность"]);
+
+        let (headers, rows) = read_back(&output);
         assert_eq!(
-            read.input_rows().unwrap(),
-            vec![vec![1.0, 2.0], vec![3.5, 4.0]]
+            headers,
+            vec![
+                "заметка",
+                "материал",
+                "температура",
+                "влажность",
+                "плотность"
+            ]
         );
-
-        let filled = read
-            .fill_outputs(&[vec![10.0, 20.0], vec![30.0, 40.0]])
-            .unwrap();
-        write_prediction_xlsx(output.to_str().unwrap(), &filled).unwrap();
-
-        let reread = read_prediction_xlsx(output.to_str().unwrap(), 2, 2).unwrap();
-        assert_eq!(reread.rows[0][3], SheetCell::Number(10.0));
-        assert_eq!(reread.rows[0][4], SheetCell::Number(20.0));
-        assert_eq!(reread.rows[1][3], SheetCell::Number(30.0));
-        assert_eq!(reread.rows[1][4], SheetCell::Number(40.0));
+        // Посторонняя колонка переехала как значение.
+        assert_eq!(rows[0][0], "хорошо");
+        // Категория осталась подписью, а не превратилась в код.
+        assert_eq!(rows[0][1], "глина");
+        // 70 + 1 (код «глина») и 70 − 1.
+        assert_eq!(rows[0][3], "71");
+        assert_eq!(rows[0][4], "69");
+        // Вторая строка: 60 + 0 и 60 − 0.
+        assert_eq!(rows[1][3], "60");
+        assert_eq!(rows[1][4], "60");
 
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(output);
+    }
+
+    #[test]
+    fn export_explains_a_missing_input_column() {
+        let input = tmp_path("missing.csv");
+        std::fs::write(
+            &input,
+            "материал,влажность
+глина,1
+",
+        )
+        .unwrap();
+        let err = export_predictions(
+            input.to_str().unwrap(),
+            tmp_path("unused.xlsx").to_str().unwrap(),
+            &schema(),
+            double,
+        )
+        .unwrap_err();
+        assert!(err.contains("нет колонки 'температура'"), "{err}");
+        // Ошибка показывает и что нужно, и что есть.
+        assert!(err.contains("В таблице: материал, влажность"), "{err}");
+        let _ = std::fs::remove_file(input);
+    }
+
+    /// Ошибка ячейки адресуется номером строки ФАЙЛА, а не порядком в выборке.
+    #[test]
+    fn export_addresses_a_bad_cell() {
+        let input = tmp_path("bad.csv");
+        std::fs::write(
+            &input,
+            "температура,материал
+70,глина
+# комментарий
+60,мрамор
+",
+        )
+        .unwrap();
+        let err = export_predictions(
+            input.to_str().unwrap(),
+            tmp_path("unused2.xlsx").to_str().unwrap(),
+            &schema(),
+            double,
+        )
+        .unwrap_err();
+        assert!(err.contains("строка 4"), "{err}");
+        assert!(err.contains("мрамор"), "{err}");
+        let _ = std::fs::remove_file(input);
     }
 
     fn tmp_path(name: &str) -> std::path::PathBuf {

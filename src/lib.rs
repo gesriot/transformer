@@ -21,6 +21,7 @@ pub mod nn;
 pub mod numeric_model;
 pub mod ops;
 pub mod optim;
+pub mod predict;
 pub mod schema;
 pub mod serialize;
 pub mod split;

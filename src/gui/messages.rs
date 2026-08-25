@@ -1,6 +1,7 @@
 //! Сообщения UI <-> worker. Только `Send`-данные; Rc-модели не
 //! пересекают границу потока.
 
+use crate::batch_predict::ExportSummary;
 use crate::config::ModelConfig;
 use crate::data::{NumericDataset, OutOfRange};
 use crate::diagnostics::SensitivityReport;
@@ -164,7 +165,9 @@ pub enum Command {
     LoadModel(String),
     SaveModel(String),
     Predict(Vec<f32>),
-    PredictFile {
+    /// Экспорт таблицы с прогнозами: результат — новая книга, исходная не
+    /// сохраняется.
+    ExportPredictions {
         input: String,
         output: String,
     },
@@ -270,10 +273,9 @@ pub enum Event {
         outputs: Vec<f32>,
         extrapolation: Vec<OutOfRange>,
     },
-    PredictFileDone {
+    ExportDone {
         output: String,
-        rows: usize,
-        extrapolation_rows: usize,
+        summary: ExportSummary,
     },
     KanEdgeCurve {
         layer: usize,

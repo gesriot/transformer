@@ -460,19 +460,24 @@ impl App {
                     self.predict_outputs = Some(outputs);
                     self.extrapolation = extrapolation;
                 }
-                Event::PredictFileDone {
-                    output,
-                    rows,
-                    extrapolation_rows,
-                } => {
+                Event::ExportDone { output, summary } => {
                     self.batch_predicting = false;
-                    self.status = if extrapolation_rows == 0 {
-                        format!("Excel заполнен: {output} ({rows} строк)")
-                    } else {
-                        format!(
-                            "Excel заполнен: {output} ({rows} строк, {extrapolation_rows} вне train-диапазона)"
-                        )
-                    };
+                    let mut text =
+                        format!("Таблица с прогнозами: {output} ({} строк", summary.rows);
+                    if summary.extrapolated_rows > 0 {
+                        text.push_str(&format!(
+                            ", {} вне обученного диапазона",
+                            summary.extrapolated_rows
+                        ));
+                    }
+                    if !summary.replaced.is_empty() {
+                        text.push_str(&format!("; заменены: {}", summary.replaced.join(", ")));
+                    }
+                    if !summary.added.is_empty() {
+                        text.push_str(&format!("; добавлены: {}", summary.added.join(", ")));
+                    }
+                    text.push(')');
+                    self.status = text;
                 }
                 Event::KanEdgeCurve {
                     layer,
