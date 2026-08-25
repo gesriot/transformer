@@ -1,17 +1,18 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-//! CLI: обучение surrogate-модели на чёрном ящике / числовой таблице, либо char-LM.
+//! CLI: обучение surrogate-модели на числовых данных и прогноз по ней.
 //!
 //! Использование:
-//!   transformer numeric <blackbox> [--epochs N] [--model out.bin] [конфиг-флаги]
-//!   transformer numeric-file <data> [--epochs N] [--model out.bin] [флаги]
-//!   transformer text <file.txt> [steps]
+//!   transformer gui
+//!   transformer train <данные> [--epochs N] [--eval-every N] [--model out.bin]
+//!   transformer search <данные> [оси сетки]
+//!   transformer prepare <таблица> <out.tnum> --inputs N --outputs M
 //!   transformer predict <model.bin> <v1> <v2> ...
 //!   transformer predict <model.bin> --table <вход> --out <выход>
+//!   transformer demo train|search <чёрный ящик> | demo text <file.txt> [steps]
 //!
 //! Конфиг-флаги: --d-model --heads --layers --enc-layers --dec-layers --d-ff
 //!               --lr --batch-size --seed
-//! Старая позиционная форма (`numeric-file f.tnum 40 out.bin`) тоже работает.
 
 use ndarray::Array2;
 use rand::rngs::StdRng;
@@ -23,7 +24,6 @@ use transformer::config::ModelConfig;
 use transformer::data::{Normalizer, NumericDataset, TextDataset};
 use transformer::diagnostics;
 use transformer::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
-use transformer::epoch_sweep;
 use transformer::generate::generate;
 use transformer::init::set_init_seed;
 use transformer::interpret::{self, InterpretOverrides, InterpretProfile, InterpretReport};
@@ -49,7 +49,8 @@ use transformer::train::{
     TrainConfig,
 };
 use transformer::training::{
-    evaluate_on, run_training, Dataset, Phase, TrainedModel, TrainingSetup,
+    evaluate_on, recommended_epoch, run_training, Dataset, EvalSchedule, Phase, TrainedModel,
+    TrainingHistory, TrainingSetup,
 };
 
 /// Разобранные аргументы: `--key value` во flags, остальное — позиционные.
@@ -62,6 +63,7 @@ struct Flags {
 /// чтобы опечатка не привела к молчаливому обучению дефолтной конфигурации.
 const NUMERIC_FLAGS: &[&str] = &[
     "epochs",
+    "eval-every",
     "model",
     "model-kind",
     "d-model",
@@ -425,20 +427,37 @@ fn resolve_epochs(f: &Flags) -> usize {
     }
 }
 
+/// Замена для команды, удалённой при переходе на train/search/predict/demo.
+/// Держим один релиз: молчаливое «неизвестная команда» не подсказывает, куда
+/// переехал сценарий.
+fn renamed_command(name: &str) -> Option<&'static str> {
+    match name {
+        "numeric-file" => Some("используйте transformer train <данные>"),
+        "numeric" => Some("используйте transformer demo train <чёрный ящик>"),
+        "sweep" => Some("используйте transformer search <данные> или demo search <чёрный ящик>"),
+        "epoch-sweep" => Some("используйте transformer train <данные> --eval-every N"),
+        "text" => Some("используйте transformer demo text <файл.txt>"),
+        _ => None,
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         // Без подкоманды — GUI (основной режим). CLI-подкоманды — по имени.
         None | Some("gui") => run_gui_cmd(),
-        Some("numeric") => run_numeric(&args),
-        Some("numeric-file") => run_numeric_file(&args),
-        Some("sweep") => run_sweep(&args),
-        Some("epoch-sweep") => run_epoch_sweep_cmd(&args),
-        Some("prepare") => run_prepare(&args),
-        Some("text") => run_text(&args),
-        Some("predict") => run_predict(&args),
+        Some("train") => run_train(&args[2..]),
+        Some("search") => run_search(&args[2..]),
+        Some("prepare") => run_prepare(&args[2..]),
+        Some("predict") => run_predict(&args[2..]),
+        Some("demo") => run_demo(&args[2..]),
         Some(other) => {
-            eprintln!("Неизвестная команда: {other}\n");
+            match renamed_command(other) {
+                // Переименованную команду не выполняем догадкой: печатаем
+                // замену и выходим, иначе старый скрипт молча сделает не то.
+                Some(hint) => eprintln!("Команда «{other}» больше не существует: {hint}\n"),
+                None => eprintln!("Неизвестная команда: {other}\n"),
+            }
             print_usage();
             std::process::exit(1);
         }
@@ -449,21 +468,23 @@ fn print_usage() {
     eprintln!("Использование:");
     eprintln!("  transformer                 без аргументов — GUI (основной режим)");
     eprintln!("  transformer gui             явный запуск GUI");
-    eprintln!("  transformer numeric <blackbox> [--epochs N] [--model out.bin] [флаги]");
-    eprintln!("  transformer numeric-file <data> [--epochs N] [--model out.bin] [флаги]");
-    eprintln!("  transformer sweep <blackbox> [--model-kinds transformer,mlp,kan]");
+    eprintln!("  transformer train <данные> [--epochs N] [--eval-every N] [--model out.bin]");
+    eprintln!("                    данные: .tnum, XLSX, CSV или TSV");
+    eprintln!("  transformer search <данные> [--model-kinds transformer,mlp,kan]");
     eprintln!("                    [--d-models 32,64 --layers-list 2,3 --mlp-widths 128]");
     eprintln!("                    [--kan-widths 16,32 --kan-layers-list 2 --kan-grids 8,16]");
-    eprintln!("  transformer epoch-sweep <data> [--epochs 1,2,5,10,20,40] [конфиг-флаги]");
     eprintln!(
         "  transformer prepare <input> <out.tnum> --inputs N --outputs M [--has-header] [--categorical 9:4]"
     );
-    eprintln!("  transformer text <file.txt> [steps]");
     eprintln!("  transformer predict <model.bin> <v1> <v2> ...");
     eprintln!("  transformer predict <model.bin> --table <вход> --out <выход.xlsx>");
+    eprintln!("  transformer demo train <чёрный ящик> [флаги обучения]");
+    eprintln!("  transformer demo search <чёрный ящик> [оси сетки]");
+    eprintln!("  transformer demo text <file.txt> [steps]");
     eprintln!("  флаги: --d-model --heads --layers --d-ff --lr --batch-size --seed");
     eprintln!("         --model-kind transformer|mlp|kan --mlp-width --mlp-layers");
     eprintln!("         --kan-width --kan-layers --kan-grid");
+    eprintln!("         --eval-every N (кривая validation по эпохам и рекомендованная остановка)");
     eprintln!("         --interpret (профиль KAN: L1 → prune → fine-tune → compact)");
     eprintln!("         --kan-l1 <λ> --kan-prune <отн. порог> --kan-finetune-epochs <N>");
     eprintln!("         --kan-symbolic (извлечь формулы из обученной KAN)");
@@ -618,7 +639,13 @@ fn run_numeric_flow(
     }
     validate_kan_symbolic(f, &nc).unwrap_or_else(|e| fail(&e));
 
-    let setup = TrainingSetup::new(nc.clone(), tcfg.clone());
+    let mut setup = TrainingSetup::new(nc.clone(), tcfg.clone());
+    // Кривая validation по эпохам — то, ради чего раньше был отдельный режим
+    // epoch-sweep. Расписание проверяет само ядро: «замер реже, чем длится
+    // обучение» станет ошибкой до первой эпохи, а не пустой кривой в конце.
+    if let Some(n) = f.usize("eval-every").unwrap_or_else(|e| fail(&e)) {
+        setup.eval = EvalSchedule::Every(n);
+    }
     let never = std::sync::atomic::AtomicBool::new(false);
     let final_tcfg = TrainConfig {
         seed: DEFAULT_FINAL_INIT_SEED,
@@ -666,6 +693,8 @@ fn run_numeric_flow(
         },
     )
     .unwrap_or_else(|e| fail(&e));
+
+    print_val_curve(&outcome.development.history);
 
     // Метрики фазы разработки: validation той же модели, что прошла конвейер.
     let dev_split = plan.prepare(dataset.data()).unwrap_or_else(|e| fail(&e));
@@ -754,9 +783,26 @@ fn apply_kan_pipeline(
     print_interpret_report(&report);
 }
 
-fn run_numeric(args: &[String]) {
-    let f =
-        Flags::parse(&args[2..], NUMERIC_FLAGS, NUMERIC_BOOL_FLAGS).unwrap_or_else(|e| fail(&e));
+/// `train` и `search` работают только с файлом. Существование проверяем до
+/// чтения: иначе `train sum` жаловался бы на формат вместо того, чтобы указать
+/// на `demo train sum`. Сам формат определяет читатель.
+fn require_data_file(path: &str) {
+    if std::path::Path::new(path).is_file() {
+        return;
+    }
+    if blackbox::by_name(path).is_some() {
+        fail(&format!(
+            "«{path}» — встроенная задача, а не файл: используйте transformer demo train {path} \
+             (или demo search {path})"
+        ));
+    }
+    fail(&format!(
+        "файл не найден: {path} (ожидается .tnum, XLSX, CSV или TSV)"
+    ));
+}
+
+fn run_demo_train(rest: &[String]) {
+    let f = Flags::parse(rest, NUMERIC_FLAGS, NUMERIC_BOOL_FLAGS).unwrap_or_else(|e| fail(&e));
     let name = f.pos(0).unwrap_or("sum");
 
     let bb = match blackbox::by_name(name) {
@@ -782,16 +828,12 @@ fn run_numeric(args: &[String]) {
     run_numeric_flow(&f, data, schema, Some(&bb));
 }
 
-fn run_numeric_file(args: &[String]) {
-    let f =
-        Flags::parse(&args[2..], NUMERIC_FLAGS, NUMERIC_BOOL_FLAGS).unwrap_or_else(|e| fail(&e));
-    let path = match f.pos(0) {
-        Some(p) => p,
-        None => {
-            eprintln!("Укажите путь к .tnum, XLSX, CSV или TSV файлу");
-            std::process::exit(1);
-        }
-    };
+fn run_train(rest: &[String]) {
+    let f = Flags::parse(rest, NUMERIC_FLAGS, NUMERIC_BOOL_FLAGS).unwrap_or_else(|e| fail(&e));
+    let path = f
+        .pos(0)
+        .unwrap_or_else(|| fail("укажите данные: transformer train <файл>"));
+    require_data_file(path);
 
     let (data, schema) = match read_numeric_source(path) {
         Ok(v) => v,
@@ -1019,15 +1061,15 @@ fn print_export_summary(output: &str, summary: &batch_predict::ExportSummary) {
     );
 }
 
-fn run_predict(args: &[String]) {
-    let path = match args.get(2) {
+fn run_predict(rest: &[String]) {
+    let path = match rest.first() {
         Some(p) => p,
         None => {
             eprintln!("Укажите путь к сохранённой модели (.bin)");
             std::process::exit(1);
         }
     };
-    let f = Flags::parse(&args[3..], PREDICT_FLAGS, &[]).unwrap_or_else(|e| fail(&e));
+    let f = Flags::parse(&rest[1..], PREDICT_FLAGS, &[]).unwrap_or_else(|e| fail(&e));
     let form =
         predict_form(f.get("table"), f.get("out"), &f.positionals).unwrap_or_else(|e| fail(&e));
 
@@ -1102,6 +1144,45 @@ fn run_predict(args: &[String]) {
 
 // --- epoch-sweep (свип по эпохам), CLI-only ---
 
+/// Кривая validation по эпохам и рекомендованная остановка. Печатается только
+/// при `--eval-every`: без замеров точек нет.
+fn print_val_curve(history: &TrainingHistory) {
+    let measured: Vec<(usize, f32, &Metrics)> = history
+        .points
+        .iter()
+        .filter_map(|p| p.val.as_ref().map(|m| (p.epoch, p.train_loss, m)))
+        .collect();
+    if measured.is_empty() {
+        return;
+    }
+    println!("\nКривая по эпохам ({}):", history.source.label());
+    println!("epochs  train_loss     RMSE       MAE      rel.err        R²");
+    for (epoch, loss, m) in &measured {
+        println!(
+            "{epoch:>6}  {loss:>10.5}  {:>9.5}  {:>9.5}  {:>7.2}%  {:>8.5}",
+            m.rmse,
+            m.mae,
+            m.rel_error * 100.0,
+            m.r2
+        );
+    }
+    let r2s: Vec<f32> = measured.iter().map(|(_, _, m)| m.r2).collect();
+    let losses: Vec<f32> = measured.iter().map(|(_, loss, _)| *loss).collect();
+    println!("R²    {}", sparkline(&r2s));
+    println!("loss  {}", sparkline(&losses));
+    if let Some((epoch, why)) = recommended_epoch(
+        measured.iter().map(|(epoch, _, m)| (*epoch, m.r2)),
+        0.95,
+        0.02,
+        0.80,
+    ) {
+        println!("Рекомендованная остановка: {epoch} эпох ({why})");
+    }
+    if history.stopped_early {
+        println!("Обучение остановлено ранней остановкой до последней эпохи.");
+    }
+}
+
 fn sparkline(xs: &[f32]) -> String {
     if xs.is_empty() {
         return String::new();
@@ -1119,103 +1200,6 @@ fn sparkline(xs: &[f32]) -> String {
             bars[t.min(bars.len() - 1)]
         })
         .collect()
-}
-
-fn run_epoch_sweep_cmd(args: &[String]) {
-    let mut allowed = NUMERIC_FLAGS.to_vec();
-    allowed.extend_from_slice(&["out-dir", "target-r2", "min-r2-gain", "plateau-min-r2"]);
-    let f = Flags::parse(&args[2..], &allowed, NUMERIC_BOOL_FLAGS).unwrap_or_else(|e| fail(&e));
-    for k in [
-        "kan-l1",
-        "kan-prune",
-        "kan-finetune-epochs",
-        "kan-symbolic",
-        "kan-compact",
-        "interpret",
-    ] {
-        if f.has(k) {
-            fail(&format!("--{k} не поддерживается в epoch-sweep"));
-        }
-    }
-
-    let path = f
-        .pos(0)
-        .unwrap_or_else(|| fail("укажите данные: epoch-sweep <data>"));
-    let (data, schema) = read_numeric_source(path).unwrap_or_else(|e| fail(&e));
-    let dataset = Dataset::new(data, schema).unwrap_or_else(|e| fail(&e));
-
-    let milestones = csv_usize(&f, "epochs", "1,2,5,10,20,40");
-    if milestones.is_empty() {
-        fail("--epochs: пустой список");
-    }
-    if milestones.contains(&0) {
-        fail("--epochs: все значения должны быть > 0");
-    }
-    let target_r2 = f
-        .f32("target-r2")
-        .unwrap_or_else(|e| fail(&e))
-        .unwrap_or(0.95);
-    let min_gain = f
-        .f32("min-r2-gain")
-        .unwrap_or_else(|e| fail(&e))
-        .unwrap_or(0.02);
-    let plateau = f
-        .f32("plateau-min-r2")
-        .unwrap_or_else(|e| fail(&e))
-        .unwrap_or(0.80);
-    if !target_r2.is_finite() {
-        fail("--target-r2 должен быть конечным");
-    }
-    if !min_gain.is_finite() || min_gain < 0.0 {
-        fail("--min-r2-gain должен быть конечным и >= 0");
-    }
-    if !plateau.is_finite() {
-        fail("--plateau-min-r2 должен быть конечным");
-    }
-    let out_dir = f.get("out-dir").unwrap_or("runs").to_string();
-
-    let prepared = SplitPlan::default()
-        .prepare(dataset.data())
-        .unwrap_or_else(|e| fail(&e));
-    let nc = numeric_config_from(&f).unwrap_or_else(|e| fail(&e));
-    let max_e = milestones.iter().copied().max().unwrap_or(1);
-    let base_tcfg = train_config_from(&f, max_e).unwrap_or_else(|e| fail(&e));
-
-    println!(
-        "Epoch-sweep {path}: эпохи {milestones:?}, {} строк в поиске, test ({} строк) не трогаем",
-        prepared.search.len(),
-        prepared.test.len()
-    );
-    let rows =
-        epoch_sweep::run_epoch_sweep(&dataset, &prepared.search, &nc, &base_tcfg, &milestones)
-            .unwrap_or_else(|e| fail(&e));
-
-    println!("\nepochs  train_loss     RMSE       MAE      rel.err     R² (validation)");
-    for r in &rows {
-        println!(
-            "{:>6}  {:>10.5}  {:>9.5}  {:>9.5}  {:>7.2}%  {:>8.5}",
-            r.epochs,
-            r.train_loss,
-            r.rmse,
-            r.mae,
-            r.rel_error * 100.0,
-            r.r2
-        );
-    }
-    let r2s: Vec<f32> = rows.iter().map(|r| r.r2).collect();
-    let losses: Vec<f32> = rows.iter().map(|r| r.train_loss).collect();
-    println!("\nR²    {}", sparkline(&r2s));
-    println!("loss  {}", sparkline(&losses));
-
-    if let Some((e, why)) = epoch_sweep::recommended_stop(&rows, target_r2, min_gain, plateau) {
-        println!("\nРекомендованная остановка: {e} эпох ({why})");
-    }
-
-    std::fs::create_dir_all(&out_dir).ok();
-    let csv_path = format!("{out_dir}/epoch_sweep_results.csv");
-    std::fs::write(&csv_path, epoch_sweep::rows_to_csv(&rows))
-        .unwrap_or_else(|e| fail(&format!("запись {csv_path}: {e}")));
-    println!("CSV: {csv_path}");
 }
 
 // --- gui (egui), за фичей `gui` ---
@@ -1237,9 +1221,8 @@ fn run_gui_cmd() {
 
 // --- prepare (таблица -> .tnum), CLI-only ---
 
-fn run_prepare(args: &[String]) {
-    let f =
-        Flags::parse(&args[2..], PREPARE_FLAGS, PREPARE_BOOL_FLAGS).unwrap_or_else(|e| fail(&e));
+fn run_prepare(rest: &[String]) {
+    let f = Flags::parse(rest, PREPARE_FLAGS, PREPARE_BOOL_FLAGS).unwrap_or_else(|e| fail(&e));
     let input = f
         .pos(0)
         .unwrap_or_else(|| fail("укажите входную таблицу: prepare <input> <out.tnum>"));
@@ -1361,25 +1344,103 @@ fn parse_sched(s: &str) -> LrSchedule {
     }
 }
 
-fn run_sweep(args: &[String]) {
-    let f = Flags::parse(&args[2..], SWEEP_FLAGS, &[]).unwrap_or_else(|e| fail(&e));
+/// Поиск на своих данных: та же сетка, что и в demo, но датасет читается из
+/// файла и разбивается общим протоколом.
+fn run_search(rest: &[String]) {
+    let f = Flags::parse(rest, SWEEP_FLAGS, &[]).unwrap_or_else(|e| fail(&e));
+    let path = f
+        .pos(0)
+        .unwrap_or_else(|| fail("укажите данные: transformer search <файл>"));
+    require_data_file(path);
+    let (data, schema) = read_numeric_source(path).unwrap_or_else(|e| fail(&e));
+    let dataset = Dataset::new(data, schema).unwrap_or_else(|e| fail(&e));
+    let prepared = SplitPlan::default()
+        .prepare(dataset.data())
+        .unwrap_or_else(|e| fail(&e));
+
+    let axes = axes_from(&f);
+    announce_search(path, &axes);
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let result = sweep_core::run_sweep(
+        &dataset,
+        &prepared.search,
+        &axes,
+        sweep_core::SweepObjective::default(),
+        &never,
+        print_search_row,
+    )
+    .unwrap_or_else(|e| fail(&e));
+    print_search_ranking(&result);
+}
+
+fn run_demo_search(rest: &[String]) {
+    let f = Flags::parse(rest, SWEEP_FLAGS, &[]).unwrap_or_else(|e| fail(&e));
     let name = f
         .pos(0)
-        .unwrap_or_else(|| fail("укажите чёрный ящик: sweep <blackbox>"));
+        .unwrap_or_else(|| fail("укажите чёрный ящик: demo search <blackbox>"));
     blackbox::by_name(name).unwrap_or_else(|| fail(&format!("неизвестный чёрный ящик: {name}")));
 
-    let seeds = csv_u64(&f, "seeds", "0");
-    let d_models = csv_usize(&f, "d-models", "32");
-    let layers = csv_usize(&f, "layers-list", "2");
-    let d_ffs = csv_usize(&f, "d-ffs", "64");
-    let lrs = csv_f32(&f, "lrs", "0.001");
+    let axes = axes_from(&f);
+    announce_search(name, &axes);
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let result = sweep_core::run_blackbox_sweep(name, &axes, &never, print_search_row)
+        .unwrap_or_else(|e| fail(&e));
+    print_search_ranking(&result);
+}
+
+/// Цена операции — до запуска: она понятнее, чем название набора осей.
+fn announce_search(source: &str, axes: &sweep_core::SweepAxes) {
+    let cost = sweep_core::sweep_cost(axes, 1).unwrap_or_else(|e| fail(&e));
+    println!("Поиск {source}: {}\n", cost.describe());
+}
+
+fn print_search_row(row: &sweep_core::SweepRow) {
+    println!(
+        "  done [{}]: {} -> worst R²={:.5}, aggregate R²={:.5}±{:.5}",
+        row.source.label(),
+        row.label,
+        row.worst_output_r2_mean,
+        row.r2_mean,
+        row.r2_std
+    );
+}
+
+/// Ранжирование: первая строка — рекомендация, по worst-output R² по умолчанию.
+fn print_search_ranking(result: &sweep_core::SweepResult) {
+    let source = result
+        .rows
+        .first()
+        .map(|row| row.source.label())
+        .unwrap_or_else(|| "validation".to_string());
+    println!("\n=== РАНЖИРОВАНИЕ ({source}; по worst-output R²; rel — справочно) ===");
+    for (i, r) in result.rows.iter().enumerate() {
+        let mark = if i == 0 { "*" } else { " " };
+        println!(
+            "{mark} worst R²={:.5}  aggregate R²={:.5}±{:.5}  nRMSE={:.5}  rel={:.1}%  | {}",
+            r.worst_output_r2_mean,
+            r.r2_mean,
+            r.r2_std,
+            r.nrmse_mean,
+            r.rel_mean * 100.0,
+            r.label
+        );
+    }
+}
+
+/// Оси сетки из флагов: общие для поиска на своих данных и на чёрном ящике.
+fn axes_from(f: &Flags) -> sweep_core::SweepAxes {
+    let seeds = csv_u64(f, "seeds", "0");
+    let d_models = csv_usize(f, "d-models", "32");
+    let layers = csv_usize(f, "layers-list", "2");
+    let d_ffs = csv_usize(f, "d-ffs", "64");
+    let lrs = csv_f32(f, "lrs", "0.001");
     let vencs: Vec<&str> = f
         .get("value-encoders")
         .unwrap_or("linear")
         .split(',')
         .map(str::trim)
         .collect();
-    let fscales = csv_f32(&f, "fourier-scales", "2");
+    let fscales = csv_f32(f, "fourier-scales", "2");
     let scheds: Vec<&str> = f
         .get("schedulers")
         .unwrap_or("constant")
@@ -1410,7 +1471,7 @@ fn run_sweep(args: &[String]) {
         })
         .collect();
 
-    let axes = sweep_core::SweepAxes {
+    sweep_core::SweepAxes {
         model_kinds,
         seeds,
         d_models,
@@ -1420,63 +1481,41 @@ fn run_sweep(args: &[String]) {
         value_encoders: vencs.iter().map(|v| parse_venc(v)).collect(),
         fourier_scales: fscales,
         fourier_bands: bands,
-        mlp_widths: csv_usize(&f, "mlp-widths", "128"),
-        mlp_layers: csv_usize(&f, "mlp-layers-list", "3"),
-        kan_widths: csv_usize(&f, "kan-widths", "16"),
-        kan_layers: csv_usize(&f, "kan-layers-list", "2"),
-        kan_grids: csv_usize(&f, "kan-grids", "8"),
+        mlp_widths: csv_usize(f, "mlp-widths", "128"),
+        mlp_layers: csv_usize(f, "mlp-layers-list", "3"),
+        kan_widths: csv_usize(f, "kan-widths", "16"),
+        kan_layers: csv_usize(f, "kan-layers-list", "2"),
+        kan_grids: csv_usize(f, "kan-grids", "8"),
         schedules: scheds.iter().map(|s| parse_sched(s)).collect(),
         epochs,
         final_epochs: epochs,
         batch_size: batch,
-    };
-    // Цена операции — до запуска: она понятнее, чем название набора осей.
-    let cost = sweep_core::sweep_cost(&axes, 1).unwrap_or_else(|e| fail(&e));
-    println!("Sweep {name}: {}\n", cost.describe());
-
-    let never = std::sync::atomic::AtomicBool::new(false);
-    let result = sweep_core::run_blackbox_sweep(name, &axes, &never, |row| {
-        println!(
-            "  done [{}]: {} -> worst R²={:.5}, aggregate R²={:.5}±{:.5}",
-            epoch_sweep::source_label(row.source),
-            row.label,
-            row.worst_output_r2_mean,
-            row.r2_mean,
-            row.r2_std
-        );
-    })
-    .unwrap_or_else(|e| fail(&e));
-
-    // Рекомендация — первая строка, по worst-output R² по умолчанию.
-    let source = result
-        .rows
-        .first()
-        .map(|row| epoch_sweep::source_label(row.source))
-        .unwrap_or_else(|| "validation".to_string());
-    println!("\n=== РАНЖИРОВАНИЕ ({source}; по worst-output R²; rel — справочно) ===");
-    for (i, r) in result.rows.iter().enumerate() {
-        let mark = if i == 0 { "*" } else { " " };
-        println!(
-            "{mark} worst R²={:.5}  aggregate R²={:.5}±{:.5}  nRMSE={:.5}  rel={:.1}%  | {}",
-            r.worst_output_r2_mean,
-            r.r2_mean,
-            r.r2_std,
-            r.nrmse_mean,
-            r.rel_mean * 100.0,
-            r.label
-        );
     }
 }
 
-fn run_text(args: &[String]) {
-    let path = match args.get(2) {
+/// demo: встроенные задачи и char-LM. К рабочему сценарию не относятся и
+/// держатся отдельной командой, чтобы не мешаться со своими данными.
+fn run_demo(rest: &[String]) {
+    match rest.first().map(String::as_str) {
+        Some("train") => run_demo_train(&rest[1..]),
+        Some("search") => run_demo_search(&rest[1..]),
+        Some("text") => run_demo_text(&rest[1..]),
+        Some(other) => fail(&format!(
+            "неизвестная демонстрация: {other} (доступны train, search, text)"
+        )),
+        None => fail("укажите демонстрацию: demo train|search <чёрный ящик> | demo text <файл>"),
+    }
+}
+
+fn run_demo_text(rest: &[String]) {
+    let path = match rest.first() {
         Some(p) => p,
         None => {
             eprintln!("Укажите путь к .txt файлу");
             std::process::exit(1);
         }
     };
-    let steps: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(2000);
+    let steps: usize = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(2000);
 
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -1541,6 +1580,24 @@ mod tests {
 
     fn row(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn removed_commands_point_at_their_replacement() {
+        for (old, hint) in [
+            ("numeric-file", "train"),
+            ("numeric", "demo train"),
+            ("sweep", "search"),
+            ("epoch-sweep", "--eval-every"),
+            ("text", "demo text"),
+        ] {
+            let msg = renamed_command(old).unwrap_or_else(|| panic!("нет замены для {old}"));
+            assert!(msg.contains(hint), "{old}: {msg}");
+        }
+        // Действующие команды не должны попадать в список замен.
+        for live in ["train", "search", "predict", "prepare", "demo", "gui"] {
+            assert!(renamed_command(live).is_none(), "{live}");
+        }
     }
 
     #[test]

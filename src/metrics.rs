@@ -59,6 +59,17 @@ pub enum EvalSource {
     Test,
 }
 
+impl EvalSource {
+    /// Подпись происхождения для отчётов CLI, CSV и GUI.
+    pub fn label(&self) -> String {
+        match self {
+            EvalSource::Validation => "validation".to_string(),
+            EvalSource::Cv { k } => format!("cv-{k}"),
+            EvalSource::Test => "test".to_string(),
+        }
+    }
+}
+
 /// Происхождение ОДНОГО прогона: номер fold (None у holdout) и seed
 /// инициализации.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

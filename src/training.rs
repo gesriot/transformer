@@ -961,6 +961,21 @@ mod tests {
     }
 
     #[test]
+    fn recommendation_prefers_target_then_plateau_then_last() {
+        // Достигнутый target важнее плато: остановка на первой такой точке.
+        let target = [(1, 0.5), (2, 0.96), (5, 0.99)];
+        assert_eq!(recommended_epoch(target, 0.95, 0.02, 0.8).unwrap().0, 2);
+        // Плато засчитывается только после plateau_min, иначе ранний шум
+        // остановил бы обучение на первой же паре близких точек.
+        let plateau = [(1, 0.5), (2, 0.82), (5, 0.83), (10, 0.835)];
+        assert_eq!(recommended_epoch(plateau, 0.99, 0.02, 0.8).unwrap().0, 2);
+        // Ни target, ни плато — последняя точка, а не отсутствие ответа.
+        let growing = [(1, 0.2), (2, 0.5)];
+        assert_eq!(recommended_epoch(growing, 0.99, 0.02, 0.8).unwrap().0, 2);
+        assert!(recommended_epoch([], 0.9, 0.02, 0.8).is_none());
+    }
+
+    #[test]
     fn cost_counts_runs_and_epochs_before_launch() {
         let cost = SearchCost::new(6, 2, 5, 40);
         assert_eq!(cost.runs, 60);

@@ -25,13 +25,11 @@ cargo build --release
 cargo build --release --no-default-features
 ```
 
-Подготовить Excel/CSV и обучить интерпретируемую KAN:
+Обучить интерпретируемую KAN прямо по таблице (`prepare` нужен только там, где
+автоопределения ролей не хватает):
 
 ```bash
-./target/release/transformer prepare data.xlsx data.tnum \
-  --inputs 3 --outputs 3 --has-header
-
-./target/release/transformer numeric-file data.tnum \
+./target/release/transformer train data.xlsx \
   --model-kind kan --kan-width 16 --kan-layers 2 --kan-grid 16 \
   --lr 3e-3 --epochs 80 --seed 0 \
   --interpret --kan-symbolic --model model-kan.bin
@@ -40,6 +38,17 @@ cargo build --release --no-default-features
 Пайплайн KAN: обучение → activation-L1 → hard-prune → fine-tune → structural
 compaction → формулы в исходных единицах. Формулы, кривые рёбер и слабые
 символьные фиты доступны также в GUI.
+
+Команды CLI: `gui`, `train`, `search`, `prepare`, `predict`, `demo`. Прежние
+имена удалены:
+
+| было | стало |
+| --- | --- |
+| `numeric-file <файл>` | `train <файл>` |
+| `numeric <ящик>` | `demo train <ящик>` |
+| `sweep <ящик>` | `search <файл>` или `demo search <ящик>` |
+| `epoch-sweep <файл>` | `train <файл> --eval-every N` |
+| `text <файл>` | `demo text <файл>` |
 
 ## Протокол оценки
 
@@ -52,7 +61,7 @@ validation**: поисковые функции не получают test да�
 ## Что входит
 
 - подготовка CSV/TSV/текстовых таблиц и Excel в `.tnum`;
-- Optimize, Sweep и Epoch-sweep для сравнения Transformer/MLP/KAN;
+- поиск по сетке (`search`) для сравнения Transformer/MLP/KAN;
 - диагностика, предупреждения об экстраполяции и экспорт таблицы с прогнозами;
 - checkpoint-ы с масками прунинга, топологией сжатой KAN и калибровкой для
   формул после загрузки;

@@ -5,7 +5,6 @@ pub mod core;
 pub mod data;
 pub mod diagnostics;
 pub mod encoders;
-pub mod epoch_sweep;
 pub mod generate;
 #[cfg(feature = "gui")]
 pub mod gui;

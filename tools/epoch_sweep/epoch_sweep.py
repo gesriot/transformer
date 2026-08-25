@@ -3,7 +3,7 @@
 
 The script intentionally uses the Rust CLI as a black box:
 
-    transformer numeric-file <data.tnum> <epochs> <model.bin>
+    transformer train <data.tnum> <epochs> <model.bin>
 
 It updates a live matplotlib chart when matplotlib is available. In headless
 mode it still saves a PNG and always writes a CSV with the collected metrics.
@@ -35,7 +35,7 @@ R2_RE = re.compile(r"R²\s*=\s*([-+0-9.eE]+)")
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Sweep epoch counts for numeric-file training and plot train loss / R2."
+        description="Sweep epoch counts for train and plot train loss / R2."
     )
     p.add_argument(
         "--data",
@@ -133,7 +133,7 @@ def maybe_import_pyplot(no_live: bool):
 
 def run_training(binary: Path, data: Path, epochs: int, out_dir: Path) -> dict[str, float]:
     model_path = out_dir / f"model_e{epochs}.bin"
-    cmd = [str(binary), "numeric-file", str(data), str(epochs), str(model_path)]
+    cmd = [str(binary), "train", str(data), str(epochs), str(model_path)]
     print("\n" + "=" * 80)
     print("$ " + " ".join(cmd))
     print("=" * 80)

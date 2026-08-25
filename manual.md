@@ -24,7 +24,7 @@ cargo build --release
 
 ```bash
 cargo build --release --no-default-features
-./target/release/transformer numeric sum --epochs 5
+./target/release/transformer demo train sum --epochs 5
 ```
 
 ## Данные и `.tnum`
@@ -127,7 +127,7 @@ data
 Типичный CLI-проход:
 
 ```bash
-./target/release/transformer numeric-file train.tnum \
+./target/release/transformer train train.tnum \
   --model-kind kan --kan-width 16 --kan-layers 2 --kan-grid 16 \
   --lr 3e-3 --epochs 80 --seed 0 \
   --interpret --kan-symbolic --model model-kan.bin
@@ -295,53 +295,77 @@ validation. Если непрерывных входов нет или пары 
 ### Обучение и предсказание
 
 ```bash
-# Встроенная задача
-./target/release/transformer numeric projectile --epochs 40 --model projectile.bin
-
 # Свой .tnum
-./target/release/transformer numeric-file train.tnum \
+./target/release/transformer train train.tnum \
   --model-kind mlp --mlp-width 128 --mlp-layers 3 \
   --epochs 80 --lr 1e-3 --model model.bin
 
 # Или сразу таблица — .xlsx, .csv, .tsv
-./target/release/transformer numeric-file raw.xlsx --model-kind mlp --epochs 80
+./target/release/transformer train raw.xlsx --model-kind mlp --epochs 80
+
+# Встроенная задача — только через demo
+./target/release/transformer demo train projectile --epochs 40 --model projectile.bin
 
 # Инференс в исходных единицах — одна строка или таблица целиком
 ./target/release/transformer predict model.bin 0.25 0.75
 ./target/release/transformer predict model.bin --table вход.xlsx --out прогноз.xlsx
 ```
 
-`numeric-file` принимает и `.tnum`, и обычные таблицы. Для таблицы разметка
+`train` принимает только файл — `.tnum` или обычную таблицу; встроенные задачи
+живут отдельно, в `demo train`, поэтому `train sum` — ошибка с подсказкой, а не
+молчаливая подмена данных. Для таблицы разметка
 определяется тем же автоопределением, что и в `prepare` (заголовок вида
 `x…/y…`); если его не хватает, ошибка отправляет к `prepare`, где роли колонок
 задаются флагами. Промежуточный `.tnum` при этом не создаётся — таблица
 превращается в датасет напрямую.
 
-Общие флаги: `--epochs`, `--model`, `--lr`, `--batch-size`, `--seed`,
-`--scheduler constant|warmup-cosine`, `--warmup`, `--min-lr-ratio` и
+Общие флаги: `--epochs`, `--eval-every`, `--model`, `--lr`, `--batch-size`,
+`--seed`, `--scheduler constant|warmup-cosine`, `--warmup`, `--min-lr-ratio` и
 `--diagnose`. CLI строго отвергает неизвестные и несовместимые флаги.
 
-### Sweep и Epoch-sweep
+### Поиск по сетке
 
 ```bash
-./target/release/transformer sweep projectile \
+./target/release/transformer search train.tnum \
   --model-kinds transformer,mlp,kan \
   --d-models 32,64 --layers-list 2 \
   --mlp-widths 64,128 --mlp-layers-list 3 \
   --kan-widths 8,16 --kan-layers-list 2 --kan-grids 8,16 \
   --lrs 1e-3,3e-3 --epochs 80 --batch-size 64 --seeds 0,1
 
-./target/release/transformer epoch-sweep train.tnum \
-  --model-kind kan --kan-width 16 --kan-layers 2 --kan-grid 16 \
-  --epochs 20,40,60,80,120 --target-r2 0.99 \
-  --plateau-min-r2 0.95 --min-r2-gain 0.002 --out-dir runs
+# То же на встроенной задаче
+./target/release/transformer demo search projectile --model-kinds mlp,kan
 ```
 
-`epoch-sweep` пишет `runs/epoch_sweep_results.csv` и печатает sparklines
-loss/R². KAN-операции `--interpret`, `--kan-l1`, `--kan-prune`, `--kan-finetune-epochs`,
-`--kan-compact` и `--kan-symbolic` намеренно не поддерживаются внутри
-epoch-sweep: это разные фазы final-training, которые нельзя молча смешивать с
-поиском числа эпох.
+Цена перебора печатается до запуска, метрики — только с validation (или CV), а
+первая строка ранжирования и есть рекомендация.
+
+### Кривая по эпохам
+
+Отдельного `epoch-sweep` нет: число эпох выбирается тем же обучением.
+
+```bash
+./target/release/transformer train train.tnum \
+  --model-kind kan --kan-width 16 --kan-layers 2 --kan-grid 16 \
+  --epochs 120 --eval-every 10
+```
+
+`--eval-every N` включает замеры validation по ходу обучения и печатает
+таблицу, sparklines loss/R² и рекомендованную остановку. Это одно обучение
+вместо серии независимых, поэтому кривая относится к той самой модели, которая
+поедет дальше в конвейер и checkpoint.
+
+### Переименованные команды
+
+Прежние имена удалены и один релиз отвечают подсказкой без выполнения:
+
+| было | стало |
+| --- | --- |
+| `numeric-file <файл>` | `train <файл>` |
+| `numeric <ящик>` | `demo train <ящик>` |
+| `sweep <ящик>` | `search <файл>` или `demo search <ящик>` |
+| `epoch-sweep <файл>` | `train <файл> --eval-every N` |
+| `text <файл>` | `demo text <файл>` |
 
 ## Checkpoint-ы
 

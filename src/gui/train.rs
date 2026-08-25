@@ -5,7 +5,6 @@ use super::model::ModelInfo;
 use super::session::App;
 use crate::config::ModelConfig;
 use crate::encoders::{ValueEncoderConfig, ValueEncoderKind};
-use crate::epoch_sweep;
 use crate::interpret::{self, InterpretOverrides, InterpretProfile};
 use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
 use crate::split::DEFAULT_FINAL_INIT_SEED;
@@ -876,7 +875,7 @@ impl App {
             );
         }
 
-        let source = epoch_sweep::source_label(self.search_rows[0].source);
+        let source = self.search_rows[0].source.label();
         ui.label(format!(
             "Ранжирование: {}; метрики {source}",
             objective_label(self.search_form.objective())
