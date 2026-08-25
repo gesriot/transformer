@@ -215,9 +215,11 @@ where
     for (r, row) in table.rows().iter().enumerate() {
         let mut cells: Vec<SheetCell> = (0..width)
             .map(|c| match row.get(c) {
-                // Посторонние колонки переносятся как значения.
+                // Посторонние колонки переносятся как значения — но числом
+                // становится только то, что записывается обратно теми же
+                // символами. Иначе артикул «007» уехал бы в таблицу как 7.
                 Some(text) if !text.trim().is_empty() => match text.trim().parse::<f64>() {
-                    Ok(v) if v.is_finite() => SheetCell::Number(v),
+                    Ok(v) if v.is_finite() && format!("{v}") == text.trim() => SheetCell::Number(v),
                     _ => SheetCell::Text(text.clone()),
                 },
                 _ => SheetCell::Blank,
@@ -485,6 +487,38 @@ mod tests {
         // Вторая строка: 60 + 0 и 60 − 0.
         assert_eq!(rows[1][3], "60");
         assert_eq!(rows[1][4], "60");
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(output);
+    }
+
+    /// Посторонняя колонка переносится как есть: число остаётся числом, а
+    /// «числоподобный» текст — текстом, иначе артикул или код теряет форму.
+    #[test]
+    fn foreign_columns_keep_their_form() {
+        let input = tmp_path("foreign.csv");
+        let output = tmp_path("foreign_out.xlsx");
+        std::fs::write(
+            &input,
+            "артикул,счёт,температура,материал\n007,1.5,70,глина\n0123,2,60,песок\n",
+        )
+        .unwrap();
+
+        export_predictions(
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+            &schema(),
+            double,
+        )
+        .unwrap();
+
+        let (_, rows) = read_back(&output);
+        // Ведущие нули сохранены: это идентификатор, а не число.
+        assert_eq!(rows[0][0], "007");
+        assert_eq!(rows[1][0], "0123");
+        // Настоящие числа остались числами.
+        assert_eq!(rows[0][1], "1.5");
+        assert_eq!(rows[1][1], "2");
 
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(output);
