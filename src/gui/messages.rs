@@ -2,6 +2,7 @@
 //! пересекают границу потока.
 
 use crate::batch_predict::ExportSummary;
+#[cfg(feature = "demo")]
 use crate::config::ModelConfig;
 use crate::data::{NumericDataset, OutOfRange};
 use crate::diagnostics::SensitivityReport;
@@ -14,7 +15,9 @@ use crate::split::{FinalEval, SplitPlan};
 use crate::sweep::{SweepAxes, SweepObjective, SweepRow};
 use crate::table::Table;
 use crate::tnum::PrepareSpec;
-use crate::train::{TextTrainConfig, TrainConfig};
+#[cfg(feature = "demo")]
+use crate::train::TextTrainConfig;
+use crate::train::TrainConfig;
 use crate::training::EvalSchedule;
 use crate::training::Phase;
 use std::sync::Arc;
@@ -26,6 +29,7 @@ use std::sync::Arc;
 /// вызываемого чёрного ящика.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DatasetOrigin {
+    #[cfg(any(feature = "demo", test))]
     Blackbox(String),
     /// `.tnum` со своей схемой.
     File(String),
@@ -34,6 +38,7 @@ pub enum DatasetOrigin {
 }
 
 impl DatasetOrigin {
+    #[cfg(feature = "demo")]
     pub fn blackbox(&self) -> Option<&str> {
         match self {
             DatasetOrigin::Blackbox(name) => Some(name),
@@ -44,6 +49,7 @@ impl DatasetOrigin {
     /// Короткая подпись для шапки: путь целиком там не помещается.
     pub fn short_name(&self) -> String {
         match self {
+            #[cfg(any(feature = "demo", test))]
             DatasetOrigin::Blackbox(name) => format!("чёрный ящик: {name}"),
             DatasetOrigin::File(path) | DatasetOrigin::Table(path) => std::path::Path::new(path)
                 .file_name()
@@ -187,11 +193,13 @@ pub enum Command {
         axes: SweepAxes,
         objective: SweepObjective,
     },
+    #[cfg(feature = "demo")]
     TrainText {
         path: String,
         model_cfg: ModelConfig,
         train_cfg: TextTrainConfig,
     },
+    #[cfg(feature = "demo")]
     GenerateText {
         seed: String,
         total_new: usize,
@@ -300,19 +308,23 @@ pub enum Event {
         rows: Vec<SweepRow>,
         cancelled: bool,
     },
+    #[cfg(feature = "demo")]
     TextStarted {
         total_steps: usize,
     },
+    #[cfg(feature = "demo")]
     TextProgress {
         step: usize,
         loss: f32,
     },
+    #[cfg(feature = "demo")]
     TextDone {
         final_loss: Option<f32>,
         cancelled: bool,
         vocab_size: usize,
         seed_hint: String,
     },
+    #[cfg(feature = "demo")]
     GeneratedText {
         text: String,
     },

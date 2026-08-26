@@ -3,14 +3,19 @@
 //! Модель учится в НОРМАЛИЗОВАННОМ пространстве; метрики считаются в исходных
 //! единицах (предсказания денормализуются перед сравнением).
 
-use crate::data::{Normalizer, NumericDataset, TextDataset};
+#[cfg(feature = "demo")]
+use crate::data::TextDataset;
+use crate::data::{Normalizer, NumericDataset};
 use crate::encoders::FeatureSpec;
 use crate::metrics::{evaluate, Metrics};
 use crate::numeric_model::NumericModel;
 use crate::optim::Adam;
 use crate::tensor::Tensor;
+#[cfg(feature = "demo")]
 use crate::textmodel::TextModel;
-use ndarray::{Array2, ArrayD, Ix2};
+#[cfg(feature = "demo")]
+use ndarray::ArrayD;
+use ndarray::{Array2, Ix2};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
@@ -210,6 +215,7 @@ pub fn evaluate_surrogate(
 }
 
 #[derive(Clone)]
+#[cfg(feature = "demo")]
 pub struct TextTrainConfig {
     pub steps: usize,
     pub batch_size: usize,
@@ -222,6 +228,7 @@ pub struct TextTrainConfig {
 /// Строит вход декодера (teacher forcing) и метки из окна контекст/продолжение.
 /// Вход декодера = [последний символ контекста] + продолжение[..-1];
 /// метки = продолжение. Так позиция `t` декодера предсказывает `labels[t]`.
+#[cfg(feature = "demo")]
 fn build_decoder_io(src: &Array2<usize>, tgt: &Array2<usize>) -> (ArrayD<usize>, ArrayD<usize>) {
     let (b, tgt_len) = tgt.dim();
     let ctx_len = src.ncols();
@@ -237,11 +244,13 @@ fn build_decoder_io(src: &Array2<usize>, tgt: &Array2<usize>) -> (ArrayD<usize>,
 
 /// Обучает char-LM на случайных окнах. Возвращает усреднённый loss по
 /// контрольным точкам (для построения кривой / perplexity).
+#[cfg(feature = "demo")]
 pub fn train_text(model: &TextModel, dataset: &TextDataset, cfg: &TextTrainConfig) -> Vec<f32> {
     let never = AtomicBool::new(false);
     train_text_cb(model, dataset, cfg, &mut |_, _| {}, &never)
 }
 
+#[cfg(feature = "demo")]
 pub fn train_text_cb(
     model: &TextModel,
     dataset: &TextDataset,
@@ -342,6 +351,7 @@ mod tests {
 
     /// Smoke-тест char-LM: loss заметно падает на маленьком тексте.
     #[test]
+    #[cfg(feature = "demo")]
     fn smoke_text_decreases_loss() {
         let text = "the quick brown fox jumps over the lazy dog. ".repeat(8);
         let ds = TextDataset::new(&text);

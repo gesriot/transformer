@@ -10,12 +10,15 @@
 //! новыми полями (fourier_bands и т.п.) без поломки старых файлов.
 
 use crate::config::ModelConfig;
-use crate::data::{Normalizer, Vocab};
+use crate::data::Normalizer;
+#[cfg(feature = "demo")]
+use crate::data::Vocab;
 use crate::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
 use crate::interpret::{InterpretProfile, INTERPRET_PROFILE_VERSION};
 use crate::numeric_model::{KanConfig, ModelKind, NumericConfig, NumericModel};
 use crate::schema::{Column, ColumnRole, ColumnType, ModelSchema};
 use crate::tensor::Tensor;
+#[cfg(feature = "demo")]
 use crate::textmodel::TextModel;
 use ndarray::{Array2, ArrayD, Ix2, IxDyn};
 use std::collections::HashMap;
@@ -25,6 +28,7 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 const MAGIC: u32 = 0x5452_4653; // "TRFS"
 const VERSION: u32 = 2;
 const KIND_SURROGATE: u32 = 0;
+#[cfg(feature = "demo")]
 const KIND_TEXT: u32 = 1;
 
 // Теги полей конфига (стабильные; новые поля получают новые теги).
@@ -60,6 +64,7 @@ const SURROGATE_SECTIONS: &[&str] = &[
     "in_norm",
     "out_norm",
 ];
+#[cfg(feature = "demo")]
 const TEXT_SECTIONS: &[&str] = &["config", "vocab", "params"];
 
 /// Полное содержимое численного checkpoint-а.
@@ -542,6 +547,7 @@ fn read_norm(bytes: &[u8]) -> io::Result<Normalizer> {
     })
 }
 
+#[cfg(feature = "demo")]
 fn build_vocab(v: &Vocab) -> Vec<u8> {
     let chars = v.chars();
     let mut p = Vec::new();
@@ -551,6 +557,7 @@ fn build_vocab(v: &Vocab) -> Vec<u8> {
     }
     p
 }
+#[cfg(feature = "demo")]
 fn read_vocab(bytes: &[u8]) -> io::Result<Vocab> {
     let mut r = bytes;
     let n = r_u64(&mut r)? as usize;
@@ -586,6 +593,7 @@ fn config_from_map(f: &std::collections::HashMap<u16, Vec<u8>>) -> io::Result<Mo
         ln_eps: field_f32(f, TAG_LN_EPS).unwrap_or(1e-5),
     })
 }
+#[cfg(any(feature = "demo", test))]
 fn read_config(bytes: &[u8]) -> io::Result<ModelConfig> {
     config_from_map(&parse_tlv(bytes)?)
 }
@@ -943,6 +951,7 @@ pub fn load_numeric_full(path: &str) -> io::Result<NumericCheckpoint> {
 }
 
 /// Сохраняет char-LM модель вместе с конфигом и словарём.
+#[cfg(feature = "demo")]
 pub fn save_text(
     path: &str,
     cfg: &ModelConfig,
@@ -958,6 +967,7 @@ pub fn save_text(
 }
 
 /// Загружает char-LM модель и словарь.
+#[cfg(feature = "demo")]
 pub fn load_text(path: &str) -> io::Result<(TextModel, Vocab)> {
     let mut r = BufReader::new(File::open(path)?);
     r_header(&mut r, KIND_TEXT)?;
@@ -1647,6 +1657,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "demo")]
     fn text_round_trip_identical() {
         let cfg = tiny_cfg();
         let vocab = Vocab::from_text("hello world abcdef");

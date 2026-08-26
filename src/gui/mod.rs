@@ -3,6 +3,7 @@
 //! живёт в worker-потоке, UI общается с ним каналами.
 
 mod data;
+#[cfg(feature = "demo")]
 mod demo;
 mod messages;
 mod model;

@@ -19,11 +19,21 @@ cargo build --release
 ./target/release/transformer gui
 ```
 
-Без аргументов приложение тоже открывает GUI. Для CLI без GUI:
+Без аргументов приложение тоже открывает GUI. Сборка настраивается двумя
+независимыми cargo-фичами (обе включены по умолчанию):
+
+| фича | что даёт |
+| --- | --- |
+| `gui` | окно egui и команда `gui` |
+| `demo` | встроенные чёрные ящики, char-LM и раздел «Демо» |
 
 ```bash
-cargo build --release --no-default-features
+cargo build --release --no-default-features                    # только рабочий CLI
+cargo build --release --no-default-features --features gui     # GUI без демонстраций
 ```
+
+`gui` не включает `demo`: интерфейс собирается и работает без встроенных
+примеров.
 
 Обучить интерпретируемую KAN прямо по таблице (`prepare` нужен только там, где
 автоопределения ролей не хватает):
@@ -73,6 +83,10 @@ validation**: поисковые функции не получают test да�
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+# Комбинации фич: gui не должен зависеть от demo
+cargo test --no-default-features
+cargo test --no-default-features --features gui
+cargo test --no-default-features --features demo
 cargo build --release
 ./scripts/package-macos.sh
 ```

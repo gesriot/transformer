@@ -9,9 +9,13 @@
 use crate::encoders::FeatureSpec;
 use crate::schema::{Column, ColumnRole, ColumnType, ModelSchema};
 use ndarray::Array2;
+#[cfg(feature = "demo")]
 use rand::rngs::StdRng;
+#[cfg(feature = "demo")]
 use rand::Rng;
-use std::collections::{BTreeSet, HashMap};
+#[cfg(feature = "demo")]
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::io::{self, ErrorKind};
 
 /// Деталь экстраполяции: континуальный признак вне обученного диапазона.
@@ -660,11 +664,13 @@ pub fn write_numeric_tnum(schema: &ModelSchema, data: &NumericDataset) -> Result
 }
 
 /// Словарь char-уровня: отсортированные уникальные символы корпуса.
+#[cfg(feature = "demo")]
 pub struct Vocab {
     itos: Vec<char>,
     stoi: HashMap<char, usize>,
 }
 
+#[cfg(feature = "demo")]
 impl Vocab {
     pub fn from_text(text: &str) -> Self {
         let itos: Vec<char> = text.chars().collect::<BTreeSet<_>>().into_iter().collect();
@@ -707,11 +713,13 @@ impl Vocab {
 }
 
 /// Текстовый датасет char-уровня: весь корпус как поток id + словарь.
+#[cfg(feature = "demo")]
 pub struct TextDataset {
     pub vocab: Vocab,
     data: Vec<usize>,
 }
 
+#[cfg(feature = "demo")]
 impl TextDataset {
     pub fn new(text: &str) -> Self {
         let vocab = Vocab::from_text(text);
@@ -758,6 +766,7 @@ impl TextDataset {
 mod tests {
     use super::*;
     use ndarray::array;
+    #[cfg(feature = "demo")]
     use rand::SeedableRng;
 
     #[test]
@@ -1067,6 +1076,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "demo")]
     fn vocab_round_trip() {
         let text = "hello world";
         let vocab = Vocab::from_text(text);
@@ -1076,6 +1086,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "demo")]
     fn text_batch_shapes() {
         let ds = TextDataset::new("abcdefghijklmnop");
         let mut rng = StdRng::seed_from_u64(1);

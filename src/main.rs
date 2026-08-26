@@ -15,16 +15,23 @@
 //!               --lr --batch-size --seed
 
 use ndarray::Array2;
+#[cfg(feature = "demo")]
 use rand::rngs::StdRng;
+#[cfg(feature = "demo")]
 use rand::SeedableRng;
 use std::collections::HashMap;
 use transformer::batch_predict;
+#[cfg(feature = "demo")]
 use transformer::blackbox;
 use transformer::config::ModelConfig;
-use transformer::data::{Normalizer, NumericDataset, TextDataset};
+#[cfg(feature = "demo")]
+use transformer::data::TextDataset;
+use transformer::data::{Normalizer, NumericDataset};
 use transformer::diagnostics;
 use transformer::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
+#[cfg(feature = "demo")]
 use transformer::generate::generate;
+#[cfg(feature = "demo")]
 use transformer::init::set_init_seed;
 use transformer::interpret::{self, InterpretOverrides, InterpretProfile, InterpretReport};
 use transformer::metrics::{evaluate, Metrics};
@@ -34,20 +41,22 @@ use transformer::numeric_model::{
 use transformer::predict;
 use transformer::schema::ModelSchema;
 use transformer::serialize::{calibration_sample, load_numeric_full, save_numeric};
-use transformer::split::{
-    SplitPlan, DEFAULT_DATA_SEED, DEFAULT_FINAL_INIT_SEED, DEFAULT_SPLIT_SEED,
-};
+#[cfg(feature = "demo")]
+use transformer::split::DEFAULT_DATA_SEED;
+use transformer::split::{SplitPlan, DEFAULT_FINAL_INIT_SEED, DEFAULT_SPLIT_SEED};
 use transformer::sweep as sweep_core;
 use transformer::symbolic;
+#[cfg(feature = "demo")]
 use transformer::textmodel::TextModel;
 use transformer::tnum::{
     infer_prepare_spec_from_path, parse_categorical, read_numeric_source, table_path_to_tnum,
     Delimiter, PrepareSpec,
 };
 use transformer::train::{
-    evaluate_surrogate, predict_dataset, train_text, validate_train, LrSchedule, TextTrainConfig,
-    TrainConfig,
+    evaluate_surrogate, predict_dataset, validate_train, LrSchedule, TrainConfig,
 };
+#[cfg(feature = "demo")]
+use transformer::train::{train_text, TextTrainConfig};
 use transformer::training::{
     evaluate_on, recommended_epoch, run_training, Dataset, EvalSchedule, Phase, TrainedModel,
     TrainingHistory, TrainingSetup,
@@ -464,7 +473,12 @@ fn main() {
         Some("search") => run_search(&args[2..]),
         Some("prepare") => run_prepare(&args[2..]),
         Some("predict") => run_predict(&args[2..]),
+        #[cfg(feature = "demo")]
         Some("demo") => run_demo(&args[2..]),
+        // Демонстрации — отдельная фича: в сборке без них команда обязана
+        // сказать это прямо, а не притвориться опечаткой.
+        #[cfg(not(feature = "demo"))]
+        Some("demo") => fail("сборка без демонстраций: пересоберите с --features demo"),
         Some(other) => {
             match renamed_command(other) {
                 // Переименованную команду не выполняем догадкой: печатаем
@@ -492,9 +506,12 @@ fn print_usage() {
     );
     eprintln!("  transformer predict <model.bin> <v1> <v2> ...");
     eprintln!("  transformer predict <model.bin> --table <вход> --out <выход.xlsx>");
-    eprintln!("  transformer demo train <чёрный ящик> [флаги обучения]");
-    eprintln!("  transformer demo search <чёрный ящик> [оси сетки]");
-    eprintln!("  transformer demo text <file.txt> [steps]");
+    #[cfg(feature = "demo")]
+    {
+        eprintln!("  transformer demo train <чёрный ящик> [флаги обучения]");
+        eprintln!("  transformer demo search <чёрный ящик> [оси сетки]");
+        eprintln!("  transformer demo text <file.txt> [steps]");
+    }
     eprintln!("  флаги: --d-model --heads --layers --d-ff --lr --batch-size --seed");
     eprintln!("         --model-kind transformer|mlp|kan --mlp-width --mlp-layers");
     eprintln!("         --kan-width --kan-layers --kan-grid");
@@ -639,7 +656,7 @@ fn run_train_flow(
     f: &Flags,
     data: NumericDataset,
     schema: ModelSchema,
-    bb: Option<&blackbox::BlackBox>,
+    reference: Option<&diagnostics::Reference>,
 ) {
     let epochs = resolve_epochs(f);
     let save_path = f.get("model").or_else(|| f.pos(2));
@@ -750,7 +767,7 @@ fn run_train_flow(
             &outcome.development.in_norm,
             &outcome.development.out_norm,
             &outcome.development.model,
-            bb,
+            reference,
         );
     }
 
@@ -824,6 +841,7 @@ fn require_data_file(path: &str) {
     if std::path::Path::new(path).is_file() {
         return;
     }
+    #[cfg(feature = "demo")]
     if blackbox::by_name(path).is_some() {
         fail(&format!(
             "«{path}» — встроенная задача, а не файл: используйте transformer demo train {path} \
@@ -846,6 +864,7 @@ fn validate_train_positionals(f: &Flags) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "demo")]
 fn run_demo_train(rest: &[String]) {
     let f = Flags::parse(rest, TRAIN_FLAGS, TRAIN_BOOL_FLAGS).unwrap_or_else(|e| fail(&e));
     // Имя ящика можно опустить: `demo train` остаётся коротким запуском sum.
@@ -874,7 +893,15 @@ fn run_demo_train(rest: &[String]) {
     let data = bb.generate(2000, DEFAULT_DATA_SEED);
     // У встроенного ящика имён нет — схема синтетическая и это осознанно.
     let schema = ModelSchema::synthetic(bb.n_inputs(), bb.n_outputs).unwrap_or_else(|e| fail(&e));
-    run_train_flow(&f, data, schema, Some(&bb));
+    // Встроенный ящик умеет считать сам себя, поэтому у демо есть эталон, с
+    // которым можно сравнить чувствительность обученной модели.
+    let eval = |x: &[f32]| bb.eval(x);
+    let reference = diagnostics::Reference {
+        n_inputs: bb.n_inputs(),
+        n_outputs: bb.n_outputs,
+        eval: &eval,
+    };
+    run_train_flow(&f, data, schema, Some(&reference));
 }
 
 fn run_train(rest: &[String]) {
@@ -958,7 +985,7 @@ fn run_diagnostics(
     in_norm: &Normalizer,
     out_norm: &Normalizer,
     model: &NumericModel,
-    bb: Option<&blackbox::BlackBox>,
+    reference: Option<&diagnostics::Reference>,
 ) {
     // Диагностика — часть принятия решений, поэтому смотрит на validation:
     // счёт экстраполяции и формы остатка по test означали бы подглядывание.
@@ -1011,7 +1038,7 @@ fn run_diagnostics(
                 NumericDataset::new(inputs.clone(), Array2::zeros((inputs.nrows(), n_outputs)));
             predict_dataset(model, &ds, in_norm, out_norm)
         },
-        bb,
+        reference,
         1.0,
         300,
     );
@@ -1431,6 +1458,7 @@ fn run_search(rest: &[String]) {
     print_search_ranking(&result);
 }
 
+#[cfg(feature = "demo")]
 fn run_demo_search(rest: &[String]) {
     let f = Flags::parse(rest, SEARCH_FLAGS, &[]).unwrap_or_else(|e| fail(&e));
     f.require_positionals(1, 1, "demo search <чёрный ящик>")
@@ -1555,6 +1583,7 @@ fn axes_from(f: &Flags) -> sweep_core::SweepAxes {
 
 /// demo: встроенные задачи и char-LM. К рабочему сценарию не относятся и
 /// держатся отдельной командой, чтобы не мешаться со своими данными.
+#[cfg(feature = "demo")]
 fn run_demo(rest: &[String]) {
     match rest.first().map(String::as_str) {
         Some("train") => run_demo_train(&rest[1..]),
@@ -1567,6 +1596,7 @@ fn run_demo(rest: &[String]) {
     }
 }
 
+#[cfg(feature = "demo")]
 fn run_demo_text(rest: &[String]) {
     if !(1..=2).contains(&rest.len()) {
         fail("ожидалось: demo text <файл.txt> [steps]");

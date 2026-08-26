@@ -2,7 +2,6 @@
 //! плохой точности ДО смены архитектуры — underfit (ёмкость/кодирование) vs
 //! покрытие данных vs чувствительность карты.
 
-use crate::blackbox::BlackBox;
 use crate::data::{Normalizer, NumericDataset};
 use crate::encoders::FeatureSpec;
 use crate::numeric_model::NumericConfig;
@@ -162,6 +161,18 @@ pub struct SensitivityReport {
     pub divergence: Option<f32>,
 }
 
+/// Исходный процесс, с которым сравнивают модель: размерности и способ его
+/// посчитать.
+///
+/// Ядро не знает про встроенные чёрные ящики — иначе диагностика тянула бы за
+/// собой демонстрации и не собиралась бы без них. Вызывающий сам решает, что
+/// считать «процессом».
+pub struct Reference<'a> {
+    pub n_inputs: usize,
+    pub n_outputs: usize,
+    pub eval: &'a dyn Fn(&[f32]) -> Vec<f32>,
+}
+
 /// Чувствительность по парам РЕАЛЬНЫХ строк.
 ///
 /// Возмущать вход независимо нельзя: в данных бывают жёсткие связи (например
@@ -180,7 +191,7 @@ pub fn sensitivity<F>(
     in_norm: &Normalizer,
     out_norm: &Normalizer,
     predict: F,
-    reference: Option<&BlackBox>,
+    reference: Option<&Reference>,
     alpha: f32,
     max_pairs: usize,
 ) -> Result<SensitivityReport, String>
@@ -210,8 +221,8 @@ where
     if data.inputs.iter().any(|v| !v.is_finite()) {
         return Err("входные данные содержат NaN или бесконечность".to_string());
     }
-    if let Some(bb) = reference {
-        if bb.n_inputs() != n_features || bb.n_outputs != n_outputs {
+    if let Some(r) = reference {
+        if r.n_inputs != n_features || r.n_outputs != n_outputs {
             return Err("размерность исходного процесса не соответствует данным".to_string());
         }
     }
@@ -312,11 +323,11 @@ where
     let model_y1 = predict(&x1);
     let model_y2 = predict(&x2);
     let model = ratios(&model_y1, &model_y2, &dx, out_norm, "модель")?;
-    let reference = reference.map(|bb| -> Result<SensitivityStats, String> {
+    let reference = reference.map(|reference| -> Result<SensitivityStats, String> {
         let eval_all = |xs: &Array2<f32>| {
-            let mut out = Array2::<f32>::zeros((xs.nrows(), bb.n_outputs));
+            let mut out = Array2::<f32>::zeros((xs.nrows(), reference.n_outputs));
             for r in 0..xs.nrows() {
-                let y = bb.eval(&xs.row(r).to_vec());
+                let y = (reference.eval)(&xs.row(r).to_vec());
                 for (c, v) in y.into_iter().enumerate() {
                     out[[r, c]] = v;
                 }
@@ -516,7 +527,11 @@ mod tests {
             &in_norm,
             &out_norm,
             |x| Array2::from_shape_fn((x.nrows(), 1), |(r, _)| bb.eval(&x.row(r).to_vec())[0]),
-            Some(&bb),
+            Some(&Reference {
+                n_inputs: bb.n_inputs(),
+                n_outputs: bb.n_outputs,
+                eval: &|x| bb.eval(x),
+            }),
             1.0,
             20,
         )

@@ -5,13 +5,19 @@
 //! умолчанию ранжирование идёт по худшему выходу; UI получает строки через
 //! callback без парсинга stdout.
 
+#[cfg(any(feature = "demo", test))]
 use crate::blackbox;
 use crate::config::ModelConfig;
 use crate::encoders::{ValueEncoderConfig, ValueEncoderKind};
 use crate::metrics::{ConfigEval, EvalSource, RunEval};
 use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
+#[cfg(any(feature = "demo", test))]
 use crate::schema::ModelSchema;
-use crate::split::{SearchPool, SplitPlan, DEFAULT_DATA_SEED};
+use crate::split::SearchPool;
+#[cfg(any(feature = "demo", test))]
+use crate::split::SplitPlan;
+#[cfg(feature = "demo")]
+use crate::split::DEFAULT_DATA_SEED;
 use crate::train::{validate_train, LrSchedule, TrainConfig};
 use crate::training::{
     compare_scores_desc, search, search_cost, Dataset, SearchCandidate, SearchCost, SearchPlan,
@@ -744,6 +750,7 @@ fn row_from_search(row: &SearchRow, configs: &[Candidate]) -> SweepRow {
 /// Поиск на встроенном чёрном ящике (демо). Данные генерируются ОДИН РАЗ с
 /// фиксированным `data_seed`: ось `seeds` меняет только инициализацию модели,
 /// иначе `±` смешивал бы разброс инициализации с разбросом выборки.
+#[cfg(feature = "demo")]
 pub fn run_blackbox_sweep<F>(
     blackbox_name: &str,
     axes: &SweepAxes,
@@ -762,6 +769,7 @@ where
     )
 }
 
+#[cfg(feature = "demo")]
 pub fn run_blackbox_sweep_with_objective<F>(
     blackbox_name: &str,
     axes: &SweepAxes,
@@ -869,6 +877,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "demo")]
     fn blackbox_sweep_runs_and_ranks() {
         let axes = SweepAxes {
             epochs: 1,

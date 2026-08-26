@@ -4,9 +4,12 @@ version = "0.5.0"
 edition = "2021"
 
 [features]
-default = ["gui"]
+default = ["gui", "demo"]
 # GUI за фичей: лёгкий CLI собирается `cargo build --no-default-features`.
+# gui НЕ включает demo: интерфейс не должен зависеть от встроенных примеров.
 gui = ["dep:eframe", "dep:egui_plot", "dep:rfd"]
+# Демонстрации: встроенные чёрные ящики, char-LM и раздел «Демо».
+demo = []
 
 [dependencies]
 ndarray = { version = "0.16", features = ["rayon"] }

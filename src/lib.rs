@@ -1,10 +1,15 @@
 pub mod batch_predict;
+// Встроенные ящики — демонстрация, но ими же порождаются данные для тестов
+// ядра: под `test` они доступны и без фичи, иначе каждому модулю пришлось бы
+// заводить свой генератор.
+#[cfg(any(feature = "demo", test))]
 pub mod blackbox;
 pub mod config;
 pub mod core;
 pub mod data;
 pub mod diagnostics;
 pub mod encoders;
+#[cfg(feature = "demo")]
 pub mod generate;
 #[cfg(feature = "gui")]
 pub mod gui;
@@ -29,6 +34,7 @@ pub mod sweep;
 pub mod symbolic;
 pub mod table;
 pub mod tensor;
+#[cfg(feature = "demo")]
 pub mod textmodel;
 pub mod tnum;
 pub mod train;

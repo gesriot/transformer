@@ -24,6 +24,22 @@ cargo build --release
 
 ```bash
 cargo build --release --no-default-features
+```
+
+Фичи `gui` и `demo` независимы и обе включены по умолчанию. `demo` — это
+встроенные чёрные ящики, char-LM, подкоманда `demo` и раздел «Демо» в
+интерфейсе; без неё этого кода в бинаре нет, а команда `demo` честно отвечает,
+что собрана без демонстраций. `gui` от `demo` не зависит, поэтому рабочая
+сборка для пользователя выглядит так:
+
+```bash
+cargo build --release --no-default-features --features gui
+```
+
+С демонстрациями доступен короткий прогон без своих данных:
+
+```bash
+cargo build --release --no-default-features --features demo
 ./target/release/transformer demo train sum --epochs 5
 ```
 
@@ -502,6 +518,15 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release
 ./scripts/package-macos.sh
+```
+
+Комбинации фич проверяются отдельно — иначе `gui` незаметно обрастает
+зависимостью от `demo`:
+
+```bash
+cargo test --no-default-features
+cargo test --no-default-features --features gui
+cargo test --no-default-features --features demo
 ```
 
 Скрипт создаёт `dist/Transformer.app`, ZIP и DMG, проверяет DMG через

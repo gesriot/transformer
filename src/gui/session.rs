@@ -5,6 +5,7 @@
 //! конфигурации между экранами.
 
 use super::data::{MarkupState, PrepareForm};
+#[cfg(feature = "demo")]
 use super::demo::TextForm;
 use super::messages::{
     Command, DatasetOrigin, DiagnosticsResult, Event, InterpretReports, KanModelInfo,
@@ -35,6 +36,7 @@ pub(super) enum Section {
     Training,
     Model,
     Predict,
+    #[cfg(feature = "demo")]
     Demo,
 }
 
@@ -45,6 +47,7 @@ impl Section {
             Section::Training => "Обучение",
             Section::Model => "Модель",
             Section::Predict => "Прогноз",
+            #[cfg(feature = "demo")]
             Section::Demo => "Демо",
         }
     }
@@ -53,6 +56,7 @@ impl Section {
 /// Одно сообщение на все экраны: данные общие, значит и текст общий.
 pub(super) const NO_DATASET: &str = "сначала откройте данные";
 
+#[cfg(feature = "demo")]
 pub(super) const BLACKBOXES: &[&str] = &["sum", "product", "sine", "polynomial", "projectile"];
 pub(super) const KAN_CURVE_SAMPLES: usize = 201;
 
@@ -241,11 +245,17 @@ pub struct App {
     /// Строка поиска, выбранная для финального обучения.
     pub(super) search_selected: Option<usize>,
     // Text (UI-M7)
+    #[cfg(feature = "demo")]
     pub(super) text_form: TextForm,
+    #[cfg(feature = "demo")]
     pub(super) text_training: bool,
+    #[cfg(feature = "demo")]
     pub(super) text_curve: Vec<[f64; 2]>,
+    #[cfg(feature = "demo")]
     pub(super) text_ready: bool,
+    #[cfg(feature = "demo")]
     pub(super) text_vocab_size: Option<usize>,
+    #[cfg(feature = "demo")]
     pub(super) generated_text: String,
     // Совместимая явная конвертация в .tnum внутри раздела «Данные».
     pub(super) prepare_form: PrepareForm,
@@ -299,11 +309,17 @@ impl App {
             custom_form: CustomSearchForm::default(),
             mode: TrainingMode::Single,
             search_selected: None,
+            #[cfg(feature = "demo")]
             text_form: TextForm::default(),
+            #[cfg(feature = "demo")]
             text_training: false,
+            #[cfg(feature = "demo")]
             text_curve: Vec::new(),
+            #[cfg(feature = "demo")]
             text_ready: false,
+            #[cfg(feature = "demo")]
             text_vocab_size: None,
+            #[cfg(feature = "demo")]
             generated_text: String::new(),
             prepare_form: PrepareForm::default(),
         }
@@ -316,7 +332,10 @@ impl App {
                 Event::Error(e) => {
                     self.training = false;
                     self.searching = false;
-                    self.text_training = false;
+                    #[cfg(feature = "demo")]
+                    {
+                        self.text_training = false;
+                    }
                     self.batch_predicting = false;
                     self.kan_symbolic_pending = false;
                     self.table_opening = false;
@@ -533,6 +552,7 @@ impl App {
                         "поиск завершён".to_string()
                     };
                 }
+                #[cfg(feature = "demo")]
                 Event::TextStarted { total_steps } => {
                     self.text_training = true;
                     self.text_ready = false;
@@ -541,10 +561,12 @@ impl App {
                     self.text_vocab_size = None;
                     self.status = format!("text: 0/{total_steps} шагов");
                 }
+                #[cfg(feature = "demo")]
                 Event::TextProgress { step, loss } => {
                     self.text_curve.push([step as f64, loss.exp() as f64]);
                     self.status = format!("text шаг {step}: loss {loss:.4}, ppl {:.2}", loss.exp());
                 }
+                #[cfg(feature = "demo")]
                 Event::TextDone {
                     final_loss,
                     cancelled,
@@ -567,6 +589,7 @@ impl App {
                         (false, None) => "text готов".to_string(),
                     };
                 }
+                #[cfg(feature = "demo")]
                 Event::GeneratedText { text } => {
                     self.generated_text = text;
                     self.status = "генерация готова".to_string();
@@ -586,9 +609,12 @@ impl App {
     }
 
     pub(super) fn busy(&self) -> bool {
+        #[cfg(feature = "demo")]
+        if self.text_training {
+            return true;
+        }
         self.training
             || self.searching
-            || self.text_training
             || self.batch_predicting
             || self.kan_symbolic_pending
             || self.table_opening
@@ -812,6 +838,7 @@ impl eframe::App for App {
                     Section::Training,
                     Section::Model,
                     Section::Predict,
+                    #[cfg(feature = "demo")]
                     Section::Demo,
                 ] {
                     ui.selectable_value(&mut self.section, section, section.label());
@@ -838,6 +865,7 @@ impl eframe::App for App {
                     Section::Training => self.ui_train(ui),
                     Section::Model => self.ui_model(ui),
                     Section::Predict => self.ui_predict(ui),
+                    #[cfg(feature = "demo")]
                     Section::Demo => self.ui_demo(ui),
                 });
         });

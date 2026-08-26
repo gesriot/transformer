@@ -10,10 +10,15 @@ use super::messages::{
     PreparedData, ValidationOrigin,
 };
 use crate::batch_predict::{export_predictions, ExportSummary};
+#[cfg(any(feature = "demo", test))]
 use crate::blackbox;
+#[cfg(feature = "demo")]
 use crate::config::ModelConfig;
-use crate::data::{Normalizer, NumericDataset, OutOfRange, TextDataset};
+#[cfg(feature = "demo")]
+use crate::data::TextDataset;
+use crate::data::{Normalizer, NumericDataset, OutOfRange};
 use crate::encoders::FeatureSpec;
+#[cfg(feature = "demo")]
 use crate::generate::generate;
 use crate::gui::messages::InterpretReports;
 use crate::init::set_init_seed;
@@ -24,24 +29,28 @@ use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
 use crate::predict::predict_rows;
 use crate::schema::ModelSchema;
 use crate::serialize::{calibration_sample, load_numeric_full, save_numeric};
-use crate::split::{SplitPlan, DEFAULT_DATA_SEED, DEFAULT_FINAL_INIT_SEED};
+#[cfg(any(feature = "demo", test))]
+use crate::split::DEFAULT_DATA_SEED;
+use crate::split::{SplitPlan, DEFAULT_FINAL_INIT_SEED};
 use crate::sweep::{self, SweepAxes, SweepObjective};
 use crate::symbolic;
 use crate::table::{Delimiter, Table};
+#[cfg(feature = "demo")]
 use crate::textmodel::TextModel;
 use crate::tnum::{
     infer_prepare_spec_from_table, read_numeric_source, table_path_to_tnum, PrepareSpec,
 };
-use crate::train::{
-    evaluate_surrogate, predict_dataset, train_text_cb, validate_train, TextTrainConfig,
-    TrainConfig,
-};
+use crate::train::{evaluate_surrogate, predict_dataset, validate_train, TrainConfig};
+#[cfg(feature = "demo")]
+use crate::train::{train_text_cb, TextTrainConfig};
 use crate::training::{
     evaluate_on, refit, run_training, Dataset, EvalSchedule, Phase, TrainedModel, TrainingSetup,
 };
 use eframe::egui;
 use ndarray::Array2;
+#[cfg(feature = "demo")]
 use rand::rngs::StdRng;
+#[cfg(feature = "demo")]
 use rand::SeedableRng;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -120,6 +129,9 @@ struct Loaded {
 /// Данные сессии обучения, нужные для диагностики.
 struct DiagData {
     nc: NumericConfig,
+    /// Источник нужен только демонстрациям: у встроенного ящика есть эталон,
+    /// с которым сравнивают чувствительность модели.
+    #[cfg(feature = "demo")]
     origin: DatasetOrigin,
     in_specs: Vec<FeatureSpec>,
     train: Arc<NumericDataset>,
@@ -129,6 +141,7 @@ struct DiagData {
     eval_label: &'static str,
 }
 
+#[cfg(feature = "demo")]
 struct LoadedText {
     model: TextModel,
     dataset: TextDataset,
@@ -145,6 +158,7 @@ fn worker_loop(
     let _ = evt_tx.send(Event::Status("worker запущен".to_string()));
     ctx.request_repaint();
     let mut current: Option<Loaded> = None;
+    #[cfg(feature = "demo")]
     let mut current_text: Option<LoadedText> = None;
 
     while let Ok(cmd) = cmd_rx.recv() {
@@ -348,6 +362,7 @@ fn worker_loop(
                     ctx.request_repaint();
                 }
             },
+            #[cfg(feature = "demo")]
             Command::TrainText {
                 path,
                 model_cfg,
@@ -362,6 +377,7 @@ fn worker_loop(
                     ctx.request_repaint();
                 }
             },
+            #[cfg(feature = "demo")]
             Command::GenerateText {
                 seed,
                 total_new,
@@ -443,6 +459,7 @@ fn worker_loop(
 
 fn source_desc(origin: &DatasetOrigin) -> String {
     match origin {
+        #[cfg(any(feature = "demo", test))]
         DatasetOrigin::Blackbox(name) => format!("blackbox: {name}"),
         DatasetOrigin::File(path) => format!("файл: {path}"),
         DatasetOrigin::Table(path) => format!("таблица: {path}"),
@@ -607,7 +624,22 @@ fn diagnose(l: &Loaded) -> Result<DiagnosticsResult, String> {
 
     // Чувствительность модели считается всегда; исходного процесса — только у
     // демо-ящика, и на тех же самых парах точек.
-    let reference = d.origin.blackbox().and_then(blackbox::by_name);
+    #[cfg(feature = "demo")]
+    let bb = d.origin.blackbox().and_then(blackbox::by_name);
+    #[cfg(feature = "demo")]
+    let bb_eval = bb.as_ref().map(|bb| move |x: &[f32]| bb.eval(x));
+    #[cfg(feature = "demo")]
+    let reference =
+        bb.as_ref()
+            .zip(bb_eval.as_ref())
+            .map(|(bb, eval)| crate::diagnostics::Reference {
+                n_inputs: bb.n_inputs(),
+                n_outputs: bb.n_outputs,
+                eval,
+            });
+    // Без демонстраций исходного процесса взять неоткуда: только модель.
+    #[cfg(not(feature = "demo"))]
+    let reference: Option<crate::diagnostics::Reference> = None;
     let sensitivity = crate::diagnostics::sensitivity(
         &d.eval,
         &d.in_specs,
@@ -690,6 +722,7 @@ fn run_search(
     Ok(())
 }
 
+#[cfg(feature = "demo")]
 fn validate_text_config(
     model_cfg: &ModelConfig,
     train_cfg: &TextTrainConfig,
@@ -724,6 +757,7 @@ fn validate_text_config(
     Ok(())
 }
 
+#[cfg(feature = "demo")]
 fn train_text(
     path: &str,
     model_cfg: &ModelConfig,
@@ -786,6 +820,7 @@ fn train_text(
     }))
 }
 
+#[cfg(feature = "demo")]
 fn generate_text(
     loaded: &LoadedText,
     seed: &str,
@@ -849,6 +884,7 @@ fn clone_data(prepared: &PreparedData) -> NumericDataset {
 /// один раз — на этом и держится инвариант «один активный датасет».
 fn open_dataset(origin: &DatasetOrigin) -> Result<PreparedData, String> {
     let (data, schema) = match origin {
+        #[cfg(any(feature = "demo", test))]
         DatasetOrigin::Blackbox(name) => {
             let bb = blackbox::by_name(name)
                 .ok_or_else(|| format!("неизвестный чёрный ящик: {name}"))?;
@@ -1138,6 +1174,7 @@ fn train_numeric(
         interpret: profile,
         diag: Some(DiagData {
             nc: nc.clone(),
+            #[cfg(feature = "demo")]
             origin: prepared.origin.clone(),
             in_specs,
             train: diag_train,
@@ -1472,6 +1509,7 @@ mod tests {
             interpret: None,
             diag: Some(DiagData {
                 nc: config,
+                #[cfg(feature = "demo")]
                 origin: DatasetOrigin::Blackbox("sum".to_string()),
                 in_specs,
                 train: Arc::new(train),
