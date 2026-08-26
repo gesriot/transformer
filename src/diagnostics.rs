@@ -170,6 +170,8 @@ pub struct SensitivityReport {
 pub struct Reference<'a> {
     pub n_inputs: usize,
     pub n_outputs: usize,
+    /// Должен возвращать ровно `n_outputs` значений; несоответствие
+    /// превращается в ошибку диагностики, а не в усечение или дополнение.
     pub eval: &'a dyn Fn(&[f32]) -> Vec<f32>,
 }
 
@@ -324,19 +326,26 @@ where
     let model_y2 = predict(&x2);
     let model = ratios(&model_y1, &model_y2, &dx, out_norm, "модель")?;
     let reference = reference.map(|reference| -> Result<SensitivityStats, String> {
-        let eval_all = |xs: &Array2<f32>| {
+        let eval_all = |xs: &Array2<f32>| -> Result<Array2<f32>, String> {
             let mut out = Array2::<f32>::zeros((xs.nrows(), reference.n_outputs));
             for r in 0..xs.nrows() {
                 let y = (reference.eval)(&xs.row(r).to_vec());
+                if y.len() != reference.n_outputs {
+                    return Err(format!(
+                        "исходный процесс: ожидалось {} выходов, получено {}",
+                        reference.n_outputs,
+                        y.len()
+                    ));
+                }
                 for (c, v) in y.into_iter().enumerate() {
                     out[[r, c]] = v;
                 }
             }
-            out
+            Ok(out)
         };
         ratios(
-            &eval_all(&x1),
-            &eval_all(&x2),
+            &eval_all(&x1)?,
+            &eval_all(&x2)?,
             &dx,
             out_norm,
             "исходный процесс",
@@ -653,6 +662,41 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("форма выходов"), "{err}");
+    }
+
+    #[test]
+    fn sensitivity_rejects_wrong_reference_output_count() {
+        let data = NumericDataset::new(
+            Array2::from_shape_vec((3, 1), vec![0.0, 1.0, 2.0]).unwrap(),
+            Array2::from_shape_vec((3, 1), vec![0.0, 1.0, 2.0]).unwrap(),
+        );
+        let specs = vec![FeatureSpec::Continuous];
+        let (in_norm, out_norm) = fit_normalizers(&data, &specs);
+        let predict = |x: &Array2<f32>| Array2::zeros((x.nrows(), 1));
+
+        let too_few = |_: &[f32]| -> Vec<f32> { vec![] };
+        let too_many = |_: &[f32]| -> Vec<f32> { vec![0.0, 1.0] };
+        for eval in [
+            &too_few as &dyn Fn(&[f32]) -> Vec<f32>,
+            &too_many as &dyn Fn(&[f32]) -> Vec<f32>,
+        ] {
+            let err = sensitivity(
+                &data,
+                &specs,
+                &in_norm,
+                &out_norm,
+                predict,
+                Some(&Reference {
+                    n_inputs: 1,
+                    n_outputs: 1,
+                    eval,
+                }),
+                1.0,
+                2,
+            )
+            .unwrap_err();
+            assert!(err.contains("ожидалось 1 выходов"), "{err}");
+        }
     }
 
     #[test]
