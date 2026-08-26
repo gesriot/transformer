@@ -73,7 +73,7 @@ impl EvalSource {
 /// Происхождение ОДНОГО прогона: номер fold (None у holdout) и seed
 /// инициализации.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RunOrigin {
+pub(crate) struct RunOrigin {
     pub fold: Option<usize>,
     pub init_seed: u64,
 }

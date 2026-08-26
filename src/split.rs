@@ -279,7 +279,7 @@ impl SearchPool {
     /// Происхождение прогона на fold `i`. Номер fold проставляет pool, а не
     /// потребитель: у holdout он обязан быть `None`, у CV — `Some(i)`, и
     /// `aggregate_runs` это проверяет.
-    pub fn run_origin(&self, fold: usize, init_seed: u64) -> RunOrigin {
+    pub(crate) fn run_origin(&self, fold: usize, init_seed: u64) -> RunOrigin {
         RunOrigin {
             fold: match self.source {
                 EvalSource::Validation => None,

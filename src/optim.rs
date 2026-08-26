@@ -10,8 +10,8 @@ use ndarray::ArrayD;
 pub(crate) struct Adam {
     params: Vec<Tensor>,
     /// lr по умолчанию: им пользуется только `step`. Числовое обучение всегда
-    /// задаёт lr расписанием, поэтому в part сборках поле никто не читает.
-    #[allow(dead_code)]
+    /// задаёт lr расписанием, поэтому без `demo` поле никто не читает.
+    #[cfg_attr(not(any(feature = "demo", test)), allow(dead_code))]
     lr: f32,
     beta1: f32,
     beta2: f32,
@@ -64,7 +64,7 @@ impl Adam {
     }
 
     /// Шаг с lr по умолчанию (из конструктора). Для constant-расписания.
-    #[allow(dead_code)]
+    #[cfg_attr(not(any(feature = "demo", test)), allow(dead_code))]
     pub(crate) fn step(&mut self) {
         self.step_with_lr(self.lr);
     }
