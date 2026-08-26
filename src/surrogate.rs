@@ -50,7 +50,7 @@ impl SurrogateModel {
 
     /// `values` — `[B, F]` нормализованных входов. Возвращает `[B, O]` предсказаний
     /// (в нормализованном пространстве выходов).
-    pub fn predict(&self, values: &Tensor) -> Tensor {
+    pub(crate) fn predict(&self, values: &Tensor) -> Tensor {
         let batch = values.shape()[0];
         let src = self.input_enc.forward(values);
         let memory = self.core.encode(&src, None);
@@ -63,7 +63,7 @@ impl SurrogateModel {
             .reshape(&[batch, self.num_outputs]) // [B, O, 1] -> [B, O]
     }
 
-    pub fn loss(&self, values: &Tensor, targets: &Tensor) -> Tensor {
+    pub(crate) fn loss(&self, values: &Tensor, targets: &Tensor) -> Tensor {
         self.predict(values).mse_loss(targets)
     }
 
@@ -76,7 +76,7 @@ impl SurrogateModel {
         ArrayD::from_shape_vec(IxDyn(&[batch, self.num_outputs]), ids).unwrap()
     }
 
-    pub fn parameters(&self) -> Vec<Tensor> {
+    pub(crate) fn parameters(&self) -> Vec<Tensor> {
         let mut p = self.input_enc.parameters();
         p.extend(self.query_emb.parameters());
         p.extend(self.core.parameters());

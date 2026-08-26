@@ -239,7 +239,7 @@ struct Candidate {
 
 /// Цель ранжирования живёт в ядре: поиск и отображение должны означать одно и
 /// то же.
-pub use crate::training::SearchObjective as SweepObjective;
+pub(crate) use crate::training::SearchObjective as SweepObjective;
 
 /// Счёт уже построенной строки — для сортировки таблицы в интерфейсе.
 pub fn row_score(objective: SweepObjective, row: &SweepRow) -> f32 {
@@ -252,14 +252,14 @@ pub fn row_score(objective: SweepObjective, row: &SweepRow) -> f32 {
 }
 
 /// n_heads, делящее d_model (предпочитаем 4).
-pub fn pick_heads(d_model: usize) -> usize {
+pub(crate) fn pick_heads(d_model: usize) -> usize {
     [4, 2, 1]
         .into_iter()
         .find(|&h| d_model.is_multiple_of(h))
         .unwrap_or(1)
 }
 
-pub fn value_encoder_label(v: ValueEncoderKind) -> &'static str {
+pub(crate) fn value_encoder_label(v: ValueEncoderKind) -> &'static str {
     match v {
         ValueEncoderKind::Linear => "linear",
         ValueEncoderKind::Mlp => "mlp",
@@ -267,7 +267,7 @@ pub fn value_encoder_label(v: ValueEncoderKind) -> &'static str {
     }
 }
 
-pub fn schedule_label(s: LrSchedule) -> &'static str {
+pub(crate) fn schedule_label(s: LrSchedule) -> &'static str {
     match s {
         LrSchedule::Constant => "constant",
         LrSchedule::WarmupCosine { .. } => "warmup-cosine",

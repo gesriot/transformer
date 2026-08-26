@@ -385,13 +385,13 @@ impl<'a> Cursor<'a> {
 }
 
 /// Прочитать числовой датасет и его схему из `.tnum` (TRNUM1 или TRNUM2).
-pub fn read_numeric_tnum(path: &str) -> io::Result<(NumericDataset, ModelSchema)> {
+pub(crate) fn read_numeric_tnum(path: &str) -> io::Result<(NumericDataset, ModelSchema)> {
     parse_numeric_tnum(&std::fs::read_to_string(path)?)
 }
 
 /// Разбор `.tnum` из строки. У TRNUM1 имён нет, поэтому схема достраивается
 /// синтетически — с сохранением категориальных типов.
-pub fn parse_numeric_tnum(text: &str) -> io::Result<(NumericDataset, ModelSchema)> {
+pub(crate) fn parse_numeric_tnum(text: &str) -> io::Result<(NumericDataset, ModelSchema)> {
     let tokens = tokenize(text)?;
     let mut c = Cursor {
         tokens: &tokens,
@@ -615,7 +615,10 @@ fn validate_numeric_tnum(schema: &ModelSchema, data: &NumericDataset) -> Result<
 ///
 /// Схема обязательна: без неё имена пришлось бы выдумывать, а именно этого
 /// формат и должен избежать.
-pub fn write_numeric_tnum(schema: &ModelSchema, data: &NumericDataset) -> Result<String, String> {
+pub(crate) fn write_numeric_tnum(
+    schema: &ModelSchema,
+    data: &NumericDataset,
+) -> Result<String, String> {
     validate_numeric_tnum(schema, data)?;
 
     let specs: Vec<String> = schema

@@ -1,20 +1,20 @@
 use crate::tensor::Tensor;
 use ndarray::{ArrayD, IxDyn};
 
-pub struct LayerNorm {
+pub(crate) struct LayerNorm {
     pub gamma: Tensor,
     pub beta: Tensor,
     eps: f32,
 }
 
 impl LayerNorm {
-    pub fn new(dim: usize, eps: f32) -> Self {
+    pub(crate) fn new(dim: usize, eps: f32) -> Self {
         let gamma = ArrayD::from_elem(IxDyn(&[dim]), 1.0);
         let beta = ArrayD::zeros(IxDyn(&[dim]));
         Self::from_tensors(Tensor::new(gamma), Tensor::new(beta), eps)
     }
 
-    pub fn from_tensors(gamma: Tensor, beta: Tensor, eps: f32) -> Self {
+    pub(crate) fn from_tensors(gamma: Tensor, beta: Tensor, eps: f32) -> Self {
         assert_eq!(
             gamma.shape(),
             beta.shape(),
@@ -23,11 +23,11 @@ impl LayerNorm {
         Self { gamma, beta, eps }
     }
 
-    pub fn forward(&self, x: &Tensor) -> Tensor {
+    pub(crate) fn forward(&self, x: &Tensor) -> Tensor {
         x.layer_norm_last_dim(&self.gamma, &self.beta, self.eps)
     }
 
-    pub fn parameters(&self) -> Vec<Tensor> {
+    pub(crate) fn parameters(&self) -> Vec<Tensor> {
         vec![self.gamma.clone(), self.beta.clone()]
     }
 }

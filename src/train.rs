@@ -96,7 +96,7 @@ fn to_tensor(a: &Array2<f32>) -> Tensor {
 /// Единая точка создания нормализаторов. В поиске сюда передаётся только
 /// train конкретного fold; при финальном refit — весь train+validation pool.
 /// Test не участвует в `fit` никогда.
-pub fn fit_normalizers(
+pub(crate) fn fit_normalizers(
     train: &NumericDataset,
     in_specs: &[FeatureSpec],
 ) -> (Normalizer, Normalizer) {
@@ -109,7 +109,7 @@ pub fn fit_normalizers(
 }
 
 /// Обучает модель, возвращает средний loss по эпохам (для диагностики).
-pub fn train_surrogate(
+pub(crate) fn train_surrogate(
     model: &NumericModel,
     data: &NumericDataset,
     in_norm: &Normalizer,
@@ -137,7 +137,7 @@ pub fn train_surrogate(
 /// так работает ранняя остановка по validation. Отмена пользователем и ранняя
 /// остановка — разные вещи и разными путями и приходят: первая может сработать
 /// посреди эпохи, вторая осмысленна только на её границе.
-pub fn train_surrogate_cb(
+pub(crate) fn train_surrogate_cb(
     model: &NumericModel,
     data: &NumericDataset,
     in_norm: &Normalizer,

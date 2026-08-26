@@ -58,7 +58,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-pub struct Worker {
+pub(crate) struct Worker {
     cmd_tx: Sender<Command>,
     evt_rx: Receiver<Event>,
     cancel: Arc<AtomicBool>,
@@ -66,7 +66,7 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn spawn(ctx: egui::Context) -> Self {
+    pub(crate) fn spawn(ctx: egui::Context) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (evt_tx, evt_rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -80,16 +80,16 @@ impl Worker {
         }
     }
 
-    pub fn send(&self, cmd: Command) {
+    pub(crate) fn send(&self, cmd: Command) {
         let _ = self.cmd_tx.send(cmd);
     }
-    pub fn try_recv(&self) -> Option<Event> {
+    pub(crate) fn try_recv(&self) -> Option<Event> {
         self.evt_rx.try_recv().ok()
     }
-    pub fn request_cancel(&self) {
+    pub(crate) fn request_cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
-    pub fn reset_cancel(&self) {
+    pub(crate) fn reset_cancel(&self) {
         self.cancel.store(false, Ordering::Relaxed);
     }
 }

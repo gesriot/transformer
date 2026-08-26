@@ -29,7 +29,7 @@ impl MlpBaseline {
     }
 
     /// `values` — `[B, F]` (нормализованные) -> `[B, O]`.
-    pub fn predict(&self, values: &Tensor) -> Tensor {
+    pub(crate) fn predict(&self, values: &Tensor) -> Tensor {
         let mut x = self.input.forward(values).gelu();
         for h in &self.hidden {
             x = h.forward(&x).gelu();
@@ -37,11 +37,11 @@ impl MlpBaseline {
         self.output.forward(&x)
     }
 
-    pub fn loss(&self, values: &Tensor, targets: &Tensor) -> Tensor {
+    pub(crate) fn loss(&self, values: &Tensor, targets: &Tensor) -> Tensor {
         self.predict(values).mse_loss(targets)
     }
 
-    pub fn parameters(&self) -> Vec<Tensor> {
+    pub(crate) fn parameters(&self) -> Vec<Tensor> {
         let mut p = self.input.parameters();
         for h in &self.hidden {
             p.extend(h.parameters());

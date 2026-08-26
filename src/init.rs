@@ -25,7 +25,8 @@ pub fn set_init_seed(seed: u64) {
 }
 
 /// Вернуться к недетерминированной инициализации (из энтропии).
-pub fn clear_init_seed() {
+#[cfg(test)]
+pub(crate) fn clear_init_seed() {
     INIT_RNG.with(|c| *c.borrow_mut() = None);
 }
 

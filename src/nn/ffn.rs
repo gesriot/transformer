@@ -1,28 +1,29 @@
 use crate::nn::linear::Linear;
 use crate::tensor::Tensor;
 
-pub struct FeedForward {
+pub(crate) struct FeedForward {
     pub up: Linear,
     pub down: Linear,
 }
 
 impl FeedForward {
-    pub fn new(d_model: usize, d_ff: usize) -> Self {
+    pub(crate) fn new(d_model: usize, d_ff: usize) -> Self {
         Self {
             up: Linear::new(d_model, d_ff),
             down: Linear::new(d_ff, d_model),
         }
     }
 
-    pub fn from_layers(up: Linear, down: Linear) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_layers(up: Linear, down: Linear) -> Self {
         Self { up, down }
     }
 
-    pub fn forward(&self, x: &Tensor) -> Tensor {
+    pub(crate) fn forward(&self, x: &Tensor) -> Tensor {
         self.down.forward(&self.up.forward(x).gelu())
     }
 
-    pub fn parameters(&self) -> Vec<Tensor> {
+    pub(crate) fn parameters(&self) -> Vec<Tensor> {
         let mut params = self.up.parameters();
         params.extend(self.down.parameters());
         params

@@ -6,7 +6,9 @@
 //!   `category_emb[code]` для категориальных (Plan.md §3).
 //! - `TokenInputEncoder` — для текста: embedding + sinusoidal positions.
 
-use crate::nn::embedding::{sinusoidal_positions, Embedding};
+#[cfg(any(feature = "demo", test))]
+use crate::nn::embedding::sinusoidal_positions;
+use crate::nn::embedding::Embedding;
 use crate::nn::linear::Linear;
 use crate::tensor::Tensor;
 use ndarray::{ArrayD, IxDyn};
@@ -145,7 +147,7 @@ impl ValueEncoder {
 /// Кодировщик числовых признаков. Вход — `[B, F]` значений, где столбец `j` это
 /// один и тот же признак для всех примеров (слот `j`). Континуальные значения
 /// должны быть нормализованы; категориальные хранят целочисленный код категории.
-pub struct NumericInputEncoder {
+pub(crate) struct NumericInputEncoder {
     pub feature_emb: Embedding,
     value_enc: ValueEncoder,
     /// Общая таблица для всех категориальных признаков: строка 0 — паддинг
@@ -162,8 +164,10 @@ pub struct NumericInputEncoder {
 }
 
 impl NumericInputEncoder {
-    /// Все признаки континуальные.
-    pub fn new(num_features: usize, d_model: usize) -> Self {
+    /// Все признаки континуальные. Нужен только тестам: рабочий путь всегда
+    /// знает спецификации признаков.
+    #[cfg(test)]
+    pub(crate) fn new(num_features: usize, d_model: usize) -> Self {
         Self::with_specs(
             &vec![FeatureSpec::Continuous; num_features],
             d_model,
@@ -171,7 +175,7 @@ impl NumericInputEncoder {
         )
     }
 
-    pub fn with_specs(
+    pub(crate) fn with_specs(
         specs: &[FeatureSpec],
         d_model: usize,
         value_cfg: &ValueEncoderConfig,
@@ -213,7 +217,7 @@ impl NumericInputEncoder {
     }
 
     /// `values` — `[B, F]`. Возвращает токены `[B, F, d_model]`.
-    pub fn forward(&self, values: &Tensor) -> Tensor {
+    pub(crate) fn forward(&self, values: &Tensor) -> Tensor {
         let shape = values.shape();
         assert_eq!(shape.len(), 2, "NumericInputEncoder ожидает values [B, F]");
         let (batch, f) = (shape[0], shape[1]);
@@ -270,7 +274,7 @@ impl NumericInputEncoder {
         ArrayD::from_shape_vec(IxDyn(&[batch, f]), ids).unwrap()
     }
 
-    pub fn parameters(&self) -> Vec<Tensor> {
+    pub(crate) fn parameters(&self) -> Vec<Tensor> {
         let mut p = self.feature_emb.parameters();
         p.extend(self.value_enc.parameters());
         if self.has_categorical {
@@ -285,20 +289,23 @@ impl NumericInputEncoder {
         &self.specs
     }
 
-    /// Параметры кодировщика значений (для проверок, что путь значения учится).
-    pub fn value_parameters(&self) -> Vec<Tensor> {
+    /// Параметры кодировщика значений — для проверки, что путь значения учится.
+    #[cfg(test)]
+    pub(crate) fn value_parameters(&self) -> Vec<Tensor> {
         self.value_enc.parameters()
     }
 }
 
 /// Кодировщик токенов текста: embedding + синусоидальные позиции.
-pub struct TokenInputEncoder {
+#[cfg(any(feature = "demo", test))]
+pub(crate) struct TokenInputEncoder {
     pub emb: Embedding,
     d_model: usize,
 }
 
+#[cfg(any(feature = "demo", test))]
 impl TokenInputEncoder {
-    pub fn new(vocab_size: usize, d_model: usize) -> Self {
+    pub(crate) fn new(vocab_size: usize, d_model: usize) -> Self {
         Self {
             emb: Embedding::new(vocab_size, d_model),
             d_model,
@@ -306,7 +313,7 @@ impl TokenInputEncoder {
     }
 
     /// `ids` — `[B, T]`. Возвращает `[B, T, d_model]` с позиционным кодированием.
-    pub fn forward(&self, ids: &ArrayD<usize>) -> Tensor {
+    pub(crate) fn forward(&self, ids: &ArrayD<usize>) -> Tensor {
         let seq_len = *ids
             .shape()
             .last()
@@ -316,7 +323,8 @@ impl TokenInputEncoder {
         x.add(&pos)
     }
 
-    pub fn parameters(&self) -> Vec<Tensor> {
+    #[cfg(feature = "demo")]
+    pub(crate) fn parameters(&self) -> Vec<Tensor> {
         self.emb.parameters()
     }
 }

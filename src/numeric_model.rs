@@ -161,7 +161,7 @@ impl NumericModel {
         }
     }
 
-    pub fn predict(&self, values: &Tensor) -> Tensor {
+    pub(crate) fn predict(&self, values: &Tensor) -> Tensor {
         match self {
             NumericModel::Transformer(m) => m.predict(values),
             NumericModel::Mlp(m) => m.predict(values),
@@ -169,7 +169,7 @@ impl NumericModel {
         }
     }
 
-    pub fn loss(&self, values: &Tensor, targets: &Tensor) -> Tensor {
+    pub(crate) fn loss(&self, values: &Tensor, targets: &Tensor) -> Tensor {
         match self {
             NumericModel::Transformer(m) => m.loss(values, targets),
             NumericModel::Mlp(m) => m.loss(values, targets),
@@ -177,7 +177,7 @@ impl NumericModel {
         }
     }
 
-    pub fn parameters(&self) -> Vec<Tensor> {
+    pub(crate) fn parameters(&self) -> Vec<Tensor> {
         match self {
             NumericModel::Transformer(m) => m.parameters(),
             NumericModel::Mlp(m) => m.parameters(),

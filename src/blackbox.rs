@@ -56,7 +56,7 @@ impl BlackBox {
     }
 }
 
-pub fn sum() -> BlackBox {
+pub(crate) fn sum() -> BlackBox {
     BlackBox {
         name: "sum",
         input_ranges: vec![(-1.0, 1.0), (-1.0, 1.0)],
@@ -65,7 +65,7 @@ pub fn sum() -> BlackBox {
     }
 }
 
-pub fn product() -> BlackBox {
+pub(crate) fn product() -> BlackBox {
     BlackBox {
         name: "product",
         input_ranges: vec![(-1.0, 1.0), (-1.0, 1.0)],
@@ -74,7 +74,7 @@ pub fn product() -> BlackBox {
     }
 }
 
-pub fn sine() -> BlackBox {
+pub(crate) fn sine() -> BlackBox {
     BlackBox {
         name: "sine",
         input_ranges: vec![(-std::f32::consts::PI, std::f32::consts::PI)],
@@ -83,7 +83,7 @@ pub fn sine() -> BlackBox {
     }
 }
 
-pub fn polynomial() -> BlackBox {
+pub(crate) fn polynomial() -> BlackBox {
     BlackBox {
         name: "polynomial",
         input_ranges: vec![(-2.0, 2.0)],
@@ -94,7 +94,7 @@ pub fn polynomial() -> BlackBox {
 
 /// Дальность полёта снаряда: range = v^2 * sin(2θ) / g. Два входа разного
 /// масштаба (скорость и угол) — проверяет per-feature нормализацию.
-pub fn projectile() -> BlackBox {
+pub(crate) fn projectile() -> BlackBox {
     BlackBox {
         name: "projectile",
         input_ranges: vec![(1.0, 10.0), (0.1, 1.5)],

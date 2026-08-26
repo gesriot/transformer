@@ -2,7 +2,7 @@ use crate::init::rand_uniform;
 use crate::tensor::Tensor;
 use ndarray::{ArrayD, IxDyn};
 
-pub struct Linear {
+pub(crate) struct Linear {
     pub weight: Tensor,
     pub bias: Tensor,
     in_features: usize,
@@ -10,14 +10,14 @@ pub struct Linear {
 }
 
 impl Linear {
-    pub fn new(in_features: usize, out_features: usize) -> Self {
+    pub(crate) fn new(in_features: usize, out_features: usize) -> Self {
         let limit = (6.0_f32 / (in_features + out_features) as f32).sqrt();
         let weight = rand_uniform(&[in_features, out_features], -limit, limit);
         let bias = ArrayD::zeros(IxDyn(&[1, out_features]));
         Self::from_tensors(Tensor::new(weight), Tensor::new(bias))
     }
 
-    pub fn from_tensors(weight: Tensor, bias: Tensor) -> Self {
+    pub(crate) fn from_tensors(weight: Tensor, bias: Tensor) -> Self {
         let w_shape = weight.shape();
         let b_shape = bias.shape();
         assert_eq!(w_shape.len(), 2, "Linear weight должен быть [in, out]");
@@ -34,7 +34,7 @@ impl Linear {
         }
     }
 
-    pub fn forward(&self, x: &Tensor) -> Tensor {
+    pub(crate) fn forward(&self, x: &Tensor) -> Tensor {
         let shape = x.shape();
         assert!(
             !shape.is_empty(),
@@ -59,7 +59,7 @@ impl Linear {
             .reshape(&out_shape)
     }
 
-    pub fn parameters(&self) -> Vec<Tensor> {
+    pub(crate) fn parameters(&self) -> Vec<Tensor> {
         vec![self.weight.clone(), self.bias.clone()]
     }
 }

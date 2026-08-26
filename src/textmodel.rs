@@ -30,7 +30,7 @@ impl TextModel {
     }
 
     /// `src` — `[B, ctx]`, `dec` — `[B, tgt]`. Логиты `[B, tgt, vocab]`.
-    pub fn forward(&self, src: &ArrayD<usize>, dec: &ArrayD<usize>) -> Tensor {
+    pub(crate) fn forward(&self, src: &ArrayD<usize>, dec: &ArrayD<usize>) -> Tensor {
         let dec_len = dec.shape()[1];
         let memory = self.core.encode(&self.embed.forward(src), None);
         let dec_emb = self.embed.forward(dec);
@@ -39,18 +39,23 @@ impl TextModel {
         self.head.forward(&hidden)
     }
 
-    pub fn loss(&self, src: &ArrayD<usize>, dec: &ArrayD<usize>, labels: &ArrayD<usize>) -> Tensor {
+    pub(crate) fn loss(
+        &self,
+        src: &ArrayD<usize>,
+        dec: &ArrayD<usize>,
+        labels: &ArrayD<usize>,
+    ) -> Tensor {
         cross_entropy(&self.forward(src, dec), labels)
     }
 
     /// Кодирует контекст один раз (память переиспользуется при генерации).
-    pub fn encode_src(&self, src: &[usize]) -> Tensor {
+    pub(crate) fn encode_src(&self, src: &[usize]) -> Tensor {
         let arr = ArrayD::from_shape_vec(IxDyn(&[1, src.len()]), src.to_vec()).unwrap();
         self.core.encode(&self.embed.forward(&arr), None)
     }
 
     /// Логиты следующего символа для текущей последовательности декодера.
-    pub fn next_logits(&self, dec: &[usize], memory: &Tensor) -> Vec<f32> {
+    pub(crate) fn next_logits(&self, dec: &[usize], memory: &Tensor) -> Vec<f32> {
         let arr = ArrayD::from_shape_vec(IxDyn(&[1, dec.len()]), dec.to_vec()).unwrap();
         let dec_emb = self.embed.forward(&arr);
         let mask = causal_mask(dec.len());
@@ -62,7 +67,7 @@ impl TextModel {
             .collect()
     }
 
-    pub fn parameters(&self) -> Vec<Tensor> {
+    pub(crate) fn parameters(&self) -> Vec<Tensor> {
         let mut p = self.embed.parameters();
         p.extend(self.core.parameters());
         p.extend(self.head.parameters());

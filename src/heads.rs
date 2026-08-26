@@ -1,66 +1,71 @@
 //! Головы задач: из скрытого состояния декодера в Y_hat + loss (Plan.md §1).
 //!
-//! - `RegressionHead` — числовой выход + MSE/Huber (surrogate-модель).
-//! - `CharHead` — логиты по словарю + cross_entropy (char-LM).
+//! - `RegressionHead` — числовой выход (surrogate-модель).
+//! - `CharHead` — логиты по словарю (char-LM).
+//!
+//! Функцию потерь считает вызывающая модель; здесь она есть только под тестом,
+//! где по ней проверяются градиенты голов.
 
+#[cfg(test)]
 use crate::loss::cross_entropy;
 use crate::nn::linear::Linear;
 use crate::tensor::Tensor;
+#[cfg(test)]
 use ndarray::ArrayD;
 
 /// Регрессионная голова: проецирует скрытое состояние каждого query-токена в
 /// числовой выход. Обычно `out_dim = 1` (один скаляр на запрос).
-pub struct RegressionHead {
+pub(crate) struct RegressionHead {
     pub proj: Linear,
 }
 
 impl RegressionHead {
-    pub fn new(d_model: usize, out_dim: usize) -> Self {
+    pub(crate) fn new(d_model: usize, out_dim: usize) -> Self {
         Self {
             proj: Linear::new(d_model, out_dim),
         }
     }
 
     /// `hidden` — `[B, n_queries, d_model]` -> `[B, n_queries, out_dim]`.
-    pub fn forward(&self, hidden: &Tensor) -> Tensor {
+    pub(crate) fn forward(&self, hidden: &Tensor) -> Tensor {
         self.proj.forward(hidden)
     }
 
-    pub fn mse(&self, hidden: &Tensor, target: &Tensor) -> Tensor {
+    #[cfg(test)]
+    pub(crate) fn mse(&self, hidden: &Tensor, target: &Tensor) -> Tensor {
         self.forward(hidden).mse_loss(target)
     }
 
-    pub fn huber(&self, hidden: &Tensor, target: &Tensor, delta: f32) -> Tensor {
-        self.forward(hidden).huber_loss(target, delta)
-    }
-
-    pub fn parameters(&self) -> Vec<Tensor> {
+    pub(crate) fn parameters(&self) -> Vec<Tensor> {
         self.proj.parameters()
     }
 }
 
 /// Голова char-LM: проецирует скрытое состояние в логиты по словарю.
-pub struct CharHead {
+#[cfg(any(feature = "demo", test))]
+pub(crate) struct CharHead {
     pub proj: Linear,
 }
 
+#[cfg(any(feature = "demo", test))]
 impl CharHead {
-    pub fn new(d_model: usize, vocab_size: usize) -> Self {
+    pub(crate) fn new(d_model: usize, vocab_size: usize) -> Self {
         Self {
             proj: Linear::new(d_model, vocab_size),
         }
     }
 
     /// `hidden` -> логиты `[.., vocab]`.
-    pub fn forward(&self, hidden: &Tensor) -> Tensor {
+    pub(crate) fn forward(&self, hidden: &Tensor) -> Tensor {
         self.proj.forward(hidden)
     }
 
-    pub fn loss(&self, hidden: &Tensor, targets: &ArrayD<usize>) -> Tensor {
+    #[cfg(test)]
+    pub(crate) fn loss(&self, hidden: &Tensor, targets: &ArrayD<usize>) -> Tensor {
         cross_entropy(&self.forward(hidden), targets)
     }
 
-    pub fn parameters(&self) -> Vec<Tensor> {
+    pub(crate) fn parameters(&self) -> Vec<Tensor> {
         self.proj.parameters()
     }
 }

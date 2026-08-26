@@ -176,7 +176,7 @@ impl ActiveDataset {
     }
 }
 
-pub struct App {
+pub(crate) struct App {
     pub(super) worker: Worker,
     pub(super) section: Section,
     pub(super) status: String,
@@ -262,7 +262,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub(crate) fn new(cc: &eframe::CreationContext<'_>) -> Self {
         Self {
             worker: Worker::spawn(cc.egui_ctx.clone()),
             section: Section::Data,

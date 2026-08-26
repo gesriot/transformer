@@ -3,14 +3,18 @@
 //! - `mse_loss` / `huber_loss` — регрессия (surrogate-модель).
 //! - `cross_entropy` — классификация / char-LM.
 
+#[cfg(any(feature = "demo", test))]
 use crate::ops::{flatten_last_dim, from_flat_last_dim};
-use crate::tensor::{BackwardFn, Tensor};
+#[cfg(any(feature = "demo", test))]
+use crate::tensor::BackwardFn;
+use crate::tensor::Tensor;
+#[cfg(any(feature = "demo", test))]
 use ndarray::{Array2, ArrayD};
 
 impl Tensor {
     /// Среднеквадратичная ошибка: `mean((pred - target)^2)`.
     /// Собрана из уже проверенных примитивов — отдельный backward не нужен.
-    pub fn mse_loss(&self, target: &Tensor) -> Tensor {
+    pub(crate) fn mse_loss(&self, target: &Tensor) -> Tensor {
         assert_eq!(
             self.shape(),
             target.shape(),
@@ -23,7 +27,9 @@ impl Tensor {
     /// Huber (smooth L1): квадратичная при |d| <= delta, линейная вне.
     /// Устойчивее MSE к выбросам. Реализована как примитив, т.к. функция
     /// кусочная и её аналитический градиент проще задать напрямую.
-    pub fn huber_loss(&self, target: &Tensor, delta: f32) -> Tensor {
+    /// Остаётся ради grad-check: рабочий путь считает MSE.
+    #[cfg(test)]
+    pub(crate) fn huber_loss(&self, target: &Tensor, delta: f32) -> Tensor {
         assert!(delta > 0.0, "huber delta должна быть > 0");
         assert_eq!(
             self.shape(),
@@ -69,7 +75,8 @@ impl Tensor {
 /// `logits` — `[.., C]`, по последней оси классы. `targets` — индексы классов
 /// той же формы без последней оси (плоско: по строке на каждый ряд логитов).
 /// Возвращает скаляр — среднее по всем строкам.
-pub fn cross_entropy(logits: &Tensor, targets: &ArrayD<usize>) -> Tensor {
+#[cfg(any(feature = "demo", test))]
+pub(crate) fn cross_entropy(logits: &Tensor, targets: &ArrayD<usize>) -> Tensor {
     let (flat, shape) = flatten_last_dim(&logits.data());
     let (n, c) = flat.dim();
     let tgt: Vec<usize> = targets.iter().copied().collect();

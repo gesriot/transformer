@@ -5,48 +5,53 @@
 //! `interpret` и `predict`, оставленные пространствами имён. При включённой
 //! фиче `gui` публичен также модуль `gui`. Всё остальное — устройство расчёта,
 //! и наружу не обещано.
+//!
+//! `unreachable_pub` включён намеренно: он ловит `pub`, который на самом деле
+//! никуда не ведёт, — такой элемент либо часть контракта и должен попасть в
+//! фасад, либо внутренний и должен стать `pub(crate)`.
+#![warn(unreachable_pub)]
 
-pub mod batch_predict;
+mod batch_predict;
 // Встроенные ящики — демонстрация, но ими же порождаются данные для тестов
 // ядра: под `test` они доступны и без фичи, иначе каждому модулю пришлось бы
 // заводить свой генератор.
 #[cfg(any(feature = "demo", test))]
-pub mod blackbox;
-pub mod config;
-pub mod core;
-pub mod data;
+mod blackbox;
+mod config;
+mod core;
+mod data;
 pub mod diagnostics;
-pub mod encoders;
+mod encoders;
 #[cfg(feature = "demo")]
-pub mod generate;
+mod generate;
 #[cfg(feature = "gui")]
 pub mod gui;
-pub mod heads;
-pub mod init;
+mod heads;
+mod init;
 pub mod interpret;
-pub mod kan;
-pub mod loss;
-pub mod markup;
-pub mod metrics;
-pub mod mlp;
-pub mod nn;
-pub mod numeric_model;
-pub mod ops;
-pub mod optim;
+mod kan;
+mod loss;
+mod markup;
+mod metrics;
+mod mlp;
+mod nn;
+mod numeric_model;
+mod ops;
+mod optim;
 pub mod predict;
-pub mod schema;
-pub mod serialize;
-pub mod split;
-pub mod surrogate;
-pub mod sweep;
-pub mod symbolic;
-pub mod table;
-pub mod tensor;
+mod schema;
+mod serialize;
+mod split;
+mod surrogate;
+mod sweep;
+mod symbolic;
+mod table;
+mod tensor;
 #[cfg(feature = "demo")]
-pub mod textmodel;
-pub mod tnum;
-pub mod train;
-pub mod training;
+mod textmodel;
+mod tnum;
+mod train;
+mod training;
 
 // --- Публичный API ---
 //
@@ -60,15 +65,27 @@ pub mod training;
 pub use data::{Normalizer, NumericDataset, OutOfRange};
 pub use encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
 pub use schema::{Column, ColumnRole, ColumnType, ModelSchema, TableSchema};
-pub use table::Delimiter;
+// Разметка таблицы: профиль -> черновик схемы -> отчёт по ролям. Ядро
+// независимо от интерфейса, поэтому идёт наружу целиком, а не через GUI.
+pub use markup::{
+    analyze_roles, ColumnProfile, DraftColumn, DraftType, LinearDependency, Message, RoleReport,
+    SchemaDraft, Severity, TableProfile,
+};
+pub use table::{Delimiter, Table};
 pub use tnum::{
     infer_prepare_spec_from_path, infer_prepare_spec_from_text, parse_categorical,
     read_numeric_source, table_path_to_tnum, table_to_tnum, InferredPrepareSpec, PrepareSpec,
 };
 
-// Модель и её конфигурация.
+// Модель и её конфигурация. Полезная нагрузка `NumericModel` называется явно:
+// она и так видна через варианты enum, а безымянный тип нельзя ни принять, ни
+// вернуть. Тензорные методы у этих типов внутренние — снаружи модель работает
+// через `predict`, `save_numeric` и отчёты.
 pub use config::ModelConfig;
+pub use kan::{CompactReport, KanNet, PruneReport};
+pub use mlp::MlpBaseline;
 pub use numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig, NumericModel};
+pub use surrogate::SurrogateModel;
 
 // Обучение: активный набор, один сценарий и его протокол оценки.
 pub use metrics::{evaluate, EvalSource, Metrics};
@@ -79,9 +96,9 @@ pub use split::{
 };
 pub use train::{evaluate_surrogate, predict_dataset, validate_train, LrSchedule, TrainConfig};
 pub use training::{
-    evaluate_on, recommended_epoch, refit, run_training, Dataset, EarlyStopping, EpochPoint,
-    EvalSchedule, Phase, RefitOutcome, TrainedModel, TrainingHistory, TrainingOutcome,
-    TrainingSetup,
+    evaluate_on, recommended_epoch, refit, run_training, ConfigureModel, Dataset, EarlyStopping,
+    EpochPoint, EvalSchedule, Phase, PostTrain, RefitOutcome, TrainedModel, TrainingHistory,
+    TrainingOutcome, TrainingSetup,
 };
 
 // Поиск конфигурации: сетка поверх того же сценария обучения.
@@ -99,13 +116,15 @@ pub use init::set_init_seed;
 pub use serialize::{
     calibration_sample, load_numeric, load_numeric_full, save_numeric, NumericCheckpoint,
 };
-pub use symbolic::{symbolize, SymbolicKan, SymbolicLayer};
+pub use symbolic::{symbolize, EdgeFit, SymbolicKan, SymbolicLayer};
 
 // Интерпретация KAN: профиль версионируется и едет в checkpoint.
 pub use interpret::{InterpretOverrides, InterpretProfile, InterpretReport};
 
 // Демонстрации.
-#[cfg(feature = "demo")]
+// Ящики компилируются и под `test` (см. объявление модуля), поэтому и их
+// реэкспорт: иначе в тестовой сборке без `demo` их `pub` вёл бы в никуда.
+#[cfg(any(feature = "demo", test))]
 pub use blackbox::{by_name as blackbox_by_name, BlackBox};
 #[cfg(feature = "demo")]
 pub use data::{TextDataset, Vocab};

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
 
-pub use crate::table::Delimiter;
+pub(crate) use crate::table::Delimiter;
 
 pub struct PrepareSpec {
     pub n_inputs: usize,
@@ -190,7 +190,7 @@ pub fn infer_prepare_spec_from_path(
 /// Разметка колонок по [`PrepareSpec`]: первые `n_inputs` колонок — входы,
 /// остальные — выходы. Имена берутся из заголовка таблицы, а у категорий
 /// подписями служат сами коды: настоящих подписей `PrepareSpec` не знает.
-pub fn table_schema_from_prepare_spec(
+pub(crate) fn table_schema_from_prepare_spec(
     table: &Table,
     spec: &PrepareSpec,
 ) -> Result<TableSchema, String> {

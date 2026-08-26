@@ -311,7 +311,10 @@ impl SearchObjective {
     }
 
     /// Чем больше, тем лучше — включая nRMSE, который для этого меняет знак.
-    pub fn score(self, eval: &ConfigEval, runs: &[RunEval]) -> f32 {
+    ///
+    /// Внутренняя: считает по агрегату прогонов, а низкоуровневый поиск наружу
+    /// не обещан. Снаружи цель видна как выбор ранжирования, не как формула.
+    pub(crate) fn score(self, eval: &ConfigEval, runs: &[RunEval]) -> f32 {
         let per_output_r2 = || eval.per_output_mean.iter().map(|m| m.r2);
         match self {
             SearchObjective::AggregateR2 => eval.mean.r2,
@@ -338,7 +341,7 @@ impl SearchObjective {
 /// Данные и разбиение сюда не входят: они приходят готовыми, а `seeds` меняет
 /// только инициализацию (см. [`crate::split`]).
 #[derive(Clone, Debug, PartialEq)]
-pub struct SearchPlan {
+pub(crate) struct SearchPlan {
     pub seeds: Vec<u64>,
     pub objective: SearchObjective,
 }
@@ -353,7 +356,7 @@ impl Default for SearchPlan {
 }
 
 impl SearchPlan {
-    pub fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.seeds.is_empty() {
             return Err("seeds: пустой список".to_string());
         }
@@ -452,13 +455,13 @@ fn russian_epochs(n: usize) -> String {
 }
 
 /// Кандидат поиска: подпись для отчёта и конфигурация запуска.
-pub struct SearchCandidate {
+pub(crate) struct SearchCandidate {
     pub label: String,
     pub setup: TrainingSetup,
 }
 
 /// Результат по одной конфигурации.
-pub struct SearchRow {
+pub(crate) struct SearchRow {
     /// Позиция кандидата в исходном списке: ранжирование меняет порядок, а
     /// вызывающему нужно вернуться к своим данным о конфигурации.
     pub candidate: usize,
@@ -468,7 +471,7 @@ pub struct SearchRow {
     pub score: f32,
 }
 
-pub struct SearchResults {
+pub(crate) struct SearchResults {
     pub rows: Vec<SearchRow>,
     pub cost: SearchCost,
     pub cancelled: bool,
@@ -479,7 +482,7 @@ pub struct SearchResults {
 /// Test сюда не попадает физически: [`SearchPool`] его не содержит. Каждый
 /// кандидат обучается на всех seed и всех folds, свёртка — через
 /// [`aggregate_runs`] (folds внутри seed, затем seeds).
-pub fn search(
+pub(crate) fn search(
     dataset: &Dataset,
     pool: &SearchPool,
     candidates: &[SearchCandidate],
@@ -552,7 +555,11 @@ pub fn search(
 }
 
 /// Стоимость поиска по кандидатам и плану.
-pub fn search_cost(candidates: &[SearchCandidate], plan: &SearchPlan, folds: usize) -> SearchCost {
+pub(crate) fn search_cost(
+    candidates: &[SearchCandidate],
+    plan: &SearchPlan,
+    folds: usize,
+) -> SearchCost {
     let epochs_per_seed_fold = candidates.iter().fold(0usize, |total, candidate| {
         total.saturating_add(candidate.setup.train.epochs)
     });
@@ -596,7 +603,7 @@ fn finish(mut rows: Vec<SearchRow>, cost: SearchCost, cancelled: bool) -> Search
 /// Единственное место, где создаётся и учится модель: нормализаторы строятся по
 /// train ЭТОГО fold, метрики снимаются на его validation.
 #[allow(clippy::too_many_arguments)]
-pub fn train_candidate(
+pub(crate) fn train_candidate(
     dataset: &Dataset,
     pool: &SearchPool,
     fold: usize,

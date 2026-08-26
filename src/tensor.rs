@@ -15,7 +15,7 @@ use std::rc::Rc;
 /// цикл ссылок (узел владеет замыканием, замыкание владело бы узлом).
 pub(crate) type BackwardFn = Box<dyn Fn(&ArrayD<f32>)>;
 
-pub struct TensorData {
+pub(crate) struct TensorData {
     pub data: ArrayD<f32>,
     pub grad: ArrayD<f32>,
     pub backward: Option<BackwardFn>,
@@ -24,11 +24,11 @@ pub struct TensorData {
 }
 
 #[derive(Clone)]
-pub struct Tensor(Rc<RefCell<TensorData>>);
+pub(crate) struct Tensor(Rc<RefCell<TensorData>>);
 
 impl Tensor {
     /// Лист графа (параметр или вход). По умолчанию требует градиент.
-    pub fn new(data: ArrayD<f32>) -> Tensor {
+    pub(crate) fn new(data: ArrayD<f32>) -> Tensor {
         let grad = ArrayD::zeros(data.raw_dim());
         Tensor(Rc::new(RefCell::new(TensorData {
             data,
@@ -40,7 +40,7 @@ impl Tensor {
     }
 
     /// Константа: не участвует в накоплении градиента (вход данных, маска).
-    pub fn constant(data: ArrayD<f32>) -> Tensor {
+    pub(crate) fn constant(data: ArrayD<f32>) -> Tensor {
         let t = Tensor::new(data);
         t.0.borrow_mut().requires_grad = false;
         t
@@ -59,25 +59,25 @@ impl Tensor {
         })))
     }
 
-    pub fn data(&self) -> ArrayD<f32> {
+    pub(crate) fn data(&self) -> ArrayD<f32> {
         self.0.borrow().data.clone()
     }
 
-    pub fn grad(&self) -> ArrayD<f32> {
+    pub(crate) fn grad(&self) -> ArrayD<f32> {
         self.0.borrow().grad.clone()
     }
 
-    pub fn shape(&self) -> Vec<usize> {
+    pub(crate) fn shape(&self) -> Vec<usize> {
         self.0.borrow().data.shape().to_vec()
     }
 
-    pub fn requires_grad(&self) -> bool {
+    pub(crate) fn requires_grad(&self) -> bool {
         self.0.borrow().requires_grad
     }
 
     /// Скалярное значение (для loss). Паникует если не один элемент —
     /// это инвариант вызывающего кода, не рантайм-ошибка.
-    pub fn item(&self) -> f32 {
+    pub(crate) fn item(&self) -> f32 {
         let b = self.0.borrow();
         assert_eq!(b.data.len(), 1, "item() требует тензор из одного элемента");
         b.data.iter().next().copied().unwrap()
@@ -91,20 +91,20 @@ impl Tensor {
         b.grad += g;
     }
 
-    pub fn zero_grad(&self) {
+    pub(crate) fn zero_grad(&self) {
         let mut b = self.0.borrow_mut();
         b.grad.fill(0.0);
     }
 
     /// In-place обновление данных (используется оптимизатором).
-    pub fn update_data<F: FnOnce(&mut ArrayD<f32>, &ArrayD<f32>)>(&self, f: F) {
+    pub(crate) fn update_data<F: FnOnce(&mut ArrayD<f32>, &ArrayD<f32>)>(&self, f: F) {
         let mut b = self.0.borrow_mut();
         let grad = b.grad.clone();
         f(&mut b.data, &grad);
     }
 
     /// Перезаписать данные (загрузка сохранённых весов). Форма должна совпадать.
-    pub fn set_data(&self, new: ArrayD<f32>) {
+    pub(crate) fn set_data(&self, new: ArrayD<f32>) {
         let mut b = self.0.borrow_mut();
         assert_eq!(
             b.data.shape(),
@@ -115,7 +115,7 @@ impl Tensor {
     }
 
     /// Обратный проход от этого (скалярного) узла.
-    pub fn backward(&self) {
+    pub(crate) fn backward(&self) {
         // Топологическая сортировка графа.
         let mut topo: Vec<Tensor> = Vec::new();
         let mut visited: Vec<*const RefCell<TensorData>> = Vec::new();
@@ -187,7 +187,7 @@ fn unbroadcast(mut grad: ArrayD<f32>, target: &[usize]) -> ArrayD<f32> {
 
 impl Tensor {
     /// Поэлементное сложение с broadcasting.
-    pub fn add(&self, other: &Tensor) -> Tensor {
+    pub(crate) fn add(&self, other: &Tensor) -> Tensor {
         let a = self.0.borrow().data.clone();
         let b = other.0.borrow().data.clone();
         let out = &a + &b;
@@ -203,7 +203,7 @@ impl Tensor {
     }
 
     /// Поэлементное умножение с broadcasting.
-    pub fn mul(&self, other: &Tensor) -> Tensor {
+    pub(crate) fn mul(&self, other: &Tensor) -> Tensor {
         let a = self.0.borrow().data.clone();
         let b = other.0.borrow().data.clone();
         let out = &a * &b;
@@ -219,7 +219,7 @@ impl Tensor {
     }
 
     /// Умножение на скаляр.
-    pub fn scale(&self, s: f32) -> Tensor {
+    pub(crate) fn scale(&self, s: f32) -> Tensor {
         let out = &self.0.borrow().data * s;
         let lhs = self.clone();
         let backward: BackwardFn = Box::new(move |g: &ArrayD<f32>| {
@@ -229,7 +229,7 @@ impl Tensor {
     }
 
     /// Матричное умножение 2D: [m, k] · [k, n] = [m, n].
-    pub fn matmul(&self, other: &Tensor) -> Tensor {
+    pub(crate) fn matmul(&self, other: &Tensor) -> Tensor {
         let a = to_2d(&self.0.borrow().data);
         let b = to_2d(&other.0.borrow().data);
         let out = a.dot(&b);
@@ -249,7 +249,9 @@ impl Tensor {
     }
 
     /// ReLU.
-    pub fn relu(&self) -> Tensor {
+    /// Сеть использует gelu; relu оставлен для grad-check.
+    #[cfg(test)]
+    pub(crate) fn relu(&self) -> Tensor {
         let a = self.0.borrow().data.clone();
         let mask = a.mapv(|x| if x > 0.0 { 1.0 } else { 0.0 });
         let out = a.mapv(|x| x.max(0.0));
@@ -261,7 +263,7 @@ impl Tensor {
     }
 
     /// Сумма всех элементов в скаляр.
-    pub fn sum(&self) -> Tensor {
+    pub(crate) fn sum(&self) -> Tensor {
         let a = self.0.borrow().data.clone();
         let total = a.sum();
         let out = ArrayD::from_elem(IxDyn(&[1]), total);
@@ -275,7 +277,7 @@ impl Tensor {
     }
 
     /// Среднее всех элементов.
-    pub fn mean(&self) -> Tensor {
+    pub(crate) fn mean(&self) -> Tensor {
         let n = self.0.borrow().data.len() as f32;
         self.sum().scale(1.0 / n)
     }

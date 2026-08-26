@@ -3,7 +3,7 @@ use crate::ops::{merge_heads, scaled_dot_product_attention, split_heads};
 use crate::tensor::Tensor;
 use ndarray::ArrayD;
 
-pub struct MultiHeadAttention {
+pub(crate) struct MultiHeadAttention {
     pub w_q: Linear,
     pub w_k: Linear,
     pub w_v: Linear,
@@ -13,7 +13,7 @@ pub struct MultiHeadAttention {
 }
 
 impl MultiHeadAttention {
-    pub fn new(d_model: usize, n_heads: usize) -> Self {
+    pub(crate) fn new(d_model: usize, n_heads: usize) -> Self {
         assert_eq!(d_model % n_heads, 0, "d_model должен делиться на n_heads");
         Self {
             w_q: Linear::new(d_model, d_model),
@@ -25,7 +25,14 @@ impl MultiHeadAttention {
         }
     }
 
-    pub fn from_layers(w_q: Linear, w_k: Linear, w_v: Linear, w_o: Linear, n_heads: usize) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_layers(
+        w_q: Linear,
+        w_k: Linear,
+        w_v: Linear,
+        w_o: Linear,
+        n_heads: usize,
+    ) -> Self {
         let d_model = w_q.weight.shape()[0];
         assert_eq!(d_model % n_heads, 0, "d_model должен делиться на n_heads");
         Self {
@@ -38,7 +45,7 @@ impl MultiHeadAttention {
         }
     }
 
-    pub fn forward(
+    pub(crate) fn forward(
         &self,
         query: &Tensor,
         key: &Tensor,
@@ -57,11 +64,11 @@ impl MultiHeadAttention {
         self.w_o.forward(&merge_heads(&context))
     }
 
-    pub fn self_attention(&self, x: &Tensor, mask: Option<&ArrayD<f32>>) -> Tensor {
+    pub(crate) fn self_attention(&self, x: &Tensor, mask: Option<&ArrayD<f32>>) -> Tensor {
         self.forward(x, x, x, mask)
     }
 
-    pub fn parameters(&self) -> Vec<Tensor> {
+    pub(crate) fn parameters(&self) -> Vec<Tensor> {
         let mut params = self.w_q.parameters();
         params.extend(self.w_k.parameters());
         params.extend(self.w_v.parameters());

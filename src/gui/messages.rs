@@ -28,7 +28,7 @@ use std::sync::Arc;
 /// для диагностики: чувствительность исходного процесса считается только у
 /// вызываемого чёрного ящика.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DatasetOrigin {
+pub(crate) enum DatasetOrigin {
     #[cfg(any(feature = "demo", test))]
     Blackbox(String),
     /// `.tnum` со своей схемой.
@@ -39,7 +39,7 @@ pub enum DatasetOrigin {
 
 impl DatasetOrigin {
     #[cfg(feature = "demo")]
-    pub fn blackbox(&self) -> Option<&str> {
+    pub(crate) fn blackbox(&self) -> Option<&str> {
         match self {
             DatasetOrigin::Blackbox(name) => Some(name),
             _ => None,
@@ -47,7 +47,7 @@ impl DatasetOrigin {
     }
 
     /// Короткая подпись для шапки: путь целиком там не помещается.
-    pub fn short_name(&self) -> String {
+    pub(crate) fn short_name(&self) -> String {
         match self {
             #[cfg(any(feature = "demo", test))]
             DatasetOrigin::Blackbox(name) => format!("чёрный ящик: {name}"),
@@ -66,14 +66,14 @@ impl DatasetOrigin {
 /// бывают по отдельности. Финальное обучение после поиска состоит ТОЛЬКО из
 /// финальной фазы, поэтому обязательный development терял бы её отчёт.
 #[derive(Clone, Debug)]
-pub struct InterpretReports {
+pub(crate) struct InterpretReports {
     pub development: Option<InterpretReport>,
     pub final_model: Option<InterpretReport>,
 }
 
 impl InterpretReports {
     /// Профиль общий для обеих фаз — берём у того отчёта, который есть.
-    pub fn profile(&self) -> Option<&InterpretProfile> {
+    pub(crate) fn profile(&self) -> Option<&InterpretProfile> {
         self.development
             .as_ref()
             .or(self.final_model.as_ref())
@@ -86,14 +86,14 @@ impl InterpretReports {
 /// В worker передаются именно данные, а не путь: иначе он открыл бы файл
 /// заново через автоопределение и ручная разметка потерялась бы.
 #[derive(Clone)]
-pub struct PreparedData {
+pub(crate) struct PreparedData {
     pub origin: DatasetOrigin,
     pub data: Arc<NumericDataset>,
     pub schema: ModelSchema,
 }
 
 /// Результат диагностики (числа для UI).
-pub struct DiagnosticsResult {
+pub(crate) struct DiagnosticsResult {
     pub overfit_loss: f32,
     pub extrapolation_rows: usize,
     pub extrapolation_total: usize,
@@ -109,7 +109,7 @@ pub struct DiagnosticsResult {
 
 /// Метаданные KAN, безопасные для передачи из worker в UI. Сами тензоры и
 /// модель остаются в worker-потоке; UI получает только размеры и выборки.
-pub struct KanModelInfo {
+pub(crate) struct KanModelInfo {
     pub layer_dims: Vec<(usize, usize)>,
     pub domain: (f32, f32),
     /// Символьный фит требует исходные train-активации. Они есть только у
@@ -118,7 +118,7 @@ pub struct KanModelInfo {
 }
 
 /// Слабое символьное ребро, передаваемое в UI без тензоров.
-pub struct KanWeakEdge {
+pub(crate) struct KanWeakEdge {
     pub layer: usize,
     pub input: String,
     pub output: String,
@@ -127,7 +127,7 @@ pub struct KanWeakEdge {
 }
 
 /// Готовый результат symbolic extraction в исходных единицах данных.
-pub struct KanSymbolicInfo {
+pub(crate) struct KanSymbolicInfo {
     pub formulas: String,
     pub min_edge_r2: f32,
     pub mean_edge_r2: f32,
@@ -142,13 +142,13 @@ pub struct KanSymbolicInfo {
 
 /// Происхождение итоговой validation-метрики development-модели.
 #[derive(Clone, Copy)]
-pub struct ValidationOrigin {
+pub(crate) struct ValidationOrigin {
     pub plan: SplitPlan,
     pub init_seed: u64,
 }
 
 /// Команды UI -> worker.
-pub enum Command {
+pub(crate) enum Command {
     /// Открыть набор данных: сгенерировать чёрный ящик или прочитать `.tnum`.
     /// Чтение — в worker-е, дальше сессия работает с готовыми данными.
     OpenDataset {
@@ -222,7 +222,7 @@ pub enum Command {
 }
 
 /// События worker -> UI.
-pub enum Event {
+pub(crate) enum Event {
     Status(String),
     Error(String),
     TrainStarted {

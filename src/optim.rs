@@ -7,8 +7,11 @@
 use crate::tensor::Tensor;
 use ndarray::ArrayD;
 
-pub struct Adam {
+pub(crate) struct Adam {
     params: Vec<Tensor>,
+    /// lr по умолчанию: им пользуется только `step`. Числовое обучение всегда
+    /// задаёт lr расписанием, поэтому в part сборках поле никто не читает.
+    #[allow(dead_code)]
     lr: f32,
     beta1: f32,
     beta2: f32,
@@ -21,11 +24,11 @@ pub struct Adam {
 
 impl Adam {
     /// Стандартные гиперпараметры: beta1=0.9, beta2=0.999, eps=1e-8, без WD.
-    pub fn new(params: Vec<Tensor>, lr: f32) -> Self {
+    pub(crate) fn new(params: Vec<Tensor>, lr: f32) -> Self {
         Self::with_config(params, lr, 0.9, 0.999, 1e-8, 0.0)
     }
 
-    pub fn with_config(
+    pub(crate) fn with_config(
         params: Vec<Tensor>,
         lr: f32,
         beta1: f32,
@@ -54,20 +57,21 @@ impl Adam {
         }
     }
 
-    pub fn zero_grad(&self) {
+    pub(crate) fn zero_grad(&self) {
         for p in &self.params {
             p.zero_grad();
         }
     }
 
     /// Шаг с lr по умолчанию (из конструктора). Для constant-расписания.
-    pub fn step(&mut self) {
+    #[allow(dead_code)]
+    pub(crate) fn step(&mut self) {
         self.step_with_lr(self.lr);
     }
 
     /// Шаг с явно заданным lr. Политику lr (warmup/cosine) держит вызывающий
     /// код в train.rs — оптимизатор хранит только моменты, не расписание.
-    pub fn step_with_lr(&mut self, lr: f32) {
+    pub(crate) fn step_with_lr(&mut self, lr: f32) {
         self.t += 1;
         let bias1 = 1.0 - self.beta1.powi(self.t);
         let bias2 = 1.0 - self.beta2.powi(self.t);

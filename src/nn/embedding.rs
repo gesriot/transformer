@@ -2,20 +2,20 @@ use crate::init::rand_uniform;
 use crate::tensor::{BackwardFn, Tensor};
 use ndarray::{Array2, ArrayD, Ix2, IxDyn};
 
-pub struct Embedding {
+pub(crate) struct Embedding {
     pub weight: Tensor,
     vocab_size: usize,
     dim: usize,
 }
 
 impl Embedding {
-    pub fn new(vocab_size: usize, dim: usize) -> Self {
+    pub(crate) fn new(vocab_size: usize, dim: usize) -> Self {
         let limit = (3.0_f32 / dim as f32).sqrt();
         let weight = rand_uniform(&[vocab_size, dim], -limit, limit);
         Self::from_weight(Tensor::new(weight))
     }
 
-    pub fn from_weight(weight: Tensor) -> Self {
+    pub(crate) fn from_weight(weight: Tensor) -> Self {
         let shape = weight.shape();
         assert_eq!(shape.len(), 2, "Embedding weight должен быть [vocab, dim]");
         Self {
@@ -25,7 +25,7 @@ impl Embedding {
         }
     }
 
-    pub fn forward(&self, ids: &ArrayD<usize>) -> Tensor {
+    pub(crate) fn forward(&self, ids: &ArrayD<usize>) -> Tensor {
         let weight = self
             .weight
             .data()
@@ -63,12 +63,13 @@ impl Embedding {
         Tensor::from_op(out_dyn, vec![self.weight.clone()], backward)
     }
 
-    pub fn parameters(&self) -> Vec<Tensor> {
+    pub(crate) fn parameters(&self) -> Vec<Tensor> {
         vec![self.weight.clone()]
     }
 }
 
-pub fn sinusoidal_positions(seq_len: usize, dim: usize) -> Tensor {
+#[cfg(any(feature = "demo", test))]
+pub(crate) fn sinusoidal_positions(seq_len: usize, dim: usize) -> Tensor {
     let mut pe = ArrayD::<f32>::zeros(IxDyn(&[1, seq_len, dim]));
     for pos in 0..seq_len {
         for i in (0..dim).step_by(2) {

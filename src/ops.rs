@@ -17,7 +17,7 @@ pub(crate) fn from_flat_last_dim(flat: &Array2<f32>, shape: &[usize]) -> ArrayD<
 }
 
 impl Tensor {
-    pub fn reshape(&self, shape: &[usize]) -> Tensor {
+    pub(crate) fn reshape(&self, shape: &[usize]) -> Tensor {
         let a = self.data();
         let old_shape = a.shape().to_vec();
         let old_len = a.len();
@@ -38,7 +38,7 @@ impl Tensor {
         Tensor::from_op(out, vec![self.clone()], backward)
     }
 
-    pub fn gelu(&self) -> Tensor {
+    pub(crate) fn gelu(&self) -> Tensor {
         let a = self.data();
         let c = (2.0_f32 / std::f32::consts::PI).sqrt();
         let k = 0.044_715_f32;
@@ -59,7 +59,7 @@ impl Tensor {
     }
 
     /// Поэлементный модуль (для L1-регуляризации). Субградиент в нуле = 0.
-    pub fn abs(&self) -> Tensor {
+    pub(crate) fn abs(&self) -> Tensor {
         let a = self.data();
         let out = a.mapv(f32::abs);
         let sign = a.mapv(|x| {
@@ -79,7 +79,7 @@ impl Tensor {
     }
 
     /// Поэлементный синус (для Fourier-фич). d/dx sin = cos.
-    pub fn sin(&self) -> Tensor {
+    pub(crate) fn sin(&self) -> Tensor {
         let a = self.data();
         let out = a.mapv(f32::sin);
         let cos = a.mapv(f32::cos);
@@ -91,7 +91,7 @@ impl Tensor {
     }
 
     /// Поэлементный косинус. d/dx cos = -sin.
-    pub fn cos(&self) -> Tensor {
+    pub(crate) fn cos(&self) -> Tensor {
         let a = self.data();
         let out = a.mapv(f32::cos);
         let neg_sin = a.mapv(|x| -x.sin());
@@ -102,7 +102,9 @@ impl Tensor {
         Tensor::from_op(out, vec![self.clone()], backward)
     }
 
-    pub fn softmax_last_dim(&self) -> Tensor {
+    /// Внимание считает softmax внутри своего ядра; здесь — для grad-check.
+    #[cfg(test)]
+    pub(crate) fn softmax_last_dim(&self) -> Tensor {
         let (a, shape) = flatten_last_dim(&self.data());
         let (rows, cols) = a.dim();
         let mut probs = Array2::<f32>::zeros((rows, cols));
@@ -144,7 +146,7 @@ impl Tensor {
         Tensor::from_op(out, vec![self.clone()], backward)
     }
 
-    pub fn layer_norm_last_dim(&self, gamma: &Tensor, beta: &Tensor, eps: f32) -> Tensor {
+    pub(crate) fn layer_norm_last_dim(&self, gamma: &Tensor, beta: &Tensor, eps: f32) -> Tensor {
         let (x, shape) = flatten_last_dim(&self.data());
         let gamma_data = gamma.data();
         let beta_data = beta.data();
@@ -238,7 +240,7 @@ impl Tensor {
     }
 }
 
-pub fn split_heads(x: &Tensor, n_heads: usize) -> Tensor {
+pub(crate) fn split_heads(x: &Tensor, n_heads: usize) -> Tensor {
     let x_data = x
         .data()
         .into_dimensionality::<Ix3>()
@@ -279,7 +281,7 @@ pub fn split_heads(x: &Tensor, n_heads: usize) -> Tensor {
     Tensor::from_op(out.into_dyn(), vec![x.clone()], backward)
 }
 
-pub fn merge_heads(x: &Tensor) -> Tensor {
+pub(crate) fn merge_heads(x: &Tensor) -> Tensor {
     let x_data = x
         .data()
         .into_dimensionality::<Ix4>()
@@ -327,7 +329,7 @@ fn mask_at(mask: &ArrayD<f32>, b: usize, h: usize, tq: usize, tk: usize) -> f32 
     }
 }
 
-pub fn scaled_dot_product_attention(
+pub(crate) fn scaled_dot_product_attention(
     q: &Tensor,
     k: &Tensor,
     v: &Tensor,

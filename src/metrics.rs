@@ -80,7 +80,7 @@ pub struct RunOrigin {
 
 /// Метрики одного прогона вместе с его происхождением.
 #[derive(Debug, Clone)]
-pub struct RunEval {
+pub(crate) struct RunEval {
     pub metrics: Metrics,
     pub per_output: Vec<Metrics>,
     pub origin: RunOrigin,
@@ -89,7 +89,7 @@ pub struct RunEval {
 /// Происхождение АГРЕГАТА по конфигурации: по каким seed и скольким folds он
 /// собран.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigOrigin {
+pub(crate) struct ConfigOrigin {
     pub init_seeds: Vec<u64>,
     pub folds: usize,
     pub source: EvalSource,
@@ -100,7 +100,7 @@ pub struct ConfigOrigin {
 /// `r2_std_seeds` означает устойчивость к инициализации и ничего больше;
 /// разброс по данным вынесен отдельным числом `r2_std_folds`.
 #[derive(Debug, Clone)]
-pub struct ConfigEval {
+pub(crate) struct ConfigEval {
     pub mean: Metrics,
     pub per_output_mean: Vec<Metrics>,
     /// Std R² между init_seed (0 при одном seed) — то самое `±`.
@@ -135,7 +135,7 @@ fn population_std(xs: &[f32]) -> f32 {
 /// `init_seeds` задаёт порядок свёртки и попадает в происхождение. Прогон с
 /// seed вне списка — ошибка, а не молчаливое отбрасывание: иначе агрегат
 /// посчитается не по тем данным, о которых отчитывается.
-pub fn aggregate_runs(
+pub(crate) fn aggregate_runs(
     runs: &[RunEval],
     init_seeds: &[u64],
     source: EvalSource,
@@ -257,7 +257,7 @@ pub fn aggregate_runs(
 /// Метрики отдельно для каждого выхода (столбца). Агрегатный `evaluate`
 /// считает R² по всем выходам сразу, что у мультимасштабных целей скрывает
 /// слабый выход — per-output это вскрывает.
-pub fn evaluate_per_output(pred: &Array2<f32>, target: &Array2<f32>) -> Vec<Metrics> {
+pub(crate) fn evaluate_per_output(pred: &Array2<f32>, target: &Array2<f32>) -> Vec<Metrics> {
     assert_eq!(
         pred.dim(),
         target.dim(),

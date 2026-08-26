@@ -111,7 +111,7 @@ fn bspline_basis(x: &Tensor, grid: usize) -> Tensor {
 /// Маски рёбер (константы, не параметры) — механизм мягкого прунинга: они
 /// умножаются на веса ВНУТРИ графа, поэтому у отсечённого ребра зануляется и
 /// вклад в forward, и градиент — fine-tune не «отращивает» его обратно.
-pub struct KanLayer {
+pub(crate) struct KanLayer {
     base: Linear,
     spline_weight: Tensor, // [I*M, O]
     mask: Tensor,          // [I, O], 1 = ребро активно
@@ -120,7 +120,7 @@ pub struct KanLayer {
 }
 
 impl KanLayer {
-    pub fn new(in_features: usize, out_features: usize, grid: usize) -> Self {
+    pub(crate) fn new(in_features: usize, out_features: usize, grid: usize) -> Self {
         let m = grid + SPLINE_ORDER;
         // Сплайны стартуют малыми: начальная функция ребра ≈ базовая gelu-ветка.
         let limit = (6.0 / (in_features * m + out_features) as f32).sqrt();
@@ -151,14 +151,14 @@ impl KanLayer {
         )
     }
 
-    pub fn forward(&self, x: &Tensor) -> Tensor {
+    pub(crate) fn forward(&self, x: &Tensor) -> Tensor {
         let (wb, ws) = self.masked_weights();
         let base = x.gelu().matmul(&wb).add(&self.base.bias);
         let spline = bspline_basis(x, self.grid).matmul(&ws);
         base.add(&spline)
     }
 
-    pub fn parameters(&self) -> Vec<Tensor> {
+    pub(crate) fn parameters(&self) -> Vec<Tensor> {
         let mut p = self.base.parameters();
         p.push(self.spline_weight.clone());
         p
@@ -392,7 +392,7 @@ impl KanNet {
     }
 
     /// `values` — `[B, F]` (нормализованные) -> `[B, O]`.
-    pub fn predict(&self, values: &Tensor) -> Tensor {
+    pub(crate) fn predict(&self, values: &Tensor) -> Tensor {
         let mut x = values.clone();
         for layer in &self.layers {
             x = layer.forward(&x);
@@ -400,7 +400,7 @@ impl KanNet {
         x
     }
 
-    pub fn loss(&self, values: &Tensor, targets: &Tensor) -> Tensor {
+    pub(crate) fn loss(&self, values: &Tensor, targets: &Tensor) -> Tensor {
         let lambda = self.l1_lambda.get();
         if lambda == 0.0 {
             return self.predict(values).mse_loss(targets);
@@ -412,7 +412,7 @@ impl KanNet {
 
     /// Дифференцируемый L1-терм всей сети: `Σ по слоям Σ_ij mean_batch |φ_ij|`
     /// на активациях данного батча (для слоя k — выход слоя k-1).
-    pub fn l1(&self, values: &Tensor) -> Tensor {
+    pub(crate) fn l1(&self, values: &Tensor) -> Tensor {
         let mut x = values.clone();
         let mut total: Option<Tensor> = None;
         for layer in &self.layers {
@@ -568,7 +568,7 @@ impl KanNet {
         })
     }
 
-    pub fn parameters(&self) -> Vec<Tensor> {
+    pub(crate) fn parameters(&self) -> Vec<Tensor> {
         self.layers.iter().flat_map(|l| l.parameters()).collect()
     }
 

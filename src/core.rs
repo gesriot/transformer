@@ -8,12 +8,15 @@ use crate::nn::attention::MultiHeadAttention;
 use crate::nn::ffn::FeedForward;
 use crate::nn::layernorm::LayerNorm;
 use crate::tensor::Tensor;
-use ndarray::{ArrayD, IxDyn};
+use ndarray::ArrayD;
+#[cfg(any(feature = "demo", test))]
+use ndarray::IxDyn;
 
 /// Аддитивная causal-маска `[seq, seq]`: 0 на разрешённых позициях,
 /// большое отрицательное на будущих (запрещённых) — добавляется к score
 /// до softmax. Для авторегрессии декодера (char-LM).
-pub fn causal_mask(seq_len: usize) -> ArrayD<f32> {
+#[cfg(any(feature = "demo", test))]
+pub(crate) fn causal_mask(seq_len: usize) -> ArrayD<f32> {
     let mut mask = ArrayD::<f32>::zeros(IxDyn(&[seq_len, seq_len]));
     for q in 0..seq_len {
         for k in (q + 1)..seq_len {
@@ -104,7 +107,7 @@ impl DecoderLayer {
     }
 }
 
-pub struct TransformerCore {
+pub(crate) struct TransformerCore {
     enc_layers: Vec<EncoderLayer>,
     enc_norm: LayerNorm,
     dec_layers: Vec<DecoderLayer>,
@@ -112,7 +115,7 @@ pub struct TransformerCore {
 }
 
 impl TransformerCore {
-    pub fn new(cfg: &ModelConfig) -> Self {
+    pub(crate) fn new(cfg: &ModelConfig) -> Self {
         Self {
             enc_layers: (0..cfg.n_enc_layers)
                 .map(|_| EncoderLayer::new(cfg))
@@ -126,7 +129,7 @@ impl TransformerCore {
     }
 
     /// Кодирует вход `[B, src_len, d_model]` в память `[B, src_len, d_model]`.
-    pub fn encode(&self, src: &Tensor, src_mask: Option<&ArrayD<f32>>) -> Tensor {
+    pub(crate) fn encode(&self, src: &Tensor, src_mask: Option<&ArrayD<f32>>) -> Tensor {
         let mut x = src.clone();
         for layer in &self.enc_layers {
             x = layer.forward(&x, src_mask);
@@ -136,7 +139,7 @@ impl TransformerCore {
 
     /// Декодирует `[B, tgt_len, d_model]` с памятью энкодера в скрытое состояние.
     /// `self_mask` — causal для авторегрессии или None для параллельных запросов.
-    pub fn decode(
+    pub(crate) fn decode(
         &self,
         tgt: &Tensor,
         memory: &Tensor,
@@ -150,7 +153,7 @@ impl TransformerCore {
         self.dec_norm.forward(&x)
     }
 
-    pub fn parameters(&self) -> Vec<Tensor> {
+    pub(crate) fn parameters(&self) -> Vec<Tensor> {
         let mut p = Vec::new();
         for layer in &self.enc_layers {
             p.extend(layer.parameters());
