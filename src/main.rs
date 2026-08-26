@@ -20,47 +20,26 @@ use rand::rngs::StdRng;
 #[cfg(feature = "demo")]
 use rand::SeedableRng;
 use std::collections::HashMap;
-use transformer::batch_predict;
+// Бинарь ходит в библиотеку только через её публичный фасад: если чего-то в
+// корне нет, значит этого нет и у внешнего потребителя.
 #[cfg(feature = "demo")]
-use transformer::blackbox;
-use transformer::config::ModelConfig;
-#[cfg(feature = "demo")]
-use transformer::data::TextDataset;
-use transformer::data::{Normalizer, NumericDataset};
-use transformer::diagnostics;
-use transformer::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
-#[cfg(feature = "demo")]
-use transformer::generate::generate;
-#[cfg(feature = "demo")]
-use transformer::init::set_init_seed;
-use transformer::interpret::{self, InterpretOverrides, InterpretProfile, InterpretReport};
-use transformer::metrics::{evaluate, Metrics};
-use transformer::numeric_model::{
-    validate_numeric, KanConfig, ModelKind, NumericConfig, NumericModel,
+use transformer::{
+    blackbox, generate, run_blackbox_sweep, set_init_seed, train_text, TextDataset, TextModel,
+    TextTrainConfig, DEFAULT_DATA_SEED,
 };
-use transformer::predict;
-use transformer::schema::ModelSchema;
-use transformer::serialize::{calibration_sample, load_numeric_full, save_numeric};
-#[cfg(feature = "demo")]
-use transformer::split::DEFAULT_DATA_SEED;
-use transformer::split::{SplitPlan, DEFAULT_FINAL_INIT_SEED, DEFAULT_SPLIT_SEED};
-use transformer::sweep as sweep_core;
-use transformer::symbolic;
-#[cfg(feature = "demo")]
-use transformer::textmodel::TextModel;
-use transformer::tnum::{
-    infer_prepare_spec_from_path, parse_categorical, read_numeric_source, table_path_to_tnum,
-    Delimiter, PrepareSpec,
+use transformer::{
+    calibration_sample, evaluate, evaluate_on, evaluate_surrogate, export_predictions,
+    infer_prepare_spec_from_path, load_numeric_full, parse_categorical, predict_dataset,
+    read_numeric_source, recommended_epoch, run_sweep, run_training, save_numeric, sweep_cost,
+    symbolize, table_path_to_tnum, validate_numeric, validate_train, Dataset, Delimiter,
+    EvalSchedule, ExportSummary, FeatureSpec, InterpretOverrides, InterpretProfile,
+    InterpretReport, KanConfig, LrSchedule, Metrics, ModelConfig, ModelKind, ModelSchema,
+    Normalizer, NumericConfig, NumericDataset, NumericModel, Phase, PrepareSpec, SearchObjective,
+    SplitPlan, SweepAxes, SweepResult, SweepRow, TrainConfig, TrainedModel, TrainingHistory,
+    TrainingSetup, ValueEncoderConfig, ValueEncoderKind, DEFAULT_FINAL_INIT_SEED,
+    DEFAULT_SPLIT_SEED,
 };
-use transformer::train::{
-    evaluate_surrogate, predict_dataset, validate_train, LrSchedule, TrainConfig,
-};
-#[cfg(feature = "demo")]
-use transformer::train::{train_text, TextTrainConfig};
-use transformer::training::{
-    evaluate_on, recommended_epoch, run_training, Dataset, EvalSchedule, Phase, TrainedModel,
-    TrainingHistory, TrainingSetup,
-};
+use transformer::{diagnostics, interpret, predict};
 
 /// Разобранные аргументы: `--key value` во flags, остальное — позиционные.
 #[derive(Debug)]
@@ -396,7 +375,7 @@ fn run_kan_symbolic(
     let calibration = in_norm.transform(&train.inputs);
     // Свёртка z-score в коэффициенты: формулы и предсказания — в исходных
     // единицах данных, промежуточные узлы h остаются безразмерными.
-    let sym = symbolic::symbolize(kan, &calibration, 256).denormalize(in_norm, out_norm);
+    let sym = symbolize(kan, &calibration, 256).denormalize(in_norm, out_norm);
 
     println!("\n=== SYMBOLIC EXTRACTION (входы и выходы в исходных единицах данных) ===");
     print!(
@@ -649,7 +628,7 @@ fn print_metrics(title: &str, m: &Metrics, per: &[Metrics], schema: &ModelSchema
 
 /// Общий поток обучения для файла и встроенной демонстрационной задачи.
 ///
-/// Сам сценарий живёт в [`transformer::training`]: здесь остаются только
+/// Сам сценарий живёт в [`transformer::run_training`]: здесь остаются только
 /// печать и KAN-конвейер, который подключается хуком и потому применяется
 /// одинаково к модели разработки и к финальной.
 fn run_train_flow(
@@ -1117,7 +1096,7 @@ fn predict_form(
 }
 
 /// Отчёт об экспорте: сколько строк, что заменено и что добавлено.
-fn print_export_summary(output: &str, summary: &batch_predict::ExportSummary) {
+fn print_export_summary(output: &str, summary: &ExportSummary) {
     println!("Таблица с прогнозами записана в {output}");
     println!("  строк: {}", summary.rows);
     if summary.extrapolated_rows > 0 {
@@ -1163,7 +1142,7 @@ fn run_predict(rest: &[String]) {
     // Таблица и одна строка идут через один слой схемы и одно ядро прогноза.
     let row = match &form {
         PredictForm::Table { input, output } => {
-            let summary = batch_predict::export_predictions(input, output, schema, |inputs| {
+            let summary = export_predictions(input, output, schema, |inputs| {
                 predict::predict_rows(
                     &checkpoint.model,
                     &checkpoint.in_norm,
@@ -1446,11 +1425,11 @@ fn run_search(rest: &[String]) {
     warn_categorical_without_embedding(&axes.model_kinds, dataset.schema());
     announce_search(path, &axes);
     let never = std::sync::atomic::AtomicBool::new(false);
-    let result = sweep_core::run_sweep(
+    let result = run_sweep(
         &dataset,
         &prepared.search,
         &axes,
-        sweep_core::SweepObjective::default(),
+        SearchObjective::default(),
         &never,
         print_search_row,
     )
@@ -1471,18 +1450,18 @@ fn run_demo_search(rest: &[String]) {
     let axes = axes_from(&f);
     announce_search(name, &axes);
     let never = std::sync::atomic::AtomicBool::new(false);
-    let result = sweep_core::run_blackbox_sweep(name, &axes, &never, print_search_row)
-        .unwrap_or_else(|e| fail(&e));
+    let result =
+        run_blackbox_sweep(name, &axes, &never, print_search_row).unwrap_or_else(|e| fail(&e));
     print_search_ranking(&result);
 }
 
 /// Цена операции — до запуска: она понятнее, чем название набора осей.
-fn announce_search(source: &str, axes: &sweep_core::SweepAxes) {
-    let cost = sweep_core::sweep_cost(axes, 1).unwrap_or_else(|e| fail(&e));
+fn announce_search(source: &str, axes: &SweepAxes) {
+    let cost = sweep_cost(axes, 1).unwrap_or_else(|e| fail(&e));
     println!("Поиск {source}: {}\n", cost.describe());
 }
 
-fn print_search_row(row: &sweep_core::SweepRow) {
+fn print_search_row(row: &SweepRow) {
     println!(
         "  done [{}]: {} -> worst R²={:.5}, aggregate R²={:.5}±{:.5}",
         row.source.label(),
@@ -1494,7 +1473,7 @@ fn print_search_row(row: &sweep_core::SweepRow) {
 }
 
 /// Ранжирование: первая строка — рекомендация, по worst-output R² по умолчанию.
-fn print_search_ranking(result: &sweep_core::SweepResult) {
+fn print_search_ranking(result: &SweepResult) {
     let source = result
         .rows
         .first()
@@ -1516,7 +1495,7 @@ fn print_search_ranking(result: &sweep_core::SweepResult) {
 }
 
 /// Оси сетки из флагов: общие для поиска на своих данных и на чёрном ящике.
-fn axes_from(f: &Flags) -> sweep_core::SweepAxes {
+fn axes_from(f: &Flags) -> SweepAxes {
     let seeds = csv_u64(f, "seeds", "0");
     let d_models = csv_usize(f, "d-models", "32");
     let layers = csv_usize(f, "layers-list", "2");
@@ -1559,7 +1538,7 @@ fn axes_from(f: &Flags) -> sweep_core::SweepAxes {
         })
         .collect();
 
-    sweep_core::SweepAxes {
+    SweepAxes {
         model_kinds,
         seeds,
         d_models,
