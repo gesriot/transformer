@@ -24,8 +24,8 @@ use std::collections::HashMap;
 // корне нет, значит этого нет и у внешнего потребителя.
 #[cfg(feature = "demo")]
 use transformer::{
-    blackbox, generate, run_blackbox_sweep, set_init_seed, train_text, TextDataset, TextModel,
-    TextTrainConfig, DEFAULT_DATA_SEED,
+    blackbox_by_name, generate, run_blackbox_sweep, set_init_seed, train_text, TextDataset,
+    TextModel, TextTrainConfig, DEFAULT_DATA_SEED,
 };
 use transformer::{
     calibration_sample, evaluate, evaluate_on, evaluate_surrogate, export_predictions,
@@ -821,7 +821,7 @@ fn require_data_file(path: &str) {
         return;
     }
     #[cfg(feature = "demo")]
-    if blackbox::by_name(path).is_some() {
+    if blackbox_by_name(path).is_some() {
         fail(&format!(
             "«{path}» — встроенная задача, а не файл: используйте transformer demo train {path} \
              (или demo search {path})"
@@ -852,7 +852,7 @@ fn run_demo_train(rest: &[String]) {
     }
     let name = f.pos(0).unwrap_or("sum");
 
-    let bb = match blackbox::by_name(name) {
+    let bb = match blackbox_by_name(name) {
         Some(bb) => bb,
         None => {
             eprintln!("Неизвестный чёрный ящик: {name}");
@@ -1445,7 +1445,7 @@ fn run_demo_search(rest: &[String]) {
     let name = f
         .pos(0)
         .unwrap_or_else(|| fail("укажите чёрный ящик: demo search <blackbox>"));
-    blackbox::by_name(name).unwrap_or_else(|| fail(&format!("неизвестный чёрный ящик: {name}")));
+    blackbox_by_name(name).unwrap_or_else(|| fail(&format!("неизвестный чёрный ящик: {name}")));
 
     let axes = axes_from(&f);
     announce_search(name, &axes);

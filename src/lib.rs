@@ -2,8 +2,9 @@
 //! конфигурации, интерпретация KAN и прогноз.
 //!
 //! Публичный API — корневые `pub use` в конце файла плюс модули `diagnostics`,
-//! `interpret` и `predict`, оставленные пространствами имён. Всё остальное —
-//! устройство расчёта, и наружу не обещано.
+//! `interpret` и `predict`, оставленные пространствами имён. При включённой
+//! фиче `gui` публичен также модуль `gui`. Всё остальное — устройство расчёта,
+//! и наружу не обещано.
 
 pub mod batch_predict;
 // Встроенные ящики — демонстрация, но ими же порождаются данные для тестов
@@ -104,6 +105,8 @@ pub use symbolic::{symbolize, SymbolicKan, SymbolicLayer};
 pub use interpret::{InterpretOverrides, InterpretProfile, InterpretReport};
 
 // Демонстрации.
+#[cfg(feature = "demo")]
+pub use blackbox::{by_name as blackbox_by_name, BlackBox};
 #[cfg(feature = "demo")]
 pub use data::{TextDataset, Vocab};
 #[cfg(feature = "demo")]
