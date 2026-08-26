@@ -1,5 +1,7 @@
 # Transformer / KAN
 
+[![CI](https://github.com/gesriot/transformer/actions/workflows/ci.yml/badge.svg)](https://github.com/gesriot/transformer/actions/workflows/ci.yml)
+
 Локальное Rust-приложение и CLI для численной регрессии, сравнения моделей и
 интерпретации зависимостей. Оно обучает surrogate-модель по таблице
 `x0…xN → y0…yM` и работает в GUI или headless CLI.
@@ -90,6 +92,9 @@ cargo test --no-default-features --features demo
 cargo build --release
 ./scripts/package-macos.sh
 ```
+
+Те же четыре комбинации гоняет CI (`.github/workflows/ci.yml`): headless —
+на Linux, сборки с `gui` — на macOS, куда приложение и пакуется.
 
 Упаковщик использует версию из `Cargo.toml`, создаёт `dist/Transformer.app`,
 `dist/Transformer.app.zip` и `dist/Transformer.dmg`, затем проверяет DMG.

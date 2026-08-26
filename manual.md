@@ -521,7 +521,8 @@ cargo build --release
 ```
 
 Комбинации фич проверяются отдельно — иначе `gui` незаметно обрастает
-зависимостью от `demo`:
+зависимостью от `demo`. Это же делает CI (`.github/workflows/ci.yml`):
+headless-комбинации на Linux, сборки с `gui` — на macOS.
 
 ```bash
 cargo test --no-default-features

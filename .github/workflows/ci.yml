@@ -1,0 +1,94 @@
+# Матрица из четырёх наборов фич: `gui` и `demo` независимы, и каждая
+# комбинация должна собираться, проходить clippy без предупреждений и тесты.
+#
+# Сборки с `gui` идут на macOS: приложение туда и пакуется, а на Linux для
+# eframe/rfd пришлось бы тянуть системные GTK/X11-пакеты ради того же кода.
+# Headless-комбинации проверяются на Linux — это дешевле и ближе к серверному
+# запуску CLI.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  headless:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: без фич
+            id: nofeatures
+            features: --no-default-features
+          - name: demo
+            id: demo
+            features: --no-default-features --features demo
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          cargo --version && cargo clippy --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.id }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ matrix.id }}-
+      - name: fmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
+      - name: test
+        run: cargo test ${{ matrix.features }}
+      - name: doc
+        run: cargo doc --no-deps ${{ matrix.features }}
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  desktop:
+    name: ${{ matrix.name }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gui без demo
+            id: gui
+            features: --no-default-features --features gui
+          - name: gui + demo (по умолчанию)
+            id: default
+            features: ""
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          cargo --version && cargo clippy --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ matrix.id }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ matrix.id }}-
+      - name: clippy
+        run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
+      - name: test
+        run: cargo test ${{ matrix.features }}
+      - name: release build
+        run: cargo build --release ${{ matrix.features }}
