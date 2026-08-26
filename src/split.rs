@@ -29,6 +29,7 @@ pub const DEFAULT_TEST_FRAC: f32 = 0.15;
 /// План разбиения. Ровно два варианта: «ручная настройка» в интерфейсе — это
 /// другие числа в `Holdout`, а не отдельный доменный случай.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum SplitPlan {
     Holdout {
         train_frac: f32,
@@ -337,6 +338,7 @@ impl HoldoutTest {
 /// Происхождение единственного финального замера. `final_init_seed` фиксируется
 /// ДО открытия test: выбор seed по результату — та же форма подбора.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct FinalOrigin {
     pub final_init_seed: u64,
     pub plan: SplitPlan,
@@ -345,6 +347,7 @@ pub struct FinalOrigin {
 
 /// Результат единственного замера на test.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FinalEval {
     pub metrics: Metrics,
     pub per_output: Vec<Metrics>,

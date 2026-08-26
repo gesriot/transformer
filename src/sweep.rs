@@ -183,6 +183,7 @@ impl Default for SweepAxes {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct SweepRow {
     pub label: String,
     pub choice: SweepChoice,
@@ -222,6 +223,7 @@ pub struct SweepChoice {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct SweepResult {
     pub rows: Vec<SweepRow>,
     pub total_configs: usize,

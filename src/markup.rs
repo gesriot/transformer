@@ -20,6 +20,7 @@ const MAX_DISTINCT: usize = 256;
 
 /// Что делать с сообщением диагностики.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Severity {
     /// Обучение невозможно, пока это не исправлено.
     Blocking,
@@ -493,6 +494,7 @@ pub struct LinearDependency {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct RoleReport {
     /// Индексы числовых входов, попавших в анализ.
     pub numeric_inputs: Vec<usize>,

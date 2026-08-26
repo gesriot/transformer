@@ -158,6 +158,7 @@ pub fn resolve(
 /// Печатать их — дело вызывающего: CLI выводит строки, GUI рисует. Иначе один
 /// и тот же конвейер расходился бы между поверхностями в мелочах.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct InterpretReport {
     pub profile: InterpretProfile,
     /// Активные рёбра по слоям после прунинга: (активных, всего).

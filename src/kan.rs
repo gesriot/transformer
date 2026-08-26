@@ -310,12 +310,14 @@ impl KanLayer {
 
 /// Отчёт прунинга: (активных, всего) рёбер по слоям.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct PruneReport {
     pub per_layer: Vec<(usize, usize)>,
 }
 
 /// Отчёт структурного сжатия: скрытые узлы и параметры до/после.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CompactReport {
     pub nodes_before: usize,
     pub nodes_after: usize,

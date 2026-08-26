@@ -528,6 +528,9 @@ fn print_config(nc: &NumericConfig, tcfg: &TrainConfig) {
             "Модель: kan (width={} layers={} grid={})",
             nc.kan.width, nc.kan.layers, nc.kan.grid
         ),
+        // Тип модели может пополниться в библиотеке: печатаем то, что знаем,
+        // вместо того чтобы не собираться или молчать.
+        other => println!("Модель: {other:?} (гиперпараметры не разобраны)"),
     }
     let sched = match tcfg.schedule {
         LrSchedule::Constant => "constant".to_string(),
@@ -555,12 +558,15 @@ fn categorical_embedding_warning(kinds: &[ModelKind], schema: &ModelSchema) -> O
     if categorical.is_empty() {
         return None;
     }
-    let mut risky = Vec::new();
+    let mut risky: Vec<String> = Vec::new();
     for kind in kinds {
         let name = match kind {
             ModelKind::Transformer => continue,
-            ModelKind::Mlp => "mlp",
-            ModelKind::Kan => "kan",
+            ModelKind::Mlp => "mlp".to_string(),
+            ModelKind::Kan => "kan".to_string(),
+            // Embedding категорий обещан только transformer, поэтому новая
+            // модель попадает в предупреждение, а не тихо мимо него.
+            other => format!("{other:?}").to_lowercase(),
         };
         if !risky.contains(&name) {
             risky.push(name);

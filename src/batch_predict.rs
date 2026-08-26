@@ -33,6 +33,7 @@ impl SheetCell {
 
 /// Что получилось при экспорте — для отчёта пользователю.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct ExportSummary {
     pub rows: usize,
     pub extrapolated_rows: usize,

@@ -68,6 +68,7 @@ const SURROGATE_SECTIONS: &[&str] = &[
 const TEXT_SECTIONS: &[&str] = &["config", "vocab", "params"];
 
 /// Полное содержимое численного checkpoint-а.
+#[non_exhaustive]
 pub struct NumericCheckpoint {
     pub model: NumericModel,
     pub in_norm: Normalizer,

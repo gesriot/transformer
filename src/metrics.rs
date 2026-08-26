@@ -53,6 +53,7 @@ pub fn evaluate(pred: &Array2<f32>, target: &Array2<f32>) -> Metrics {
 /// Откуда взята метрика. Без этого поля число «R² = 0.98» неинтерпретируемо:
 /// validation и test означают разное, а по validation ещё и выбирают конфиг.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EvalSource {
     Validation,
     Cv { k: usize },

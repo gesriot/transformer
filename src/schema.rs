@@ -42,6 +42,7 @@ impl ColumnRole {
 /// прогноз и формулы вынуждены говорить кодами, а пользователь — помнить, что
 /// «2» означало `sand`. Порядок подписей задаёт коды `0..levels.len()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ColumnType {
     Numeric,
     Categorical { levels: Vec<String> },

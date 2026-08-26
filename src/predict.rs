@@ -24,6 +24,7 @@ pub struct RowWarning {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Predictions {
     pub outputs: Array2<f32>,
     /// Предупреждения об экстраполяции — по строкам, где она есть.

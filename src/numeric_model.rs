@@ -69,6 +69,7 @@ pub fn validate_numeric(nc: &NumericConfig) -> Result<(), String> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ModelKind {
     Transformer,
     Mlp,

@@ -158,6 +158,7 @@ pub struct EpochPoint {
 
 /// История одного обучения.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct TrainingHistory {
     pub points: Vec<EpochPoint>,
     /// Чем являются `val`-метрики: validation у holdout, CV у K-fold.
@@ -269,6 +270,7 @@ pub struct TrainedModel {
 }
 
 /// Результат полного сценария.
+#[non_exhaustive]
 pub struct TrainingOutcome {
     pub development: TrainedModel,
     /// Финальная модель: `None`, если фазу не запрашивали либо запуск отменён.
@@ -280,6 +282,7 @@ pub struct TrainingOutcome {
 
 /// Результат финального refit после уже выполненного выбора конфигурации.
 /// `None` означает отмену до открытия test.
+#[non_exhaustive]
 pub struct RefitOutcome {
     pub model: Option<TrainedModel>,
     pub eval: Option<FinalEval>,
@@ -292,6 +295,7 @@ pub struct RefitOutcome {
 /// По умолчанию worst-output R²: aggregate умеет скрыть полностью проваленный
 /// выход, а у задачи с несколькими выходами это ровно то, что важно заметить.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SearchObjective {
     #[default]
     WorstOutputR2,

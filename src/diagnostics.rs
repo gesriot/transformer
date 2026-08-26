@@ -148,6 +148,7 @@ pub struct SensitivityStats {
 
 /// Чувствительность модели и — если процесс вызываем — исходной функции.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct SensitivityReport {
     /// Сколько пар реальных строк удалось использовать.
     pub pairs: usize,
