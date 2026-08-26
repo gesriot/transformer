@@ -32,6 +32,15 @@ pub struct Predictions {
 }
 
 impl Predictions {
+    /// Собрать результат внешнего predictor-а.
+    ///
+    /// Конструктор нужен, потому что [`Predictions`] используется как
+    /// возвращаемое значение callback-а в `export_predictions`, а
+    /// `#[non_exhaustive]` запрещает внешнему крейту struct literal.
+    pub fn new(outputs: Array2<f32>, warnings: Vec<RowWarning>) -> Self {
+        Self { outputs, warnings }
+    }
+
     pub fn rows(&self) -> usize {
         self.outputs.nrows()
     }
@@ -109,7 +118,7 @@ pub fn predict_rows(
             (!details.is_empty()).then_some(RowWarning { row, details })
         })
         .collect();
-    Ok(Predictions { outputs, warnings })
+    Ok(Predictions::new(outputs, warnings))
 }
 
 /// Разобрать одну строку значений по схеме.
