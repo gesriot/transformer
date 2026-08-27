@@ -55,10 +55,18 @@ impl RunStamp {
 }
 
 /// Результат фазы разработки: то, по чему принимают решения.
+///
+/// У K-fold среднего мало: одинаковое среднее при разном разбросе между folds
+/// означает разную надёжность вывода, поэтому разброс едет рядом.
+///
+/// Атрибута `non_exhaustive` здесь нет намеренно: структуру создаёт тот, кто
+/// записывает проверку, а не только тот, кто её читает.
 #[derive(Clone, Debug)]
 pub struct CheckEval {
     pub metrics: Metrics,
     pub per_output: Vec<Metrics>,
+    /// Разброс R² между folds; 0 у holdout, где fold один.
+    pub r2_std_folds: f32,
 }
 
 /// Проверенный кандидат: отпечаток и то, что показал validation.
@@ -249,6 +257,7 @@ mod tests {
             eval: CheckEval {
                 metrics: metrics(),
                 per_output: vec![metrics()],
+                r2_std_folds: 0.0,
             },
         }
     }

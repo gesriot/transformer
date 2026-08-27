@@ -139,6 +139,36 @@ pub(crate) struct KanSymbolicInfo {
     pub weak_edges: Vec<KanWeakEdge>,
 }
 
+/// Происхождение активной модели.
+///
+/// Разница не косметическая: отладочная модель обучена только на train, и
+/// сохранять её как результат работы нельзя без явной подписи.
+#[derive(Clone, Debug)]
+pub(crate) enum ModelOrigin {
+    /// Проверка кандидата: обучена на train, доступные данные использованы не
+    /// полностью.
+    Development(Box<RunStamp>),
+    /// Финальная: train + validation, test открыт ровно один раз.
+    Final(Box<RunStamp>),
+    /// Загружена из checkpoint: происхождение известно только из файла.
+    Checkpoint,
+}
+
+impl ModelOrigin {
+    /// Подпись для интерфейса и для кнопки сохранения.
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            ModelOrigin::Development(_) => "отладочная (обучена на train, без validation)",
+            ModelOrigin::Final(_) => "финальная (train + validation)",
+            ModelOrigin::Checkpoint => "загружена из файла",
+        }
+    }
+
+    pub(crate) fn is_final(&self) -> bool {
+        matches!(self, ModelOrigin::Final(_))
+    }
+}
+
 /// Происхождение итоговой validation-метрики development-модели.
 #[derive(Clone, Copy)]
 pub(crate) struct ValidationOrigin {
@@ -153,15 +183,21 @@ pub(crate) enum Command {
     OpenDataset {
         origin: DatasetOrigin,
     },
-    TrainNumeric {
+    /// Проверить кандидата: фаза разработки и конвейер интерпретации, test не
+    /// трогаем. У K-fold проверяются все folds, поэтому проверка означает
+    /// CV-оценку, а не модель одного произвольного fold.
+    CheckCandidate {
         data: PreparedData,
-        /// Что именно обучаем: разбиение, конфигурация, параметры обучения и
-        /// профиль интерпретации приходят одним отпечатком. Отдельными полями
-        /// они могли бы разойтись с тем, чем результат будет подписан.
-        stamp: RunStamp,
-        /// Переобучить выбранную конфигурацию на train+validation и один раз
-        /// открыть test. Запрашивается только для финального обучения.
-        final_phase: bool,
+        stamp: Box<RunStamp>,
+    },
+    /// Зафиксировать проверенного кандидата: refit на train+validation и
+    /// единственный замер на test.
+    ///
+    /// Отпечаток приходит из проверки как есть, а не собирается заново по
+    /// форме: иначе «зафиксировать» могло бы обучить не то, что проверяли.
+    FinalizeCandidate {
+        data: PreparedData,
+        stamp: Box<RunStamp>,
     },
     LoadModel(String),
     SaveModel(String),
@@ -185,7 +221,8 @@ pub(crate) enum Command {
     Search {
         data: PreparedData,
         split: SplitPlan,
-        axes: SweepAxes,
+        /// В боксе: оси перебора — самый крупный вариант команды.
+        axes: Box<SweepAxes>,
         objective: SweepObjective,
     },
     #[cfg(feature = "demo")]
@@ -245,6 +282,8 @@ pub(crate) enum Event {
         /// Поколоночные validation-метрики development-модели.
         per_output: Option<Vec<Metrics>>,
         validation_origin: Option<ValidationOrigin>,
+        /// Разброс R² между folds у CV-проверки; `None` у holdout и финала.
+        r2_std_folds: Option<f32>,
         /// Единственный замер на test: есть только у финального обучения.
         final_eval: Option<FinalEval>,
         cancelled: bool,
@@ -270,6 +309,10 @@ pub(crate) enum Event {
         /// Нужен UI, чтобы предупредить о категориях без embedding.
         kind: ModelKind,
         source: String,
+        /// Чем является активная модель: отладочной, финальной или загруженной.
+        /// Без этого «Сохранить модель» одинаково выглядит для модели, обученной
+        /// на части данных, и для финальной.
+        model_origin: ModelOrigin,
         parameter_count: usize,
         kan: Option<KanModelInfo>,
         /// После обучения `TrainDone` уже установил метрики этой модели. При

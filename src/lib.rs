@@ -105,10 +105,11 @@ pub use split::{
     DEFAULT_VAL_FRAC,
 };
 pub use train::{evaluate_surrogate, predict_dataset, validate_train, LrSchedule, TrainConfig};
+pub use training::CheckOutcome;
 pub use training::{
-    evaluate_on, recommended_epoch, refit, run_training, ConfigureModel, Dataset, EarlyStopping,
-    EpochPoint, EvalSchedule, Phase, PostTrain, RefitOutcome, TrainedModel, TrainingHistory,
-    TrainingOutcome, TrainingSetup,
+    check_candidate, evaluate_on, recommended_epoch, refit, run_training, ConfigureModel, Dataset,
+    EarlyStopping, EpochPoint, EvalSchedule, Phase, PostCheck, PostTrain, RefitOutcome,
+    TrainedModel, TrainingHistory, TrainingOutcome, TrainingSetup,
 };
 
 // Жизненный цикл: что проверено и не потрачен ли test на этих данных.

@@ -252,6 +252,11 @@ pub type PostTrain<'a> =
 /// [`PostTrain`]: регуляризатор должен участвовать в обучении, а прунинг — нет.
 pub type ConfigureModel<'a> = &'a mut dyn FnMut(Phase, &NumericModel);
 
+/// Тот же хук для проверки кандидата: фаза здесь всегда «разработка», зато
+/// важен номер fold — конвейер применяется к каждому из них.
+pub type PostCheck<'a> =
+    &'a mut dyn FnMut(usize, &mut TrainedModel, &NumericDataset, Option<&NumericDataset>);
+
 /// Фаза обучения — нужна хукам, которые ведут себя в них по-разному.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -685,6 +690,112 @@ pub(crate) fn train_candidate(
     })
 }
 
+/// Результат проверки кандидата: оценка и — у holdout — сама модель.
+#[non_exhaustive]
+pub struct CheckOutcome {
+    /// Средние метрики по всем folds (у holdout — просто validation).
+    pub metrics: Metrics,
+    pub per_output: Vec<Metrics>,
+    /// Разброс R² между folds; 0 у holdout, где fold один.
+    pub r2_std_folds: f32,
+    /// Чем является оценка: validation у holdout, CV у K-fold.
+    pub source: EvalSource,
+    /// Модель фазы разработки. У K-fold её нет: моделей столько же, сколько
+    /// folds, и выдавать одну из них за общую оценку нельзя.
+    pub model: Option<TrainedModel>,
+    /// Проверка прервана: оценки нет, решение принимать не по чему.
+    pub cancelled: bool,
+}
+
+/// Проверить кандидата: обучить его на каждом fold и снять оценку, не трогая
+/// test.
+///
+/// Единственный путь «проверки» для всех режимов интерфейса. У holdout это одно
+/// обучение на train с метриками на validation; у K-fold — обучение на каждом
+/// fold и свёртка, поэтому «Проверить» при K-fold означает CV-оценку, а не
+/// произвольную модель одного fold.
+///
+/// `post_train` вызывается ДО оценки каждого fold: конвейер интерпретации
+/// меняет саму модель, и мерить нужно ту модель, которая получится в итоге.
+#[allow(clippy::too_many_arguments)]
+pub fn check_candidate(
+    dataset: &Dataset,
+    split: SplitPlan,
+    setup: &TrainingSetup,
+    cancel: &AtomicBool,
+    on_point: &mut dyn FnMut(usize, &EpochPoint),
+    configure_model: &mut dyn FnMut(&NumericModel),
+    post_train: PostCheck<'_>,
+) -> Result<CheckOutcome, String> {
+    setup.validate()?;
+    let prepared = split.prepare(dataset.data())?;
+    let pool = prepared.search;
+    let folds = pool.n_folds();
+    let init_seed = setup.train.seed;
+
+    let mut runs: Vec<RunEval> = Vec::with_capacity(folds);
+    let mut model = None;
+    for fold in 0..folds {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(cancelled_check(pool.source()));
+        }
+        let mut trained = train_candidate(
+            dataset,
+            &pool,
+            fold,
+            setup,
+            init_seed,
+            cancel,
+            &mut |point| on_point(fold, point),
+            configure_model,
+        )?;
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(cancelled_check(pool.source()));
+        }
+        let (train, val) = pool.fold(fold)?;
+        post_train(fold, &mut trained, &train, Some(&val));
+        let (metrics, per_output) = evaluate_on(&trained, &val);
+        runs.push(RunEval {
+            metrics,
+            per_output,
+            origin: pool.run_origin(fold, init_seed),
+        });
+        // Модель отдаём только когда fold один: тогда она и есть оценка.
+        if folds == 1 {
+            model = Some(trained);
+        }
+    }
+
+    let eval = aggregate_runs(&runs, &[init_seed], pool.source())?;
+    Ok(CheckOutcome {
+        metrics: eval.mean,
+        per_output: eval.per_output_mean,
+        r2_std_folds: eval.r2_std_folds,
+        source: eval.origin.source,
+        model,
+        cancelled: false,
+    })
+}
+
+/// Отменённая проверка: метрик нет, и подставлять нули нельзя — по ним начали
+/// бы принимать решения.
+fn cancelled_check(source: EvalSource) -> CheckOutcome {
+    let empty = Metrics {
+        rmse: f32::NAN,
+        mae: f32::NAN,
+        rel_error: f32::NAN,
+        r2: f32::NAN,
+    };
+    CheckOutcome {
+        metrics: empty,
+        per_output: Vec::new(),
+        r2_std_folds: f32::NAN,
+        source,
+        model: None,
+        cancelled: true,
+    }
+}
+
 /// Полный сценарий: разбиение, фаза разработки и — по запросу — финальное
 /// переобучение с единственным замером test.
 ///
@@ -969,6 +1080,123 @@ mod tests {
         let (epoch, reason) = recommended_epoch(points, 0.99, 0.02, 0.80).unwrap();
         assert_eq!(epoch, 5);
         assert!(reason.contains("плато"), "{reason}");
+    }
+
+    /// Holdout: одна модель — она же и оценка, поэтому её отдают наружу.
+    /// K-fold: моделей столько же, сколько folds, и ни одна не представляет
+    /// оценку — наружу идёт только свёртка по всем folds.
+    #[test]
+    fn check_covers_every_fold_and_returns_a_model_only_for_holdout() {
+        let data = dataset(96);
+        let s = setup(2);
+        let never = AtomicBool::new(false);
+
+        let mut folds_seen = Vec::new();
+        let holdout = check_candidate(
+            &data,
+            SplitPlan::default(),
+            &s,
+            &never,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |fold, _, _, _| folds_seen.push(fold),
+        )
+        .unwrap();
+        assert_eq!(folds_seen, vec![0]);
+        assert_eq!(holdout.source, EvalSource::Validation);
+        assert_eq!(holdout.r2_std_folds, 0.0, "у holdout разброса по folds нет");
+        assert!(
+            holdout.model.is_some(),
+            "у holdout модель — это и есть оценка"
+        );
+        assert!(holdout.metrics.r2.is_finite());
+        assert!(!holdout.cancelled);
+
+        let mut folds_seen = Vec::new();
+        let kfold = check_candidate(
+            &data,
+            SplitPlan::KFold {
+                k: 3,
+                folds_seed: 1,
+                test_frac: 0.2,
+                test_seed: 1,
+            },
+            &s,
+            &never,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |fold, _, _, _| folds_seen.push(fold),
+        )
+        .unwrap();
+        assert_eq!(folds_seen, vec![0, 1, 2], "конвейер идёт по каждому fold");
+        assert_eq!(kfold.source, EvalSource::Cv { k: 3 });
+        assert!(kfold.model.is_none(), "ни один fold не представляет CV");
+        assert!(kfold.r2_std_folds.is_finite());
+    }
+
+    /// Конвейер интерпретации меняет саму модель, поэтому метрики снимаются
+    /// ПОСЛЕ него: иначе проверка описывала бы не ту модель, которая поедет
+    /// дальше.
+    #[test]
+    fn check_evaluates_the_model_the_pipeline_produced() {
+        let data = dataset(64);
+        let s = setup(2);
+        let never = AtomicBool::new(false);
+
+        let honest = check_candidate(
+            &data,
+            SplitPlan::default(),
+            &s,
+            &never,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |_, _, _, _| {},
+        )
+        .unwrap();
+
+        // Хук портит модель: обнуляет её выход. Если бы оценка снималась до
+        // хука, метрики совпали бы с честными.
+        let broken = check_candidate(
+            &data,
+            SplitPlan::default(),
+            &s,
+            &never,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |_, trained, _, _| {
+                for p in trained.model.parameters() {
+                    p.update_data(|d, _| d.fill(0.0));
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(
+            broken.metrics.r2 < honest.metrics.r2,
+            "оценка обязана относиться к модели после конвейера: {} vs {}",
+            broken.metrics.r2,
+            honest.metrics.r2
+        );
+    }
+
+    /// Отмена не даёт оценки: подставленные нули выглядели бы как результат.
+    #[test]
+    fn cancelled_check_reports_no_usable_evaluation() {
+        let data = dataset(48);
+        let cancelled = AtomicBool::new(true);
+        let outcome = check_candidate(
+            &data,
+            SplitPlan::default(),
+            &setup(2),
+            &cancelled,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |_, _, _, _| {},
+        )
+        .unwrap();
+        assert!(outcome.cancelled);
+        assert!(outcome.model.is_none());
+        assert!(outcome.metrics.r2.is_nan());
     }
 
     #[test]

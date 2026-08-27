@@ -1,6 +1,7 @@
 //! Экран модели: кривые рёбер KAN, формулы и диагностика.
 
 use super::messages::Command;
+use super::messages::ModelOrigin;
 use super::session::{split_plan_label, App, KAN_CURVE_SAMPLES};
 use crate::metrics::Metrics;
 use crate::numeric_model::ModelKind;
@@ -15,6 +16,8 @@ pub(super) struct ModelInfo {
     pub(super) schema: ModelSchema,
     pub(super) kind: ModelKind,
     pub(super) source: String,
+    /// Чем является активная модель: отладочной, финальной или загруженной.
+    pub(super) origin: ModelOrigin,
     pub(super) parameter_count: usize,
 }
 
@@ -94,6 +97,22 @@ impl App {
             return;
         };
         ui.label(format!("Источник: {}", info.source));
+        // Происхождение самой модели, а не данных: по нему видно, на чём она
+        // обучена и что означают показанные ниже метрики.
+        ui.label(format!("Модель: {}", info.origin.label()));
+        if let ModelOrigin::Development(stamp) | ModelOrigin::Final(stamp) = &info.origin {
+            ui.label(format!(
+                "Протокол: {}; конфигурация проверена на этих данных",
+                split_plan_label(stamp.split)
+            ));
+        }
+        if !info.origin.is_final() {
+            ui.colored_label(
+                egui::Color32::from_rgb(200, 120, 0),
+                "Доступные данные использованы не полностью: validation осталась вне обучения. \
+                 Для результата работы зафиксируйте кандидата и обучите финально.",
+            );
+        }
         ui.label(format!("Параметров: {}", info.parameter_count));
         ui.label(format!("Входы: {}", info.schema.input_names().join(", ")));
         ui.label(format!("Выходы: {}", info.schema.output_names().join(", ")));
@@ -121,6 +140,11 @@ impl App {
                     split_plan_label(origin.plan),
                     origin.init_seed
                 ));
+            }
+            // У CV одного среднего мало: одинаковое среднее при разном разбросе
+            // между folds означает разную надёжность вывода.
+            if let Some(std) = self.r2_std_folds {
+                ui.label(format!("Разброс R² между folds: ±{std:.5}"));
             }
         }
         if let Some(final_eval) = &self.final_eval {

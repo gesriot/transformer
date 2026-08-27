@@ -7,7 +7,7 @@
 
 use super::messages::{
     Command, DatasetOrigin, DiagnosticsResult, Event, KanModelInfo, KanSymbolicInfo, KanWeakEdge,
-    PreparedData, ValidationOrigin,
+    ModelOrigin, PreparedData, ValidationOrigin,
 };
 use crate::batch_predict::{export_predictions, ExportSummary};
 #[cfg(any(feature = "demo", test))]
@@ -23,7 +23,9 @@ use crate::generate::generate;
 use crate::gui::messages::InterpretReports;
 use crate::init::set_init_seed;
 use crate::interpret::{self, InterpretProfile, InterpretReport};
-use crate::lifecycle::RunStamp;
+use crate::lifecycle::{
+    CheckEval, CheckedRun, FinalizeRefusal, Lifecycle, RunStamp, TestDisclosure,
+};
 use crate::markup::TableProfile;
 use crate::metrics::evaluate;
 use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
@@ -32,7 +34,7 @@ use crate::schema::ModelSchema;
 use crate::serialize::{calibration_sample, load_numeric_full, save_numeric};
 #[cfg(any(feature = "demo", test))]
 use crate::split::DEFAULT_DATA_SEED;
-use crate::split::{SplitPlan, DEFAULT_FINAL_INIT_SEED};
+use crate::split::{FinalEval, SplitPlan, DEFAULT_FINAL_INIT_SEED};
 use crate::sweep::{self, SweepAxes, SweepObjective};
 use crate::symbolic;
 use crate::table::{Delimiter, Table};
@@ -45,7 +47,7 @@ use crate::train::{evaluate_surrogate, predict_dataset, validate_train};
 #[cfg(feature = "demo")]
 use crate::train::{train_text_cb, TextTrainConfig};
 use crate::training::{
-    evaluate_on, refit, run_training, Dataset, Phase, TrainedModel, TrainingSetup,
+    check_candidate, refit, Dataset, EpochPoint, Phase, TrainedModel, TrainingSetup,
 };
 use eframe::egui;
 use ndarray::Array2;
@@ -159,36 +161,96 @@ fn worker_loop(
     let _ = evt_tx.send(Event::Status("worker запущен".to_string()));
     ctx.request_repaint();
     let mut current: Option<Loaded> = None;
+    // Собственный учёт worker-а: безопасность не должна зависеть только от
+    // того, включена ли кнопка в интерфейсе.
+    let mut lifecycle = Lifecycle::default();
     #[cfg(feature = "demo")]
     let mut current_text: Option<LoadedText> = None;
 
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
-            Command::TrainNumeric {
-                data,
-                stamp,
-                final_phase,
-            } => {
+            Command::CheckCandidate { data, stamp } => {
                 let origin = data.origin.clone();
-                match train_numeric(&data, &stamp, final_phase, &evt_tx, &ctx, &cancel) {
-                    Ok(Some(loaded)) => {
-                        let _ = evt_tx.send(Event::ModelReady {
-                            schema: loaded.schema.clone(),
-                            kind: loaded.nc.kind,
-                            source: source_desc(&origin),
-                            parameter_count: loaded.model.parameter_count(),
-                            kan: kan_model_info(
-                                &loaded.model,
-                                loaded.diag.is_some() || loaded.calibration.is_some(),
-                            ),
-                            keep_evaluation: true,
-                        });
-                        current = Some(loaded);
+                match train_numeric(&data, &stamp, RunKind::Check, &evt_tx, &ctx, &cancel) {
+                    Ok(outcome) => {
+                        if let Some(eval) = outcome.check {
+                            lifecycle.record_check(CheckedRun {
+                                stamp: (*stamp).clone(),
+                                eval,
+                            });
+                        }
+                        if let Some(loaded) = outcome.loaded {
+                            let _ = evt_tx.send(model_ready(
+                                &loaded,
+                                &origin,
+                                ModelOrigin::Development(stamp.clone()),
+                            ));
+                            current = Some(loaded);
+                        }
                         ctx.request_repaint();
                     }
-                    Ok(None) => {} // отменено — текущую модель не трогаем
                     Err(e) => {
                         let _ = evt_tx.send(Event::Error(e));
+                        ctx.request_repaint();
+                    }
+                }
+            }
+            Command::FinalizeCandidate { data, stamp } => {
+                // Вторая проверка того же правила: кнопка может быть включена
+                // по устаревшему состоянию, а test тратится здесь.
+                match lifecycle.can_finalize(&stamp) {
+                    Ok(()) => {
+                        let origin = data.origin.clone();
+                        match train_numeric(
+                            &data,
+                            &stamp,
+                            RunKind::Finalize,
+                            &evt_tx,
+                            &ctx,
+                            &cancel,
+                        ) {
+                            Ok(outcome) => {
+                                if let Some(eval) = outcome.final_eval {
+                                    lifecycle.record_disclosure(TestDisclosure {
+                                        stamp: (*stamp).clone(),
+                                        eval,
+                                    });
+                                }
+                                if let Some(loaded) = outcome.loaded {
+                                    let _ = evt_tx.send(model_ready(
+                                        &loaded,
+                                        &origin,
+                                        ModelOrigin::Final(stamp.clone()),
+                                    ));
+                                    current = Some(loaded);
+                                }
+                                ctx.request_repaint();
+                            }
+                            Err(e) => {
+                                let _ = evt_tx.send(Event::Error(e));
+                                ctx.request_repaint();
+                            }
+                        }
+                    }
+                    Err(FinalizeRefusal::AlreadyFinalized) => {
+                        // Повторный запрос того же кандидата не тратит test
+                        // второй раз: отдаём уже полученный замер.
+                        if let Some(disclosed) = lifecycle.disclosure_for(&stamp) {
+                            let _ = evt_tx.send(Event::TrainDone {
+                                stamp: stamp.clone(),
+                                metrics: None,
+                                per_output: None,
+                                validation_origin: None,
+                                r2_std_folds: None,
+                                final_eval: Some(disclosed.eval.clone()),
+                                interpret: None,
+                                cancelled: false,
+                            });
+                            ctx.request_repaint();
+                        }
+                    }
+                    Err(refusal) => {
+                        let _ = evt_tx.send(Event::Error(refusal.message().to_string()));
                         ctx.request_repaint();
                     }
                 }
@@ -200,6 +262,7 @@ fn worker_loop(
                             schema: loaded.schema.clone(),
                             kind: loaded.nc.kind,
                             source: format!("файл: {path}"),
+                            model_origin: ModelOrigin::Checkpoint,
                             parameter_count: loaded.model.parameter_count(),
                             kan: kan_model_info(
                                 &loaded.model,
@@ -440,6 +503,23 @@ fn worker_loop(
             }
             Command::Shutdown => break,
         }
+    }
+}
+
+/// Событие о новой активной модели. Происхождение идёт рядом со схемой:
+/// отладочную и финальную модель нельзя показывать одинаково.
+fn model_ready(loaded: &Loaded, origin: &DatasetOrigin, model_origin: ModelOrigin) -> Event {
+    Event::ModelReady {
+        schema: loaded.schema.clone(),
+        kind: loaded.nc.kind,
+        source: source_desc(origin),
+        model_origin,
+        parameter_count: loaded.model.parameter_count(),
+        kan: kan_model_info(
+            &loaded.model,
+            loaded.diag.is_some() || loaded.calibration.is_some(),
+        ),
+        keep_evaluation: true,
     }
 }
 
@@ -922,17 +1002,37 @@ fn open_table(
     Ok((table, profile, suggested_inputs, suggested_categories))
 }
 
-/// Обучение в worker-потоке. Возвращает обученную модель (Rc живёт здесь) или
-/// `None` при отмене.
-#[allow(clippy::too_many_arguments)]
+/// Что делаем с кандидатом: проверяем на validation/CV или фиксируем и
+/// открываем test.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunKind {
+    Check,
+    Finalize,
+}
+
+/// Итог запуска для worker-цикла: что стало активной моделью и что записать в
+/// учёт жизненного цикла.
+#[derive(Default)]
+struct RunOutcome {
+    /// Новая активная модель. `None` — отмена или CV-проверка, где моделей
+    /// столько же, сколько folds.
+    loaded: Option<Loaded>,
+    /// Оценка проверенного кандидата.
+    check: Option<CheckEval>,
+    /// Состоявшийся замер на test.
+    final_eval: Option<FinalEval>,
+}
+
+/// Обучение в worker-потоке. Модель остаётся здесь: Rc через границу потока не
+/// ходит.
 fn train_numeric(
     prepared: &PreparedData,
     stamp: &RunStamp,
-    final_phase: bool,
+    kind: RunKind,
     evt_tx: &Sender<Event>,
     ctx: &egui::Context,
     cancel: &AtomicBool,
-) -> Result<Option<Loaded>, String> {
+) -> Result<RunOutcome, String> {
     // Всё, чем запуск будет подписан, берётся из самого отпечатка: разойтись
     // им негде.
     let split = stamp.split;
@@ -970,7 +1070,7 @@ fn train_numeric(
     let pipeline_error: RefCell<Option<String>> = RefCell::new(None);
     let reports: RefCell<Vec<(Phase, InterpretReport)>> = RefCell::new(Vec::new());
     let profile = interpret;
-    let mut configure = |_phase: Phase, model: &NumericModel| {
+    let configure = |_phase: Phase, model: &NumericModel| {
         if let Some(p) = &profile {
             if pipeline_error.borrow().is_some() {
                 return;
@@ -983,10 +1083,10 @@ fn train_numeric(
             }
         }
     };
-    let mut post_train = |phase: Phase,
-                          trained: &mut TrainedModel,
-                          train_data: &NumericDataset,
-                          eval_data: Option<&NumericDataset>| {
+    let post_train = |phase: Phase,
+                      trained: &mut TrainedModel,
+                      train_data: &NumericDataset,
+                      eval_data: Option<&NumericDataset>| {
         let Some(p) = &profile else {
             return;
         };
@@ -1012,11 +1112,21 @@ fn train_numeric(
             }
         }
     };
-    // Ручной запуск заканчивается development-моделью. После поиска выбор уже
-    // сделан, поэтому финальный запуск сразу делает refit на всём pool — в том
-    // числе при K-fold — и только затем один раз открывает test.
-    let (trained, metrics, per_output, final_eval, diag_train, diag_eval, eval_label) =
-        if final_phase {
+    let epoch_event = |phase: Phase, point: &EpochPoint| {
+        let _ = evt_tx.send(Event::Epoch {
+            phase,
+            epoch: point.epoch,
+            loss: point.train_loss,
+            val_r2: point.val.as_ref().map(|m| m.r2),
+        });
+        ctx.request_repaint();
+    };
+
+    // Проверка идёт по всем folds и не трогает test. Фиксация уже выбранного
+    // кандидата сразу делает refit на всём pool — в том числе при K-fold — и
+    // только затем один раз открывает test.
+    let (trained, check, final_eval, diag_train, diag_eval, eval_label) = match kind {
+        RunKind::Finalize => {
             let pool = Arc::new(split.prepare(dataset.data())?.search.all());
             let outcome = refit(
                 &dataset,
@@ -1024,92 +1134,87 @@ fn train_numeric(
                 &setup,
                 DEFAULT_FINAL_INIT_SEED,
                 cancel,
-                &mut |phase, point| {
-                    let _ = evt_tx.send(Event::Epoch {
-                        phase,
-                        epoch: point.epoch,
-                        loss: point.train_loss,
-                        val_r2: point.val.as_ref().map(|m| m.r2),
-                    });
-                    ctx.request_repaint();
+                &mut |phase, point| epoch_event(phase, point),
+                &mut |phase, model| configure(phase, model),
+                &mut |phase, trained, train_data, eval_data| {
+                    post_train(phase, trained, train_data, eval_data)
                 },
-                &mut configure,
-                &mut post_train,
             )?;
             if let Some(e) = pipeline_error.borrow_mut().take() {
                 return Err(e);
             }
             let Some(trained) = outcome.model else {
-                let _ = evt_tx.send(Event::TrainDone {
-                    stamp: Box::new(stamp.clone()),
-                    metrics: None,
-                    per_output: None,
-                    validation_origin: None,
-                    final_eval: None,
-                    interpret: None,
-                    cancelled: true,
-                });
-                ctx.request_repaint();
-                return Ok(None);
+                send_cancelled(evt_tx, ctx, stamp);
+                return Ok(RunOutcome::default());
             };
             (
                 trained,
-                None,
                 None,
                 outcome.eval,
                 Arc::clone(&pool),
                 pool,
                 "train+validation",
             )
-        } else {
-            let outcome = run_training(
+        }
+        RunKind::Check => {
+            let outcome = check_candidate(
                 &dataset,
                 split,
                 &setup,
-                false,
-                DEFAULT_FINAL_INIT_SEED,
                 cancel,
-                &mut |phase, point| {
-                    let _ = evt_tx.send(Event::Epoch {
-                        phase,
-                        epoch: point.epoch,
-                        loss: point.train_loss,
-                        val_r2: point.val.as_ref().map(|m| m.r2),
-                    });
-                    ctx.request_repaint();
+                &mut |_fold, point| epoch_event(Phase::Development, point),
+                &mut |model| configure(Phase::Development, model),
+                &mut |_fold, trained, train_data, eval_data| {
+                    post_train(Phase::Development, trained, train_data, eval_data)
                 },
-                &mut configure,
-                &mut post_train,
             )?;
             if let Some(e) = pipeline_error.borrow_mut().take() {
                 return Err(e);
             }
-            if cancel.load(Ordering::Relaxed) {
+            if outcome.cancelled || cancel.load(Ordering::Relaxed) {
+                send_cancelled(evt_tx, ctx, stamp);
+                return Ok(RunOutcome::default());
+            }
+            let check = CheckEval {
+                metrics: outcome.metrics.clone(),
+                per_output: outcome.per_output.clone(),
+                r2_std_folds: outcome.r2_std_folds,
+            };
+            let Some(trained) = outcome.model else {
+                // K-fold: моделей столько же, сколько folds, ни одна не
+                // представляет оценку. Отдаём только её.
                 let _ = evt_tx.send(Event::TrainDone {
                     stamp: Box::new(stamp.clone()),
-                    metrics: None,
-                    per_output: None,
-                    validation_origin: None,
+                    metrics: Some(outcome.metrics),
+                    per_output: Some(outcome.per_output),
+                    validation_origin: Some(ValidationOrigin {
+                        plan: split,
+                        init_seed: tcfg.seed,
+                    }),
+                    r2_std_folds: Some(outcome.r2_std_folds),
                     final_eval: None,
-                    interpret: None,
-                    cancelled: true,
+                    interpret: interpret_reports(reports.into_inner()),
+                    cancelled: false,
                 });
                 ctx.request_repaint();
-                return Ok(None);
-            }
+                return Ok(RunOutcome {
+                    loaded: None,
+                    check: Some(check),
+                    final_eval: None,
+                });
+            };
             let splits = split.prepare(dataset.data())?;
             let (train, val) = splits.search.fold(0)?;
-            let (metrics, per_output) = evaluate_on(&outcome.development, &val);
             (
-                outcome.development,
-                Some(metrics),
-                Some(per_output),
+                trained,
+                Some(check),
                 None,
                 Arc::new(train),
                 Arc::new(val),
                 "validation",
             )
-        };
+        }
+    };
     let TrainedModel {
         model,
         in_norm,
@@ -1117,53 +1222,28 @@ fn train_numeric(
         ..
     } = trained;
     let reports = reports.into_inner();
-    // Отчёты по фазам: у development видно влияние прунинга на validation, у
-    // финальной — какой стала структура.
-    let development = reports
-        .iter()
-        .find(|(phase, _)| *phase == Phase::Development)
-        .map(|(_, r)| r.clone());
-    let final_report = reports
-        .iter()
-        .find(|(phase, _)| *phase == Phase::Final)
-        .map(|(_, r)| r.clone());
     // Прерванный конвейер оставил модель недообученной: сохранять и открывать
     // test по ней нельзя.
     if reports.iter().any(|(_, r)| r.cancelled) {
-        let _ = evt_tx.send(Event::TrainDone {
-            stamp: Box::new(stamp.clone()),
-            metrics: None,
-            per_output: None,
-            validation_origin: None,
-            final_eval: None,
-            interpret: None,
-            cancelled: true,
-        });
-        ctx.request_repaint();
-        return Ok(None);
+        send_cancelled(evt_tx, ctx, stamp);
+        return Ok(RunOutcome::default());
     }
     let _ = evt_tx.send(Event::TrainDone {
         stamp: Box::new(stamp.clone()),
-        metrics,
-        per_output,
-        validation_origin: (!final_phase).then_some(ValidationOrigin {
+        metrics: check.as_ref().map(|c| c.metrics.clone()),
+        per_output: check.as_ref().map(|c| c.per_output.clone()),
+        validation_origin: check.as_ref().map(|_| ValidationOrigin {
             plan: split,
             init_seed: tcfg.seed,
         }),
-        final_eval,
-        // Публикуем, если есть хотя бы один отчёт: после поиска фаза только
-        // финальная, и её отчёт терять нельзя.
-        interpret: (development.is_some() || final_report.is_some()).then(|| {
-            Box::new(InterpretReports {
-                development,
-                final_model: final_report,
-            })
-        }),
+        r2_std_folds: check.as_ref().map(|c| c.r2_std_folds),
+        final_eval: final_eval.clone(),
+        interpret: interpret_reports(reports),
         cancelled: false,
     });
     ctx.request_repaint();
     let calibration = Some(calibration_sample(&diag_train.inputs, 256));
-    Ok(Some(Loaded {
+    let loaded = Loaded {
         model,
         nc: nc.clone(),
         schema,
@@ -1184,7 +1264,47 @@ fn train_numeric(
             eval_label,
         }),
         calibration,
-    }))
+    };
+    Ok(RunOutcome {
+        loaded: Some(loaded),
+        check,
+        final_eval,
+    })
+}
+
+/// Отчёты конвейера по фазам: у development видно влияние прунинга на
+/// validation, у финальной — какой стала структура. Публикуем, если есть хотя
+/// бы один: после поиска фаза только финальная, и её отчёт терять нельзя.
+fn interpret_reports(reports: Vec<(Phase, InterpretReport)>) -> Option<Box<InterpretReports>> {
+    let development = reports
+        .iter()
+        .find(|(phase, _)| *phase == Phase::Development)
+        .map(|(_, r)| r.clone());
+    let final_model = reports
+        .iter()
+        .find(|(phase, _)| *phase == Phase::Final)
+        .map(|(_, r)| r.clone());
+    (development.is_some() || final_model.is_some()).then(|| {
+        Box::new(InterpretReports {
+            development,
+            final_model,
+        })
+    })
+}
+
+/// Отменённый запуск: ни оценки, ни модели, ни замера на test.
+fn send_cancelled(evt_tx: &Sender<Event>, ctx: &egui::Context, stamp: &RunStamp) {
+    let _ = evt_tx.send(Event::TrainDone {
+        stamp: Box::new(stamp.clone()),
+        metrics: None,
+        per_output: None,
+        validation_origin: None,
+        r2_std_folds: None,
+        final_eval: None,
+        interpret: None,
+        cancelled: true,
+    });
+    ctx.request_repaint();
 }
 
 #[cfg(test)]
@@ -1214,6 +1334,162 @@ mod tests {
                 eval: EvalSchedule::Never,
                 interpret,
             },
+        }
+    }
+
+    /// Дождаться первого события, которое не является просто статусом.
+    fn next_meaningful(rx: &mpsc::Receiver<Event>) -> Event {
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+                Ok(Event::Status(_)) | Ok(Event::TrainStarted { .. }) | Ok(Event::Epoch { .. }) => {
+                    continue
+                }
+                Ok(event) => return event,
+                Err(e) => panic!("worker молчит: {e}"),
+            }
+        }
+    }
+
+    /// Правило «test открывают один раз» проверяется и на границе worker-а:
+    /// кнопка могла остаться включённой по устаревшему состоянию, а тратится
+    /// test именно здесь.
+    #[test]
+    fn worker_enforces_the_test_budget_itself() {
+        let data = blackbox::sum().generate(64, 0);
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let prepared = PreparedData {
+            origin: DatasetOrigin::Blackbox("sum".to_string()),
+            data: Arc::new(data),
+            schema,
+        };
+        let config = NumericConfig {
+            kind: ModelKind::Mlp,
+            transformer: ModelConfig::default(),
+            value: ValueEncoderConfig::default(),
+            mlp_width: 4,
+            mlp_layers: 1,
+            kan: KanConfig::default(),
+        };
+        let train = TrainConfig {
+            epochs: 1,
+            batch_size: 16,
+            ..Default::default()
+        };
+        let first = stamp(SplitPlan::default(), config.clone(), train.clone(), None);
+        let mut other_config = config;
+        other_config.mlp_width = 8;
+        let second = stamp(SplitPlan::default(), other_config, train, None);
+
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let ctx = egui::Context::default();
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || worker_loop(cmd_rx, evt_tx, ctx, cancel))
+        };
+
+        // Без проверки финализировать нельзя.
+        cmd_tx
+            .send(Command::FinalizeCandidate {
+                data: prepared.clone(),
+                stamp: Box::new(first.clone()),
+            })
+            .unwrap();
+        match next_meaningful(&evt_rx) {
+            Event::Error(msg) => assert!(msg.contains("Проверить конфигурацию"), "{msg}"),
+            other => panic!(
+                "ожидался отказ, получено другое событие: {:?}",
+                event_name(&other)
+            ),
+        }
+
+        // Проверка -> финализация проходит и открывает test.
+        cmd_tx
+            .send(Command::CheckCandidate {
+                data: prepared.clone(),
+                stamp: Box::new(first.clone()),
+            })
+            .unwrap();
+        let event = next_meaningful(&evt_rx);
+        assert!(
+            matches!(event, Event::TrainDone { .. }),
+            "проверка: {}",
+            describe(&event)
+        );
+        let event = next_meaningful(&evt_rx);
+        assert!(
+            matches!(event, Event::ModelReady { .. }),
+            "проверка: {}",
+            describe(&event)
+        );
+        cmd_tx
+            .send(Command::FinalizeCandidate {
+                data: prepared.clone(),
+                stamp: Box::new(first),
+            })
+            .unwrap();
+        let disclosed = match next_meaningful(&evt_rx) {
+            Event::TrainDone { final_eval, .. } => final_eval,
+            other => panic!("ожидался финальный замер: {}", event_name(&other)),
+        };
+        assert!(disclosed.is_some(), "test должен быть открыт один раз");
+        // Финальная модель тоже становится активной: событие о ней идёт следом.
+        let event = next_meaningful(&evt_rx);
+        assert!(
+            matches!(event, Event::ModelReady { .. }),
+            "финализация: {}",
+            describe(&event)
+        );
+
+        // Другой кандидат на той же ревизии данных: test уже потрачен, и
+        // проверка на validation этого не меняет.
+        cmd_tx
+            .send(Command::CheckCandidate {
+                data: prepared.clone(),
+                stamp: Box::new(second.clone()),
+            })
+            .unwrap();
+        let event = next_meaningful(&evt_rx);
+        assert!(
+            matches!(event, Event::TrainDone { .. }),
+            "вторая проверка: {}",
+            describe(&event)
+        );
+        let event = next_meaningful(&evt_rx);
+        assert!(
+            matches!(event, Event::ModelReady { .. }),
+            "вторая проверка: {}",
+            describe(&event)
+        );
+        cmd_tx
+            .send(Command::FinalizeCandidate {
+                data: prepared,
+                stamp: Box::new(second),
+            })
+            .unwrap();
+        match next_meaningful(&evt_rx) {
+            Event::Error(msg) => assert!(msg.contains("уже открыт"), "{msg}"),
+            other => panic!("ожидался отказ: {}", event_name(&other)),
+        }
+
+        cmd_tx.send(Command::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    fn describe(event: &Event) -> String {
+        match event {
+            Event::Error(msg) => format!("Error({msg})"),
+            other => event_name(other).to_string(),
+        }
+    }
+
+    fn event_name(event: &Event) -> &'static str {
+        match event {
+            Event::Error(_) => "Error",
+            Event::TrainDone { .. } => "TrainDone",
+            Event::ModelReady { .. } => "ModelReady",
+            _ => "другое",
         }
     }
 
@@ -1257,13 +1533,14 @@ mod tests {
                 train,
                 Some(InterpretProfile::v1()),
             ),
-            true,
+            RunKind::Finalize,
             &tx,
             &egui::Context::default(),
             &cancel,
         )
         .unwrap();
-        assert!(loaded.is_none(), "модель не должна сохраняться");
+        assert!(loaded.loaded.is_none(), "модель не должна сохраняться");
+        assert!(loaded.final_eval.is_none(), "test открывать нечем");
 
         let done = rx
             .try_iter()
@@ -1317,7 +1594,7 @@ mod tests {
                 train,
                 Some(InterpretProfile::v1()),
             ),
-            true,
+            RunKind::Finalize,
             &tx,
             &egui::Context::default(),
             &cancel,
@@ -1374,12 +1651,13 @@ mod tests {
         let loaded = train_numeric(
             &prepared,
             &stamp(split, config, train, None),
-            true,
+            RunKind::Finalize,
             &tx,
             &egui::Context::default(),
             &cancel,
         )
         .unwrap()
+        .loaded
         .expect("финальная модель");
 
         assert_eq!(loaded.in_norm.mean, expected_in_norm.mean);
@@ -1438,12 +1716,13 @@ mod tests {
         let loaded = train_numeric(
             &prepared,
             &stamp(SplitPlan::default(), config, train, Some(profile)),
-            true,
+            RunKind::Finalize,
             &tx,
             &egui::Context::default(),
             &AtomicBool::new(false),
         )
         .unwrap()
+        .loaded
         .expect("финальная KAN");
         assert_eq!(loaded.interpret, Some(profile));
 
@@ -1504,12 +1783,13 @@ mod tests {
         train_numeric(
             &prepared,
             &stamp(SplitPlan::default(), config, train, None),
-            false,
+            RunKind::Check,
             &tx,
             &egui::Context::default(),
             &AtomicBool::new(false),
         )
         .unwrap()
+        .loaded
         .expect("development-модель");
 
         let per_output = rx.try_iter().find_map(|event| match event {

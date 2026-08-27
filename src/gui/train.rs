@@ -1,6 +1,6 @@
 //! Экран обучения: одна конфигурация, поиск по сетке и кривая по эпохам.
 
-use super::messages::Command;
+use super::messages::{Command, ModelOrigin, PreparedData};
 use super::model::ModelInfo;
 use super::session::{App, NO_DATASET};
 use crate::config::ModelConfig;
@@ -394,6 +394,9 @@ impl App {
         }
 
         self.ui_search_results(ui);
+        // Второй шаг общий для всех трёх режимов: кандидат приходит из формы
+        // или из выбранной строки, а правило одно.
+        self.ui_finalize(ui);
         self.ui_training_output(ui);
     }
 
@@ -648,56 +651,16 @@ impl App {
         }
 
         ui.separator();
-        let kfold = self
-            .dataset
-            .as_ref()
-            .is_some_and(|dataset| matches!(dataset.split, crate::split::SplitPlan::KFold { .. }));
-        if kfold {
-            ui.colored_label(
-                egui::Color32::from_rgb(200, 120, 0),
-                "Одна development-модель не может представлять K-fold-оценку. Используйте «Авто» \
-                 или «Свою сетку», затем обучите выбранную конфигурацию финально.",
-            );
-        }
         ui.horizontal(|ui| {
+            // Проверка доступна всегда: она не трогает test. При K-fold она
+            // означает оценку по всем folds, а не одну произвольную модель.
             if ui
-                .add_enabled(!self.busy() && !kfold, egui::Button::new("Обучить"))
+                .add_enabled(!self.busy(), egui::Button::new("Проверить конфигурацию"))
                 .clicked()
             {
-                match (
-                    self.form.build(),
-                    self.active_data(),
-                    self.dataset_revision(),
-                ) {
-                    (Ok((nc, tcfg)), Ok((data, split)), Some(revision)) => {
-                        let interpret = match self.interpret_profile(nc.kind) {
-                            Ok(profile) => profile,
-                            Err(e) => {
-                                self.status = format!("Ошибка: {e}");
-                                return;
-                            }
-                        };
-                        let stamp = RunStamp {
-                            dataset_revision: revision,
-                            split,
-                            candidate: CandidateSpec {
-                                config: nc,
-                                train: tcfg,
-                                eval: self.eval_schedule(),
-                                interpret,
-                            },
-                        };
-                        self.train_parameter_count = None;
-                        self.worker.reset_cancel();
-                        self.worker.send(Command::TrainNumeric {
-                            data,
-                            stamp,
-                            // Ручной запуск — фаза разработки: test не трогаем.
-                            final_phase: false,
-                        });
-                    }
-                    (Err(e), _, _) | (_, Err(e), _) => self.status = format!("Ошибка: {e}"),
-                    (_, _, None) => self.status = format!("Ошибка: {NO_DATASET}"),
+                match self.current_stamp() {
+                    Ok((data, stamp)) => self.send_check(data, stamp),
+                    Err(e) => self.status = format!("Ошибка: {e}"),
                 }
             }
             if ui
@@ -707,10 +670,17 @@ impl App {
                 self.worker.request_cancel();
                 self.status = "отмена…".to_string();
             }
+            // Кнопка называет то, что сохранит: отладочная модель обучена
+            // только на train, и путать её с результатом работы нельзя.
+            let save_label = match self.model_info.as_ref().map(|info| &info.origin) {
+                Some(ModelOrigin::Final(_)) => "Сохранить финальную модель…",
+                Some(ModelOrigin::Development(_)) => "Сохранить отладочную модель…",
+                _ => "Сохранить модель…",
+            };
             if ui
                 .add_enabled(
                     self.model_info.is_some() && !self.busy(),
-                    egui::Button::new("Сохранить модель…"),
+                    egui::Button::new(save_label),
                 )
                 .clicked()
             {
@@ -843,7 +813,7 @@ impl App {
                         self.worker.send(Command::Search {
                             data,
                             split,
-                            axes,
+                            axes: Box::new(axes),
                             objective: self.search_form.objective(),
                         });
                     }
@@ -959,15 +929,16 @@ impl App {
         ui.horizontal(|ui| {
             let ready = chosen.is_some() && !self.busy() && !stale;
             if ui
-                .add_enabled(ready, egui::Button::new("Обучить финально"))
+                .add_enabled(ready, egui::Button::new("Проверить выбранную"))
                 .on_hover_text(
-                    "Переобучить выбранную конфигурацию на train+validation и один раз \
-                     открыть test",
+                    "Обучить выбранную конфигурацию на полном числе эпох и снять \
+                     validation/CV-оценку. Test не открывается",
                 )
                 .clicked()
             {
-                if let Some(choice) = &chosen {
-                    self.train_final_from_choice(choice);
+                match self.current_stamp() {
+                    Ok((data, stamp)) => self.send_check(data, stamp),
+                    Err(e) => self.status = format!("Ошибка: {e}"),
                 }
             }
             if ui
@@ -985,20 +956,14 @@ impl App {
         });
     }
 
-    /// Запустить финальное обучение по выбранной строке поиска.
+    /// Кандидат из выбранной строки поиска.
     ///
-    /// Конфигурация берётся из строки напрямую, а seed — заранее заданный
-    /// `final_init_seed`: выбирать seed по результату поиска значит подбирать
-    /// его по тем же данным.
-    fn train_final_from_choice(&mut self, choice: &SweepChoice) {
-        let (data, split) = match self.active_data() {
-            Ok(active) => active,
-            Err(error) => {
-                self.status = format!("Ошибка: {error}");
-                return;
-            }
-        };
-        let nc = NumericConfig {
+    /// Число эпох — `final_epochs`, а не короткий бюджет самого перебора:
+    /// проверять надо ровно ту конфигурацию, которая поедет в финал. Seed —
+    /// заранее заданный `final_init_seed`: выбирать его по результату поиска
+    /// значит подбирать его по тем же данным.
+    fn candidate_from_choice(&self, choice: &SweepChoice) -> Result<CandidateSpec, String> {
+        let config = NumericConfig {
             kind: choice.kind,
             transformer: ModelConfig {
                 d_model: choice.d_model,
@@ -1013,49 +978,137 @@ impl App {
             mlp_layers: choice.mlp_layers,
             kan: choice.kan,
         };
-        let tcfg = TrainConfig {
+        let train = TrainConfig {
             epochs: choice.final_epochs,
             batch_size: choice.batch_size,
             lr: choice.lr,
             seed: DEFAULT_FINAL_INIT_SEED,
             schedule: choice.schedule,
         };
-        if let Err(e) =
-            validate_numeric(&nc).and_then(|()| validate_train(tcfg.lr, tcfg.batch_size))
-        {
-            self.status = format!("Ошибка: {e}");
-            return;
-        }
-        let interpret = match self.interpret_profile(nc.kind) {
-            Ok(profile) => profile,
-            Err(e) => {
-                self.status = format!("Ошибка: {e}");
-                return;
+        validate_numeric(&config)?;
+        validate_train(train.lr, train.batch_size)?;
+        Ok(CandidateSpec {
+            config,
+            train,
+            // Кривая по эпохам относится к ручной настройке; здесь число эпох
+            // уже выбрано поиском.
+            eval: EvalSchedule::Never,
+            interpret: self.interpret_profile(choice.kind)?,
+        })
+    }
+
+    /// Кандидат, о котором сейчас идёт речь: из формы в ручном режиме и из
+    /// выбранной строки после поиска.
+    fn current_candidate(&self) -> Result<CandidateSpec, String> {
+        match self.mode {
+            TrainingMode::Single => {
+                let (config, train) = self.form.build()?;
+                let interpret = self.interpret_profile(config.kind)?;
+                Ok(CandidateSpec {
+                    config,
+                    train,
+                    eval: self.eval_schedule(),
+                    interpret,
+                })
             }
-        };
-        let Some(revision) = self.dataset_revision() else {
-            self.status = format!("Ошибка: {NO_DATASET}");
-            return;
-        };
-        let stamp = RunStamp {
-            dataset_revision: revision,
-            split,
-            candidate: CandidateSpec {
-                config: nc,
-                train: tcfg,
-                // Refit учится на train+validation, поэтому validation-кривой
-                // у него быть не может. Число эпох уже выбрано поиском.
-                eval: EvalSchedule::Never,
-                interpret,
+            TrainingMode::Auto(_) | TrainingMode::Custom => {
+                if !self.search_matches_dataset() {
+                    return Err(
+                        "результат поиска относится к другим данным или разбиению".to_string()
+                    );
+                }
+                let choice = self
+                    .search_selected
+                    .or((!self.search_rows.is_empty()).then_some(0))
+                    .and_then(|i| self.search_rows.get(i))
+                    .map(|row| row.choice.clone())
+                    .ok_or_else(|| "сначала выполните поиск и выберите строку".to_string())?;
+                self.candidate_from_choice(&choice)
+            }
+        }
+    }
+
+    /// Активные данные и отпечаток текущего кандидата.
+    pub(super) fn current_stamp(&self) -> Result<(PreparedData, RunStamp), String> {
+        let (data, split) = self.active_data()?;
+        let dataset_revision = self
+            .dataset_revision()
+            .ok_or_else(|| NO_DATASET.to_string())?;
+        Ok((
+            data,
+            RunStamp {
+                dataset_revision,
+                split,
+                candidate: self.current_candidate()?,
             },
-        };
+        ))
+    }
+
+    fn send_check(&mut self, data: PreparedData, stamp: RunStamp) {
         self.train_parameter_count = None;
         self.worker.reset_cancel();
-        self.worker.send(Command::TrainNumeric {
+        self.worker.send(Command::CheckCandidate {
             data,
-            stamp,
-            final_phase: true,
+            stamp: Box::new(stamp),
         });
+    }
+
+    /// Зафиксировать проверенного кандидата. Отпечаток берётся из проверки как
+    /// есть: пересобранный по форме мог бы отличаться от проверенного.
+    fn send_finalize(&mut self, data: PreparedData, stamp: RunStamp) {
+        self.train_parameter_count = None;
+        self.worker.reset_cancel();
+        self.worker.send(Command::FinalizeCandidate {
+            data,
+            stamp: Box::new(stamp),
+        });
+    }
+
+    /// Второй шаг сценария: фиксация кандидата и единственное открытие test.
+    ///
+    /// Кнопка включается только при точном совпадении с проверенным
+    /// кандидатом; во всех остальных случаях причина написана рядом, а не
+    /// угадывается по недоступной кнопке.
+    pub(super) fn ui_finalize(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        let Ok((data, stamp)) = self.current_stamp() else {
+            return;
+        };
+        if let Some(disclosed) = self.lifecycle.disclosure_for(&stamp) {
+            ui.label(format!(
+                "Этот кандидат уже обучен финально: test открыт ({} строк), результат ниже.",
+                disclosed.eval.origin.test_rows
+            ));
+            return;
+        }
+        match self.lifecycle.can_finalize(&stamp) {
+            Ok(()) => {
+                if ui
+                    .add_enabled(
+                        !self.busy(),
+                        egui::Button::new("Зафиксировать и обучить финально"),
+                    )
+                    .on_hover_text(
+                        "Переобучить проверенного кандидата на train+validation и один раз \
+                         открыть test",
+                    )
+                    .clicked()
+                {
+                    let checked = self
+                        .lifecycle
+                        .checked_for(&stamp)
+                        .map(|run| run.stamp.clone());
+                    match checked {
+                        Some(stamp) => self.send_finalize(data, stamp),
+                        None => self.status = "Ошибка: проверка кандидата не найдена".to_string(),
+                    }
+                }
+            }
+            Err(refusal) => {
+                ui.add_enabled(false, egui::Button::new("Зафиксировать и обучить финально"));
+                ui.colored_label(egui::Color32::from_rgb(200, 120, 0), refusal.message());
+            }
+        }
     }
 
     /// Результат обучения: кривая, метрики и единственный замер на test.

@@ -200,6 +200,8 @@ pub(crate) struct App {
     pub(super) metrics: Option<Metrics>,
     pub(super) metrics_per_output: Option<Vec<Metrics>>,
     pub(super) validation_origin: Option<ValidationOrigin>,
+    /// Разброс R² между folds у CV-проверки: у K-fold среднего мало.
+    pub(super) r2_std_folds: Option<f32>,
     pub(super) train_parameter_count: Option<usize>,
     // Predict (UI-M5)
     pub(super) model_info: Option<ModelInfo>,
@@ -283,6 +285,7 @@ impl App {
             metrics: None,
             metrics_per_output: None,
             validation_origin: None,
+            r2_std_folds: None,
             train_parameter_count: None,
             model_info: None,
             model_view: ModelView::Summary,
@@ -387,6 +390,7 @@ impl App {
                     metrics,
                     per_output,
                     validation_origin,
+                    r2_std_folds,
                     final_eval,
                     interpret,
                     cancelled,
@@ -417,6 +421,7 @@ impl App {
                                     eval: CheckEval {
                                         metrics: m.clone(),
                                         per_output: per.clone(),
+                                        r2_std_folds: r2_std_folds.unwrap_or(0.0),
                                     },
                                 });
                             }
@@ -438,6 +443,7 @@ impl App {
                         self.metrics = metrics;
                         self.metrics_per_output = per_output;
                         self.validation_origin = validation_origin;
+                        self.r2_std_folds = r2_std_folds;
                         self.final_eval = final_eval;
                         self.interpret_reports = interpret;
                     }
@@ -480,6 +486,7 @@ impl App {
                     schema,
                     kind,
                     source,
+                    model_origin,
                     parameter_count,
                     kan,
                     keep_evaluation,
@@ -492,6 +499,7 @@ impl App {
                         self.metrics = None;
                         self.metrics_per_output = None;
                         self.validation_origin = None;
+                        self.r2_std_folds = None;
                         self.final_eval = None;
                         self.loss_curve.clear();
                         self.val_curve.clear();
@@ -502,6 +510,7 @@ impl App {
                         schema,
                         kind,
                         source,
+                        origin: model_origin,
                         parameter_count,
                     });
                     self.predict_inputs = vec![0.0; n_inputs];
