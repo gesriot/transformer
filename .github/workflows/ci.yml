@@ -90,5 +90,12 @@ jobs:
         run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
       - name: test
         run: cargo test ${{ matrix.features }}
+      # Default включает и gui, и demo: одной этой ноги достаточно, чтобы
+      # rustdoc проверил всю публичную поверхность, включая модуль gui.
+      - name: doc
+        if: matrix.id == 'default'
+        run: cargo doc --no-deps ${{ matrix.features }}
+        env:
+          RUSTDOCFLAGS: -D warnings
       - name: release build
         run: cargo build --release ${{ matrix.features }}
