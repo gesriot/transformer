@@ -1193,12 +1193,38 @@ impl App {
                     "Проверка относится к другому кандидату: форма изменилась после неё.",
                 );
             }
+            // Отчёт конвейера этой же проверки: у активной модели он может быть
+            // своим, и путать их нельзя.
+            let stamp = run.stamp.clone();
+            if let Some((_, reports)) = self
+                .interpret_reports
+                .as_ref()
+                .filter(|(reported, _)| *reported == stamp)
+            {
+                if let Some(profile) = reports.profile() {
+                    ui.label(format!("Конвейер интерпретации {}", profile.describe()));
+                }
+                if let Some(d) = &reports.development {
+                    ui.label(format!(
+                        "Активных рёбер после прунинга: {}/{}",
+                        d.active_edges.0, d.active_edges.1
+                    ));
+                }
+            }
         }
         if let Some(disclosed) = self.lifecycle.disclosure() {
+            // Раскрытие переживает смену набора намеренно, но выдавать его за
+            // результат текущих данных нельзя.
+            let historical = self.dataset_revision() != Some(disclosed.stamp.dataset_revision);
             ui.separator();
             let f = &disclosed.eval;
+            let prefix = if historical {
+                "test прежнего набора данных"
+            } else {
+                "test"
+            };
             ui.label(format!(
-                "test ({} строк, единственный замер): RMSE={:.5}   MAE={:.5}   \
+                "{prefix} ({} строк, единственный замер): RMSE={:.5}   MAE={:.5}   \
                  rel.error={:.2}%   R²={:.5}",
                 f.origin.test_rows,
                 f.metrics.rmse,
@@ -1206,6 +1232,13 @@ impl App {
                 f.metrics.rel_error * 100.0,
                 f.metrics.r2
             ));
+            if historical {
+                ui.colored_label(
+                    egui::Color32::from_rgb(200, 120, 0),
+                    "Этот замер относится к прежнему набору данных и к активному отношения не \
+                     имеет.",
+                );
+            }
         }
         if let Some(warning) = self
             .model_info

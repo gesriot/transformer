@@ -184,7 +184,14 @@ impl App {
                  относилась к другому кандидату.",
             );
         }
-        if let Some(reports) = &self.interpret_reports {
+        // Отчёт конвейера показывается только у своей модели: рядом с моделью
+        // A отчёт кандидата B описывал бы не её.
+        let reports = self
+            .interpret_reports
+            .as_ref()
+            .filter(|(reported, _)| Some(reported) == stamp)
+            .map(|(_, reports)| reports);
+        if let Some(reports) = reports {
             ui.separator();
             if let Some(profile) = reports.profile() {
                 ui.label(format!("Конвейер интерпретации {}", profile.describe()));
