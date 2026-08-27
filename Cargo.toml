@@ -19,6 +19,9 @@ rand_distr = "0.4"
 rayon = "1.10"
 calamine = { version = "0.35", default-features = false }
 zip = { version = "7.2", default-features = false, features = ["deflate"] }
+# Отпечаток данных: потоковый хеш с фиксированными 32 байтами.
+# rayon не включаем — таблица хешируется один раз и не в горячем пути.
+blake3 = { version = "1.8.7", default-features = false }
 
 # Только для GUI (фича `gui`).
 eframe = { version = "0.31", optional = true }

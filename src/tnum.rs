@@ -503,6 +503,41 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    /// Одна и та же числовая таблица, пришедшая из CSV и из TRNUM2, — те же
+    /// данные: отпечаток берётся из чисел и типов, а не из формата файла.
+    #[test]
+    fn the_same_table_has_one_fingerprint_in_any_format() {
+        let dir = std::env::temp_dir().join(format!(
+            "transformer_fingerprint_formats_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let csv = dir.join("in.csv");
+        let tnum = dir.join("out.tnum");
+        // Разметка одна и та же: сравниваются форматы, а не трактовки колонок.
+        // Другая трактовка — это уже другие данные, и отпечаток обязан их
+        // различать (см. тесты fingerprint).
+        std::fs::write(&csv, "x0,x1,x2,y0\n0.5,-0.2,7.0,2.0\n1.5,0.3,8.0,3.0\n").unwrap();
+
+        prepare_tnum_file(&csv, &tnum, &spec(vec![])).unwrap();
+        let (from_csv, csv_schema) = read_numeric_source(csv.to_str().unwrap()).unwrap();
+        let (from_tnum, tnum_schema) = read_numeric_source(tnum.to_str().unwrap()).unwrap();
+
+        assert_eq!(
+            csv_schema.feature_specs(),
+            tnum_schema.feature_specs(),
+            "типы входов"
+        );
+        assert_eq!(from_csv.inputs, from_tnum.inputs, "входы");
+        assert_eq!(from_csv.outputs, from_tnum.outputs, "выходы");
+        assert_eq!(
+            crate::fingerprint::DatasetFingerprint::of(&from_csv, &csv_schema).unwrap(),
+            crate::fingerprint::DatasetFingerprint::of(&from_tnum, &tnum_schema).unwrap(),
+            "формат файла не является частью данных"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn numeric_source_recognizes_tnum_by_contents() {
         let path = std::env::temp_dir().join("transformer_tnum_magic_without_extension.data");

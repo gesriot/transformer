@@ -18,6 +18,7 @@ use crate::config::ModelConfig;
 use crate::data::TextDataset;
 use crate::data::{Normalizer, NumericDataset, OutOfRange};
 use crate::encoders::FeatureSpec;
+use crate::fingerprint::DatasetFingerprint;
 #[cfg(feature = "demo")]
 use crate::generate::generate;
 use crate::gui::messages::InterpretReports;
@@ -1059,6 +1060,16 @@ fn train_numeric(
     ctx: &egui::Context,
     cancel: &AtomicBool,
 ) -> Result<RunOutcome, String> {
+    // Данные обязаны быть теми, о которых говорит отпечаток: иначе бюджет test
+    // считался бы по одному набору, а модель училась бы на другом.
+    let actual = DatasetFingerprint::of(&prepared.data, &prepared.schema)?;
+    if actual != stamp.dataset {
+        return Err(format!(
+            "данные не совпадают с отпечатком запуска ({} вместо {}): откройте набор заново",
+            actual.short(),
+            stamp.dataset.short()
+        ));
+    }
     // Всё, чем запуск будет подписан, берётся из самого отпечатка: разойтись
     // им негде.
     let split = stamp.split;
@@ -1369,12 +1380,14 @@ mod tests {
 
     /// Отпечаток для тестов: всё, чем подписан запуск, в одном месте.
     fn stamp(
+        fingerprint: DatasetFingerprint,
         split: SplitPlan,
         config: NumericConfig,
         train: TrainConfig,
         interpret: Option<InterpretProfile>,
     ) -> RunStamp {
         RunStamp {
+            dataset: fingerprint,
             dataset_revision: 1,
             split,
             candidate: CandidateSpec {
@@ -1397,6 +1410,54 @@ mod tests {
                 Err(e) => panic!("worker молчит: {e}"),
             }
         }
+    }
+
+    /// Отпечаток сверяется заново там, где тратится test: команда, пришедшая
+    /// с чужими данными, не должна ни учиться, ни списывать бюджет.
+    #[test]
+    fn worker_refuses_data_that_does_not_match_the_stamp() {
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let prepared = PreparedData {
+            origin: DatasetOrigin::Blackbox("sum".to_string()),
+            data: Arc::new(blackbox::sum().generate(32, 0)),
+            schema: schema.clone(),
+        };
+        // Отпечаток другого набора: те же схема и форма, другие числа.
+        let other = blackbox::sum().generate(32, 7);
+        let alien = DatasetFingerprint::of(&other, &schema).unwrap();
+
+        let (tx, _rx) = mpsc::channel();
+        let outcome = train_numeric(
+            &prepared,
+            &stamp(
+                alien,
+                SplitPlan::default(),
+                NumericConfig {
+                    kind: ModelKind::Mlp,
+                    transformer: ModelConfig::default(),
+                    value: ValueEncoderConfig::default(),
+                    mlp_width: 4,
+                    mlp_layers: 1,
+                    kan: KanConfig::default(),
+                },
+                TrainConfig {
+                    epochs: 1,
+                    batch_size: 16,
+                    ..Default::default()
+                },
+                None,
+            ),
+            RunKind::Check,
+            EvalSchedule::Never,
+            &tx,
+            &egui::Context::default(),
+            &AtomicBool::new(false),
+        );
+        let err = match outcome {
+            Err(e) => e,
+            Ok(_) => panic!("чужие данные не должны обучаться"),
+        };
+        assert!(err.contains("не совпадают с отпечатком"), "{err}");
     }
 
     /// Правило «test открывают один раз» проверяется и на границе worker-а:
@@ -1424,10 +1485,17 @@ mod tests {
             batch_size: 16,
             ..Default::default()
         };
-        let first = stamp(SplitPlan::default(), config.clone(), train.clone(), None);
+        let fp = DatasetFingerprint::of(&prepared.data, &prepared.schema).unwrap();
+        let first = stamp(
+            fp,
+            SplitPlan::default(),
+            config.clone(),
+            train.clone(),
+            None,
+        );
         let mut other_config = config;
         other_config.mlp_width = 8;
-        let second = stamp(SplitPlan::default(), other_config, train, None);
+        let second = stamp(fp, SplitPlan::default(), other_config, train, None);
 
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (evt_tx, evt_rx) = mpsc::channel();
@@ -1575,6 +1643,7 @@ mod tests {
         let loaded = train_numeric(
             &prepared,
             &stamp(
+                DatasetFingerprint::of(&prepared.data, &prepared.schema).unwrap(),
                 SplitPlan::default(),
                 config,
                 train,
@@ -1637,6 +1706,7 @@ mod tests {
         let result = train_numeric(
             &prepared,
             &stamp(
+                DatasetFingerprint::of(&prepared.data, &prepared.schema).unwrap(),
                 SplitPlan::default(),
                 config,
                 train,
@@ -1699,7 +1769,13 @@ mod tests {
 
         let loaded = train_numeric(
             &prepared,
-            &stamp(split, config, train, None),
+            &stamp(
+                DatasetFingerprint::of(&prepared.data, &prepared.schema).unwrap(),
+                split,
+                config,
+                train,
+                None,
+            ),
             RunKind::Finalize,
             EvalSchedule::Never,
             &tx,
@@ -1765,7 +1841,13 @@ mod tests {
 
         let loaded = train_numeric(
             &prepared,
-            &stamp(SplitPlan::default(), config, train, Some(profile)),
+            &stamp(
+                DatasetFingerprint::of(&prepared.data, &prepared.schema).unwrap(),
+                SplitPlan::default(),
+                config,
+                train,
+                Some(profile),
+            ),
             RunKind::Finalize,
             EvalSchedule::Never,
             &tx,
@@ -1833,7 +1915,13 @@ mod tests {
 
         train_numeric(
             &prepared,
-            &stamp(SplitPlan::default(), config, train, None),
+            &stamp(
+                DatasetFingerprint::of(&prepared.data, &prepared.schema).unwrap(),
+                SplitPlan::default(),
+                config,
+                train,
+                None,
+            ),
             RunKind::Check,
             EvalSchedule::Never,
             &tx,

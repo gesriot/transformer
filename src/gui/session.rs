@@ -16,6 +16,7 @@ use super::train::{CustomSearchForm, SearchForm, TrainForm, TrainingMode};
 use super::worker::Worker;
 use crate::data::OutOfRange;
 use crate::encoders::ValueEncoderKind;
+use crate::fingerprint::DatasetFingerprint;
 use crate::interpret::InterpretOverrides;
 use crate::lifecycle::{CheckEval, CheckedRun, Lifecycle, RunStamp, TestDisclosure};
 use crate::markup::{Message, TableProfile};
@@ -122,6 +123,9 @@ pub(super) struct ActiveDataset {
     pub(super) table_has_header: bool,
     /// Номер набора в сессии: по нему видно, что данные сменились.
     pub(super) revision: u64,
+    /// Отпечаток данных. Считается один раз при открытии: по нему решается,
+    /// те же это данные или другие, — в том числе после перезапуска.
+    pub(super) fingerprint: DatasetFingerprint,
 }
 
 pub(super) fn model_kind_label(kind: crate::numeric_model::ModelKind) -> &'static str {
@@ -163,7 +167,12 @@ impl ActiveDataset {
         table_has_header: bool,
         revision: u64,
     ) -> Self {
+        // Схема и данные согласованы ещё в worker-е, поэтому расхождение здесь
+        // означало бы ошибку в программе, а не во входных данных.
+        let fingerprint = DatasetFingerprint::of(&prepared.data, &prepared.schema)
+            .expect("данные и схема согласованы при открытии набора");
         Self {
+            fingerprint,
             prepared,
             profile,
             role_messages: Vec::new(),
@@ -892,6 +901,11 @@ impl App {
         self.dataset.as_ref().map(|active| active.revision)
     }
 
+    /// Отпечаток активного набора данных.
+    pub(super) fn dataset_fingerprint(&self) -> Option<DatasetFingerprint> {
+        self.dataset.as_ref().map(|active| active.fingerprint)
+    }
+
     /// Отпечаток активных данных: ревизия набора и план разбиения.
     pub(super) fn dataset_stamp(&self) -> Option<(u64, SplitPlan)> {
         self.dataset
@@ -1020,8 +1034,18 @@ mod tests {
         )
     }
 
+    /// Отпечаток тестовых данных: ревизия меняет и числа тоже.
+    fn fingerprint(seed: f32) -> DatasetFingerprint {
+        let data = crate::data::NumericDataset::new(
+            ndarray::Array2::from_shape_vec((2, 2), vec![seed, 2.0, 3.0, 4.0]).unwrap(),
+            ndarray::Array2::from_shape_vec((2, 1), vec![5.0, 6.0]).unwrap(),
+        );
+        DatasetFingerprint::of(&data, &ModelSchema::synthetic(2, 1).unwrap()).unwrap()
+    }
+
     fn stamp(revision: u64, width: usize) -> RunStamp {
         RunStamp {
+            dataset: fingerprint(revision as f32),
             dataset_revision: revision,
             split: SplitPlan::default(),
             candidate: crate::lifecycle::CandidateSpec {

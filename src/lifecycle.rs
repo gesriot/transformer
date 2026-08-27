@@ -12,6 +12,7 @@
 //! файла и перезапуск приложения дают новую ревизию и снимают запрет. Честная
 //! защита требует отпечатка самих данных в checkpoint — это отдельный шаг.
 
+use crate::fingerprint::DatasetFingerprint;
 use crate::interpret::InterpretProfile;
 use crate::metrics::{EvalSource, Metrics};
 use crate::numeric_model::NumericConfig;
@@ -38,6 +39,12 @@ pub struct CandidateSpec {
 /// split — другой результат, и выдавать один за другой нельзя.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunStamp {
+    /// Что за данные. Именно по нему считается «те же данные»: ревизия — лишь
+    /// номер внутри сессии, а отпечаток переживает и повторное открытие файла,
+    /// и перезапуск приложения.
+    pub dataset: DatasetFingerprint,
+    /// Номер набора в текущей сессии. Нужен интерфейсу, чтобы отличать
+    /// устаревшие ответы worker-а, но идентичностью данных не является.
     pub dataset_revision: u64,
     pub split: SplitPlan,
     pub candidate: CandidateSpec,
@@ -96,8 +103,9 @@ pub struct TestDisclosure {
 }
 
 impl TestDisclosure {
-    pub fn dataset_revision(&self) -> u64 {
-        self.stamp.dataset_revision
+    /// На каких данных был потрачен test.
+    pub fn dataset(&self) -> DatasetFingerprint {
+        self.stamp.dataset
     }
 }
 
@@ -185,7 +193,9 @@ impl Lifecycle {
     /// Можно ли открывать test под этот отпечаток.
     pub fn can_finalize(&self, stamp: &RunStamp) -> Result<(), FinalizeRefusal> {
         if let Some(disclosed) = &self.disclosed {
-            if disclosed.dataset_revision() == stamp.dataset_revision {
+            // Сравниваются сами данные, а не номер набора в сессии: повторно
+            // открыв тот же файл, потраченный test не вернуть.
+            if disclosed.dataset() == stamp.dataset {
                 return Err(if disclosed.stamp == *stamp {
                     FinalizeRefusal::AlreadyFinalized
                 } else {
@@ -255,8 +265,23 @@ mod tests {
         }
     }
 
+    /// Отпечаток тестовых данных: `seed` меняет числа, а значит и данные.
+    fn fingerprint(seed: f32) -> DatasetFingerprint {
+        let data = crate::data::NumericDataset::new(
+            ndarray::Array2::from_shape_vec((2, 2), vec![seed, 2.0, 3.0, 4.0]).unwrap(),
+            ndarray::Array2::from_shape_vec((2, 1), vec![5.0, 6.0]).unwrap(),
+        );
+        let schema = crate::schema::ModelSchema::synthetic(2, 1).unwrap();
+        DatasetFingerprint::of(&data, &schema).unwrap()
+    }
+
     fn stamp(revision: u64, candidate: CandidateSpec) -> RunStamp {
+        stamp_on(fingerprint(1.0), revision, candidate)
+    }
+
+    fn stamp_on(dataset: DatasetFingerprint, revision: u64, candidate: CandidateSpec) -> RunStamp {
         RunStamp {
+            dataset,
             dataset_revision: revision,
             split: SplitPlan::default(),
             candidate,
@@ -357,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stays_disclosed_for_the_whole_dataset_revision() {
+    fn test_stays_disclosed_for_the_whole_dataset() {
         let first = stamp(1, candidate(16));
         let mut life = Lifecycle::default();
         life.record_check(checked(first.clone()));
@@ -382,23 +407,45 @@ mod tests {
         assert!(life.checked_for(&second).is_some());
     }
 
+    /// Повторное открытие ТЕХ ЖЕ данных даёт новую ревизию, но не возвращает
+    /// потраченный test: идентичность данных — это их отпечаток.
     #[test]
-    fn a_new_dataset_revision_clears_the_check_but_keeps_the_history() {
+    fn reopening_the_same_data_does_not_return_the_spent_test() {
+        let first = stamp(1, candidate(16));
+        let mut life = Lifecycle::default();
+        life.record_check(checked(first.clone()));
+        life.record_disclosure(disclosure(first.clone()));
+
+        life.on_dataset_changed();
+        assert!(
+            life.checked_for(&first).is_none(),
+            "проверка не переносится"
+        );
+
+        // Тот же файл открыт заново: ревизия другая, данные те же.
+        let reopened = stamp(2, candidate(32));
+        life.record_check(checked(reopened.clone()));
+        assert_eq!(
+            life.can_finalize(&reopened),
+            Err(FinalizeRefusal::TestDisclosed)
+        );
+    }
+
+    /// Другие данные начинают жизненный цикл заново.
+    #[test]
+    fn other_data_starts_a_new_lifecycle() {
         let old = stamp(1, candidate(16));
         let mut life = Lifecycle::default();
         life.record_check(checked(old.clone()));
-        life.record_disclosure(disclosure(old.clone()));
-
+        life.record_disclosure(disclosure(old));
         life.on_dataset_changed();
-        assert!(life.checked_for(&old).is_none());
-        // Раскрытие никуда не делось: оно относится к прежней ревизии.
-        assert!(life.disclosure().is_some());
 
-        // На новых данных запрет не действует, но проверка нужна заново.
-        let fresh = stamp(2, candidate(16));
+        let fresh = stamp_on(fingerprint(9.0), 2, candidate(16));
         assert_eq!(life.can_finalize(&fresh), Err(FinalizeRefusal::NotChecked));
         life.record_check(checked(fresh.clone()));
         assert!(life.can_finalize(&fresh).is_ok());
+        // История прежнего набора никуда не делась.
+        assert!(life.disclosure().is_some());
     }
 
     #[test]

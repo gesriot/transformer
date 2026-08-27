@@ -30,6 +30,7 @@ mod core;
 mod data;
 pub mod diagnostics;
 mod encoders;
+mod fingerprint;
 #[cfg(feature = "demo")]
 mod generate;
 #[cfg(feature = "gui")]
@@ -73,6 +74,9 @@ mod training;
 // Данные и схема.
 pub use data::{Normalizer, NumericDataset, OutOfRange};
 pub use encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
+// Отпечаток данных: то, что делает «те же данные» проверяемым утверждением, а
+// не совпадением номера в текущей сессии.
+pub use fingerprint::DatasetFingerprint;
 pub use schema::{Column, ColumnRole, ColumnType, ModelSchema, TableSchema};
 // Разметка таблицы: профиль -> черновик схемы -> отчёт по ролям. Ядро
 // независимо от интерфейса, поэтому идёт наружу целиком, а не через GUI.

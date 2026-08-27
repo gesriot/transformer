@@ -1031,9 +1031,13 @@ impl App {
         let dataset_revision = self
             .dataset_revision()
             .ok_or_else(|| NO_DATASET.to_string())?;
+        let dataset = self
+            .dataset_fingerprint()
+            .ok_or_else(|| NO_DATASET.to_string())?;
         Ok((
             data,
             RunStamp {
+                dataset,
                 dataset_revision,
                 split,
                 candidate: self.current_candidate()?,
@@ -1215,7 +1219,7 @@ impl App {
         if let Some(disclosed) = self.lifecycle.disclosure() {
             // Раскрытие переживает смену набора намеренно, но выдавать его за
             // результат текущих данных нельзя.
-            let historical = self.dataset_revision() != Some(disclosed.stamp.dataset_revision);
+            let historical = self.dataset_fingerprint() != Some(disclosed.dataset());
             ui.separator();
             let f = &disclosed.eval;
             let prefix = if historical {
