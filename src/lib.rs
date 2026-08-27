@@ -18,6 +18,7 @@
 //! фасад, либо внутренний и должен стать `pub(crate)`.
 #![warn(unreachable_pub)]
 
+mod atomic_write;
 mod batch_predict;
 // Встроенные ящики — демонстрация, но ими же порождаются данные для тестов
 // ядра: под `test` они доступны и без фичи, иначе каждому модулю пришлось бы
@@ -81,7 +82,8 @@ pub use markup::{
 pub use table::{Delimiter, Table};
 pub use tnum::{
     infer_prepare_spec_from_path, infer_prepare_spec_from_text, parse_categorical,
-    read_numeric_source, table_path_to_tnum, table_to_tnum, InferredPrepareSpec, PrepareSpec,
+    prepare_tnum_file, read_numeric_source, table_path_to_tnum, table_to_tnum, InferredPrepareSpec,
+    PrepareSpec, PrepareStats,
 };
 
 // Модель и её конфигурация. Полезная нагрузка `NumericModel` называется явно:

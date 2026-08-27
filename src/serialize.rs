@@ -9,6 +9,7 @@
 //! необязательное поле берёт default. Это позволяет расширять `ModelConfig`
 //! новыми полями (fourier_bands и т.п.) без поломки старых файлов.
 
+use crate::atomic_write::write_atomically;
 use crate::config::ModelConfig;
 use crate::data::Normalizer;
 #[cfg(feature = "demo")]
@@ -24,6 +25,7 @@ use ndarray::{Array2, ArrayD, Ix2, IxDyn};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 const MAGIC: u32 = 0x5452_4653; // "TRFS"
 const VERSION: u32 = 2;
@@ -690,13 +692,18 @@ fn r_header<R: Read>(r: &mut R, expected_kind: u32) -> io::Result<()> {
 }
 
 fn write_file(path: &str, kind: u32, sections: &[(&str, Vec<u8>)]) -> io::Result<()> {
-    let mut w = BufWriter::new(File::create(path)?);
-    w_header(&mut w, kind)?;
-    w_u64(&mut w, sections.len() as u64)?;
-    for (name, payload) in sections {
-        w_section(&mut w, name, payload)?;
-    }
-    w.flush()
+    // Через временный файл: неудачное сохранение не должно оставлять на месте
+    // прежнего checkpoint обрубок, который потом «не грузится».
+    write_atomically(Path::new(path), |file| {
+        let mut w = BufWriter::new(file);
+        w_header(&mut w, kind)?;
+        w_u64(&mut w, sections.len() as u64)?;
+        for (name, payload) in sections {
+            w_section(&mut w, name, payload)?;
+        }
+        // flush до возврата: ошибку из Drop у BufWriter никто не увидит.
+        w.flush()
+    })
 }
 
 fn validate_normalizer(
@@ -1056,6 +1063,50 @@ mod tests {
         assert_eq!(full.schema.n_outputs(), 1);
         assert_eq!(full.in_norm.n_features(), 2);
         assert_eq!(full.out_norm.n_features(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Сохранение поверх существующего checkpoint заменяет его целиком, и
+    /// заменённый файл грузится: запись идёт через временный файл.
+    #[test]
+    fn saving_over_an_existing_checkpoint_replaces_it_and_loads() {
+        let nc = numeric_cfg(ModelKind::Mlp);
+        let specs = vec![FeatureSpec::Continuous, FeatureSpec::Continuous];
+        let schema = ModelSchema::synthetic_from_specs(&specs, 1).unwrap();
+        let data = blackbox::sum().generate(8, 0);
+        let in_norm = Normalizer::fit(&data.inputs, &specs);
+        let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
+
+        let path = tmp_path("replace_checkpoint.bin");
+        // На месте назначения лежит мусор прежнего запуска.
+        std::fs::write(&path, [0xff_u8, 0xff, 0x00, 0x01]).unwrap();
+
+        let model = nc.build(&specs, 1);
+        save_numeric(&path, &nc, &schema, &model, &in_norm, &out_norm, None, None).unwrap();
+
+        let x = Tensor::constant(
+            Array2::from_shape_vec((1, 2), vec![0.25, -0.5])
+                .unwrap()
+                .into_dyn(),
+        );
+        let (loaded, _, _) = load_numeric(&path).unwrap();
+        assert_eq!(model.predict(&x).data(), loaded.predict(&x).data());
+
+        // Временных файлов рядом не осталось.
+        let dir = std::path::Path::new(&path).parent().unwrap().to_path_buf();
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| {
+                let n = e.ok()?.file_name().to_string_lossy().into_owned();
+                n.starts_with(&format!(".{name}.tmp")).then_some(n)
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
         std::fs::remove_file(&path).ok();
     }
 

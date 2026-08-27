@@ -5,11 +5,12 @@
 //! Сама конвертация — это `Table + TableSchema -> NumericDataset -> TRNUM2`,
 //! то есть тот же путь, которым таблицу открывает обучение.
 
+use crate::atomic_write::write_atomically;
 use crate::data::{read_numeric_tnum, write_numeric_tnum, NumericDataset};
 use crate::schema::{Column, ColumnRole, ModelSchema, TableSchema};
 use crate::table::Table;
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 
 pub(crate) use crate::table::Delimiter;
@@ -321,6 +322,44 @@ pub fn table_path_to_tnum(path: impl AsRef<Path>, spec: &PrepareSpec) -> Result<
     )
 }
 
+/// Сколько получилось в записанном `.tnum`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PrepareStats {
+    pub rows: usize,
+    pub n_inputs: usize,
+    pub n_outputs: usize,
+}
+
+/// Конвертировать таблицу в `.tnum` и записать его атомарно.
+///
+/// Единственный путь записи `.tnum` для всех поверхностей: раньше CLI и GUI
+/// делали это порознь и по-разному считали строки — GUI вычитал из числа строк
+/// фиксированные шесть заголовочных, хотя в TRNUM2 их больше при наличии
+/// `units`/`levels`.
+pub fn prepare_tnum_file(
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    spec: &PrepareSpec,
+) -> Result<PrepareStats, String> {
+    let text = table_path_to_tnum(input, spec)?;
+    // Число строк берём из заголовка: он единственный, кто знает его точно.
+    let rows = text
+        .lines()
+        .find_map(|line| line.strip_prefix("rows "))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .ok_or_else(|| "в записанном .tnum нет строки rows".to_string())?;
+
+    let output = output.as_ref();
+    write_atomically(output, |file| file.write_all(text.as_bytes()))
+        .map_err(|e| format!("запись {}: {e}", output.display()))?;
+    Ok(PrepareStats {
+        rows,
+        n_inputs: spec.n_inputs,
+        n_outputs: spec.n_outputs,
+    })
+}
+
 fn to_tnum(table: &Table, spec: &PrepareSpec) -> Result<String, String> {
     let schema = table_schema_from_prepare_spec(table, spec)?;
     let dataset = table.to_dataset_with_category_codes(&schema, &category_columns(spec))?;
@@ -394,6 +433,39 @@ mod tests {
         assert_eq!(schema.output_names(), vec!["y"]);
         assert!((ds.inputs[[0, 0]] - 0.5).abs() < 1e-6);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Единственный путь записи `.tnum`: заменяет существующий файл целиком,
+    /// читается обратно и считает строки по заголовку, а не по числу строк
+    /// файла — в TRNUM2 их больше при наличии `units`/`levels`.
+    #[test]
+    fn prepare_tnum_file_replaces_and_reads_back() {
+        let dir = std::env::temp_dir().join(format!("transformer_prepare_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("in.csv");
+        let output = dir.join("out.tnum");
+        std::fs::write(&input, "x0,x1,mat,y\n0.5,-0.2,1,2.0\n1.5,0.3,2,3.0\n").unwrap();
+        std::fs::write(&output, "прошлый результат").unwrap();
+
+        let stats = prepare_tnum_file(&input, &output, &spec(vec![(2, 3)])).unwrap();
+        assert_eq!(
+            (stats.rows, stats.n_inputs, stats.n_outputs),
+            (2, 3, 1),
+            "строки считаются по заголовку rows"
+        );
+
+        let (ds, schema) = crate::data::read_numeric_tnum(output.to_str().unwrap()).unwrap();
+        assert_eq!(ds.inputs.dim(), (2, 3));
+        assert_eq!(schema.output_names(), vec!["y"]);
+
+        // Ни временных файлов, ни следов прежнего содержимого.
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["in.csv".to_string(), "out.tnum".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

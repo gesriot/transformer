@@ -30,8 +30,8 @@ use transformer::{
 use transformer::{
     calibration_sample, evaluate, evaluate_on, evaluate_surrogate, export_predictions,
     infer_prepare_spec_from_path, load_numeric_full, parse_categorical, predict_dataset,
-    read_numeric_source, recommended_epoch, run_sweep, run_training, save_numeric, sweep_cost,
-    symbolize, table_path_to_tnum, validate_numeric, validate_train, Dataset, Delimiter,
+    prepare_tnum_file, read_numeric_source, recommended_epoch, run_sweep, run_training,
+    save_numeric, sweep_cost, symbolize, validate_numeric, validate_train, Dataset, Delimiter,
     EvalSchedule, ExportSummary, FeatureSpec, InterpretOverrides, InterpretProfile,
     InterpretReport, KanConfig, LrSchedule, Metrics, ModelConfig, ModelKind, ModelSchema,
     Normalizer, NumericConfig, NumericDataset, NumericModel, Phase, PrepareSpec, SearchObjective,
@@ -1341,15 +1341,8 @@ fn run_prepare(rest: &[String]) {
         categorical,
     };
 
-    let tnum = table_path_to_tnum(input, &spec).unwrap_or_else(|e| fail(&e));
-    // Число строк берём из самого заголовка: их количество в TRNUM2 зависит от
-    // наличия units и levels, поэтому вычитать фиксированную константу нельзя.
-    let rows = tnum
-        .lines()
-        .find_map(|l| l.strip_prefix("rows "))
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or_else(|| fail("в записанном .tnum нет строки rows"));
-    std::fs::write(output, &tnum).unwrap_or_else(|e| fail(&format!("запись {output}: {e}")));
+    let stats = prepare_tnum_file(input, output, &spec).unwrap_or_else(|e| fail(&e));
+    let (rows, n_inputs, n_outputs) = (stats.rows, stats.n_inputs, stats.n_outputs);
     println!("Записано {output}: {rows} строк, {n_inputs} вход -> {n_outputs} выход");
 }
 

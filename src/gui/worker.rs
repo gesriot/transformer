@@ -38,7 +38,7 @@ use crate::table::{Delimiter, Table};
 #[cfg(feature = "demo")]
 use crate::textmodel::TextModel;
 use crate::tnum::{
-    infer_prepare_spec_from_table, read_numeric_source, table_path_to_tnum, PrepareSpec,
+    infer_prepare_spec_from_table, prepare_tnum_file, read_numeric_source, PrepareSpec,
 };
 use crate::train::{evaluate_surrogate, predict_dataset, validate_train, TrainConfig};
 #[cfg(feature = "demo")]
@@ -863,10 +863,8 @@ fn prepare_tnum(
     output: &str,
     spec: &PrepareSpec,
 ) -> Result<(usize, usize, usize), String> {
-    let tnum = table_path_to_tnum(input, spec)?;
-    let rows = tnum.lines().count().saturating_sub(6);
-    std::fs::write(output, &tnum).map_err(|e| format!("запись {output}: {e}"))?;
-    Ok((rows, spec.n_inputs, spec.n_outputs))
+    let stats = prepare_tnum_file(input, output, spec)?;
+    Ok((stats.rows, stats.n_inputs, stats.n_outputs))
 }
 
 #[allow(clippy::too_many_arguments)]
