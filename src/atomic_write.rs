@@ -49,11 +49,7 @@ pub(crate) fn write_atomically<F>(path: &Path, write: F) -> io::Result<()>
 where
     F: FnOnce(&mut File) -> io::Result<()>,
 {
-    let dir = match path.parent() {
-        // Пустой родитель у «file.txt» означает текущий каталог, а не корень.
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
+    let dir = destination_dir(path);
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::other(format!("{}: не путь к файлу", path.display())))?;
@@ -76,6 +72,26 @@ where
             let _ = fs::remove_file(&temp_path);
             Err(e)
         }
+    }
+}
+
+/// Один ли это файл: сначала дешёвое сравнение путей, затем разрешение
+/// существующих ссылок и компонентов `.`/`..`.
+pub(crate) fn same_file(first: &Path, second: &Path) -> bool {
+    if first == second {
+        return true;
+    }
+    match (fs::canonicalize(first), fs::canonicalize(second)) {
+        (Ok(first), Ok(second)) => first == second,
+        _ => false,
+    }
+}
+
+fn destination_dir(path: &Path) -> &Path {
+    match path.parent() {
+        // Пустой родитель у «file.txt» означает текущий каталог, а не корень.
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
     }
 }
 
@@ -202,13 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_next_to_the_destination_even_without_a_directory_component() {
-        // Относительный путь без каталога: временный файл должен лечь в
-        // текущий каталог, а не в корень.
-        let dir = temp_dir("relative");
-        let path = dir.join("plain.txt");
-        write_atomically(Path::new(path.to_str().unwrap()), |f| f.write_all(b"x")).unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"x");
-        fs::remove_dir_all(&dir).unwrap();
+    fn bare_destination_uses_the_current_directory() {
+        assert_eq!(destination_dir(Path::new("plain.txt")), Path::new("."));
     }
 }

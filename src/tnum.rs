@@ -5,7 +5,7 @@
 //! Сама конвертация — это `Table + TableSchema -> NumericDataset -> TRNUM2`,
 //! то есть тот же путь, которым таблицу открывает обучение.
 
-use crate::atomic_write::write_atomically;
+use crate::atomic_write::{same_file, write_atomically};
 use crate::data::{read_numeric_tnum, write_numeric_tnum, NumericDataset};
 use crate::schema::{Column, ColumnRole, ModelSchema, TableSchema};
 use crate::table::Table;
@@ -336,12 +336,21 @@ pub struct PrepareStats {
 /// Единственный путь записи `.tnum` для всех поверхностей: раньше CLI и GUI
 /// делали это порознь и по-разному считали строки — GUI вычитал из числа строк
 /// фиксированные шесть заголовочных, хотя в TRNUM2 их больше при наличии
-/// `units`/`levels`.
+/// `units`/`levels`. Входной файл нельзя указать как выходной: успешная
+/// конвертация не должна уничтожать исходную таблицу.
 pub fn prepare_tnum_file(
     input: impl AsRef<Path>,
     output: impl AsRef<Path>,
     spec: &PrepareSpec,
 ) -> Result<PrepareStats, String> {
+    let input = input.as_ref();
+    let output = output.as_ref();
+    if same_file(input, output) {
+        return Err(
+            "входной и выходной путь совпадают: prepare не должен перезаписывать исходную таблицу"
+                .to_string(),
+        );
+    }
     let text = table_path_to_tnum(input, spec)?;
     // Число строк берём из заголовка: он единственный, кто знает его точно.
     let rows = text
@@ -350,7 +359,6 @@ pub fn prepare_tnum_file(
         .and_then(|value| value.trim().parse::<usize>().ok())
         .ok_or_else(|| "в записанном .tnum нет строки rows".to_string())?;
 
-    let output = output.as_ref();
     write_atomically(output, |file| file.write_all(text.as_bytes()))
         .map_err(|e| format!("запись {}: {e}", output.display()))?;
     Ok(PrepareStats {
@@ -466,6 +474,33 @@ mod tests {
         left.sort();
         assert_eq!(left, vec!["in.csv".to_string(), "out.tnum".to_string()]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prepare_tnum_file_rejects_overwriting_its_input() {
+        let path = std::env::temp_dir().join(format!(
+            "transformer_prepare_same_path_{}.csv",
+            std::process::id()
+        ));
+        let contents = "x0,y0\n1,2\n";
+        std::fs::write(&path, contents).unwrap();
+
+        let err = prepare_tnum_file(
+            &path,
+            &path,
+            &PrepareSpec {
+                n_inputs: 1,
+                n_outputs: 1,
+                delimiter: Delimiter::Auto,
+                has_header: true,
+                categorical: Vec::new(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("не должен перезаписывать"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

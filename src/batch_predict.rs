@@ -3,7 +3,7 @@
 //! Writer намеренно создаёт новую минимальную книгу: значения первого листа
 //! сохраняются, стили, формулы и дополнительные листы — нет.
 
-use crate::atomic_write::write_atomically;
+use crate::atomic_write::{same_file, write_atomically};
 use crate::predict::{parse_rows, Predictions};
 use crate::schema::ModelSchema;
 use crate::table::{Delimiter, Table};
@@ -61,7 +61,7 @@ pub fn export_predictions<F>(
 where
     F: Fn(&Array2<f32>) -> Result<Predictions, String>,
 {
-    if same_path(input, output) {
+    if same_file(Path::new(input), Path::new(output)) {
         return Err(
             "входной и выходной путь совпадают: экспорт не должен перезаписывать исходную книгу"
                 .to_string(),
@@ -163,16 +163,6 @@ where
         replaced,
         added,
     })
-}
-
-fn same_path(input: &str, output: &str) -> bool {
-    if Path::new(input) == Path::new(output) {
-        return true;
-    }
-    match (std::fs::canonicalize(input), std::fs::canonicalize(output)) {
-        (Ok(input), Ok(output)) => input == output,
-        _ => false,
-    }
 }
 
 fn header_index(headers: &[String]) -> Result<HashMap<&str, usize>, String> {
