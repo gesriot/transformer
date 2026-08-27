@@ -43,13 +43,22 @@ pub struct RunStamp {
     pub candidate: CandidateSpec,
 }
 
+impl RunStamp {
+    /// Чем является development-метрика этого запуска. Источник выводится из
+    /// разбиения, а не хранится вторым полем, которое могло бы с ним разойтись.
+    pub fn eval_source(&self) -> EvalSource {
+        match self.split {
+            SplitPlan::Holdout { .. } => EvalSource::Validation,
+            SplitPlan::KFold { k, .. } => EvalSource::Cv { k },
+        }
+    }
+}
+
 /// Результат фазы разработки: то, по чему принимают решения.
 #[derive(Clone, Debug)]
 pub struct CheckEval {
     pub metrics: Metrics,
     pub per_output: Vec<Metrics>,
-    /// `Validation` у holdout, `Cv { k }` у K-fold. `Test` сюда не попадает.
-    pub source: EvalSource,
 }
 
 /// Проверенный кандидат: отпечаток и то, что показал validation.
@@ -59,17 +68,30 @@ pub struct CheckedRun {
     pub eval: CheckEval,
 }
 
+impl CheckedRun {
+    /// `Validation` у holdout, `Cv { k }` у K-fold. `Test` сюда не попадает.
+    pub fn source(&self) -> EvalSource {
+        self.stamp.eval_source()
+    }
+}
+
 /// Состоявшееся раскрытие test: на какой ревизии данных, каким кандидатом и с
 /// каким результатом.
 #[derive(Clone, Debug)]
 pub struct TestDisclosure {
-    pub dataset_revision: u64,
     pub stamp: RunStamp,
     pub eval: FinalEval,
 }
 
+impl TestDisclosure {
+    pub fn dataset_revision(&self) -> u64 {
+        self.stamp.dataset_revision
+    }
+}
+
 /// Почему финальное обучение сейчас запрещено.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FinalizeRefusal {
     /// Кандидат ещё не проверен на validation.
     NotChecked,
@@ -142,7 +164,7 @@ impl Lifecycle {
     /// Можно ли открывать test под этот отпечаток.
     pub fn can_finalize(&self, stamp: &RunStamp) -> Result<(), FinalizeRefusal> {
         if let Some(disclosed) = &self.disclosed {
-            if disclosed.dataset_revision == stamp.dataset_revision {
+            if disclosed.dataset_revision() == stamp.dataset_revision {
                 return Err(if disclosed.stamp == *stamp {
                     FinalizeRefusal::AlreadyFinalized
                 } else {
@@ -227,14 +249,12 @@ mod tests {
             eval: CheckEval {
                 metrics: metrics(),
                 per_output: vec![metrics()],
-                source: EvalSource::Validation,
             },
         }
     }
 
     fn disclosure(stamp: RunStamp) -> TestDisclosure {
         TestDisclosure {
-            dataset_revision: stamp.dataset_revision,
             stamp,
             eval: FinalEval {
                 metrics: metrics(),
@@ -261,6 +281,23 @@ mod tests {
         assert!(life.can_finalize(&current).is_ok());
         assert!(life.checked_for(&current).is_some());
         assert!(!life.check_is_stale(&current));
+        assert_eq!(
+            life.checked_for(&current).unwrap().source(),
+            EvalSource::Validation
+        );
+    }
+
+    #[test]
+    fn check_source_is_derived_from_the_split() {
+        let mut cv = stamp(1, candidate(16));
+        cv.split = SplitPlan::KFold {
+            k: 4,
+            folds_seed: 1,
+            test_frac: 0.15,
+            test_seed: 1,
+        };
+        let run = checked(cv);
+        assert_eq!(run.source(), EvalSource::Cv { k: 4 });
     }
 
     #[test]

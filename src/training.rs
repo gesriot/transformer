@@ -1482,6 +1482,32 @@ mod tests {
         assert!(outcome.final_eval.is_none());
     }
 
+    /// Хук финальной обработки выполняется после обучения, но до test. Он
+    /// может обнаружить ошибку или отмену и обязан иметь возможность закрыть
+    /// последнюю границу без единого замера test.
+    #[test]
+    fn cancellation_from_final_post_train_does_not_open_test() {
+        let ds = dataset(120);
+        let cancel = AtomicBool::new(false);
+        let outcome = refit(
+            &ds,
+            SplitPlan::default(),
+            &setup(1),
+            DEFAULT_FINAL_INIT_SEED,
+            &cancel,
+            &mut |_, _| {},
+            &mut |_, _| {},
+            &mut |phase, _, _, _| {
+                assert_eq!(phase, Phase::Final);
+                cancel.store(true, Ordering::Relaxed);
+            },
+        )
+        .unwrap();
+
+        assert!(outcome.model.is_none());
+        assert!(outcome.eval.is_none());
+    }
+
     #[test]
     fn full_training_rejects_unaggregated_kfold() {
         let ds = dataset(120);

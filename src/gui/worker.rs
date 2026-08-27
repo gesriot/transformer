@@ -977,6 +977,9 @@ fn train_numeric(
             }
             if let Err(e) = interpret::apply_l1(model, p) {
                 *pipeline_error.borrow_mut() = Some(e);
+                // Ядро проверяет cancel до post-train и до открытия test.
+                // Ошибка настройки модели должна остановить тот же путь.
+                cancel.store(true, Ordering::Relaxed);
             }
         }
     };
@@ -1001,7 +1004,12 @@ fn train_numeric(
             cancel,
         ) {
             Ok(report) => reports.borrow_mut().push((phase, report)),
-            Err(e) => *pipeline_error.borrow_mut() = Some(e),
+            Err(e) => {
+                *pipeline_error.borrow_mut() = Some(e);
+                // `refit` проверит флаг сразу после хука и не откроет test по
+                // модели, для которой запрошенный конвейер не завершился.
+                cancel.store(true, Ordering::Relaxed);
+            }
         }
     };
     // Ручной запуск заканчивается development-моделью. После поиска выбор уже
@@ -1028,6 +1036,9 @@ fn train_numeric(
                 &mut configure,
                 &mut post_train,
             )?;
+            if let Some(e) = pipeline_error.borrow_mut().take() {
+                return Err(e);
+            }
             let Some(trained) = outcome.model else {
                 let _ = evt_tx.send(Event::TrainDone {
                     stamp: Box::new(stamp.clone()),
@@ -1070,6 +1081,9 @@ fn train_numeric(
                 &mut configure,
                 &mut post_train,
             )?;
+            if let Some(e) = pipeline_error.borrow_mut().take() {
+                return Err(e);
+            }
             if cancel.load(Ordering::Relaxed) {
                 let _ = evt_tx.send(Event::TrainDone {
                     stamp: Box::new(stamp.clone()),
@@ -1102,9 +1116,6 @@ fn train_numeric(
         out_norm,
         ..
     } = trained;
-    if let Some(e) = pipeline_error.into_inner() {
-        return Err(e);
-    }
     let reports = reports.into_inner();
     // Отчёты по фазам: у development видно влияние прунинга на validation, у
     // финальной — какой стала структура.
@@ -1269,6 +1280,65 @@ mod tests {
         assert!(done.2, "обучение должно быть помечено отменённым");
         assert!(!done.0, "test открывать нельзя");
         assert!(!done.1, "отчёт неполного конвейера не публикуется");
+    }
+
+    /// Ошибка запрошенного interpret-конвейера должна остановить refit до
+    /// test. Иначе worker вернул бы ошибку без `TrainDone`, хотя test уже был
+    /// измерен внутри ядра и lifecycle об этом никогда не узнал бы.
+    #[test]
+    fn failed_pipeline_stops_before_final_evaluation() {
+        let data = blackbox::sum().generate(64, 0);
+        let prepared = PreparedData {
+            origin: DatasetOrigin::Blackbox("sum".to_string()),
+            data: Arc::new(data),
+            schema: ModelSchema::synthetic(2, 1).unwrap(),
+        };
+        let config = NumericConfig {
+            kind: ModelKind::Mlp,
+            transformer: ModelConfig::default(),
+            value: ValueEncoderConfig::default(),
+            mlp_width: 4,
+            mlp_layers: 1,
+            kan: KanConfig::default(),
+        };
+        let train = TrainConfig {
+            epochs: 1,
+            batch_size: 16,
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+
+        let result = train_numeric(
+            &prepared,
+            &stamp(
+                SplitPlan::default(),
+                config,
+                train,
+                Some(InterpretProfile::v1()),
+            ),
+            true,
+            &tx,
+            &egui::Context::default(),
+            &cancel,
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("interpret-конвейер на MLP должен быть отвергнут"),
+        };
+
+        assert!(error.contains("KAN"), "{error}");
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "ошибка хука обязана остановить ядро до test"
+        );
+        assert!(rx.try_iter().all(|event| !matches!(
+            event,
+            Event::TrainDone {
+                final_eval: Some(_),
+                ..
+            }
+        )));
     }
 
     #[test]

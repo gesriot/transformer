@@ -19,7 +19,7 @@ use crate::encoders::ValueEncoderKind;
 use crate::interpret::InterpretOverrides;
 use crate::lifecycle::{CheckEval, CheckedRun, Lifecycle, TestDisclosure};
 use crate::markup::{Message, TableProfile};
-use crate::metrics::{EvalSource, Metrics};
+use crate::metrics::Metrics;
 use crate::split::{FinalEval, SplitPlan};
 use crate::sweep::{self, SweepChoice, SweepRow};
 use crate::train::LrSchedule;
@@ -51,15 +51,6 @@ impl Section {
             #[cfg(feature = "demo")]
             Section::Demo => "Демо",
         }
-    }
-}
-
-/// Чем является итоговая метрика development-модели: validation у holdout,
-/// CV у K-fold. Без разбиения считать нечего — тогда и подписывать нечем.
-fn validation_source(origin: Option<&ValidationOrigin>) -> EvalSource {
-    match origin.map(|o| o.plan) {
-        Some(SplitPlan::KFold { k, .. }) => EvalSource::Cv { k },
-        _ => EvalSource::Validation,
     }
 }
 
@@ -401,6 +392,7 @@ impl App {
                     cancelled,
                 } => {
                     self.training = false;
+                    let mut protocol_error = None;
                     // До успешного завершения активной остаётся прежняя
                     // модель worker-а, поэтому отмена не должна стирать её
                     // метрики из шапки.
@@ -409,21 +401,36 @@ impl App {
                         // текущей формой: если её успели изменить, проверка
                         // относится к прежнему кандидату и к нему же вернётся,
                         // если поля вернуть обратно.
-                        if let (Some(m), Some(per)) = (&metrics, &per_output) {
-                            self.lifecycle.record_check(CheckedRun {
-                                stamp: (*stamp).clone(),
-                                eval: CheckEval {
-                                    metrics: m.clone(),
-                                    per_output: per.clone(),
-                                    source: validation_source(validation_origin.as_ref()),
-                                },
-                            });
+                        if let (Some(m), Some(per), Some(origin)) =
+                            (&metrics, &per_output, &validation_origin)
+                        {
+                            // При расхождении безопаснее не разблокировать
+                            // final, чем приписать проверку другому split.
+                            if origin.plan != stamp.split {
+                                protocol_error = Some(
+                                    "внутренняя ошибка: метрика и stamp описывают разные split"
+                                        .to_string(),
+                                );
+                            } else {
+                                self.lifecycle.record_check(CheckedRun {
+                                    stamp: (*stamp).clone(),
+                                    eval: CheckEval {
+                                        metrics: m.clone(),
+                                        per_output: per.clone(),
+                                    },
+                                });
+                            }
                         }
                         // Раскрытие test фиксируется всегда: замер уже сделан,
                         // и правка формы его не возвращает.
                         if let Some(eval) = &final_eval {
+                            if eval.origin.plan != stamp.split {
+                                protocol_error = Some(
+                                    "внутренняя ошибка: test и stamp описывают разные split"
+                                        .to_string(),
+                                );
+                            }
                             self.lifecycle.record_disclosure(TestDisclosure {
-                                dataset_revision: stamp.dataset_revision,
                                 stamp: *stamp,
                                 eval: eval.clone(),
                             });
@@ -434,7 +441,9 @@ impl App {
                         self.final_eval = final_eval;
                         self.interpret_reports = interpret;
                     }
-                    self.status = if cancelled {
+                    self.status = if let Some(error) = protocol_error {
+                        error
+                    } else if cancelled {
                         "обучение отменено".to_string()
                     } else if self.final_eval.is_some() {
                         "финальное обучение завершено, test открыт".to_string()
@@ -937,33 +946,6 @@ mod tests {
             true,
             revision,
         )
-    }
-
-    /// Метрика development-модели подписывается тем, чем она является:
-    /// validation у holdout и CV у K-fold. Ошибка здесь означала бы, что
-    /// проверенный кандидат записан с чужим происхождением.
-    #[test]
-    fn validation_source_follows_the_split() {
-        assert_eq!(validation_source(None), EvalSource::Validation);
-        assert_eq!(
-            validation_source(Some(&ValidationOrigin {
-                plan: SplitPlan::default(),
-                init_seed: 0,
-            })),
-            EvalSource::Validation
-        );
-        assert_eq!(
-            validation_source(Some(&ValidationOrigin {
-                plan: SplitPlan::KFold {
-                    k: 4,
-                    folds_seed: 1,
-                    test_frac: 0.15,
-                    test_seed: 1,
-                },
-                init_seed: 0,
-            })),
-            EvalSource::Cv { k: 4 }
-        );
     }
 
     /// Отпечаток результата поиска — данные и разбиение. По нему видно, что
