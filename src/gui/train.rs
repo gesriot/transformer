@@ -7,6 +7,7 @@ use crate::config::ModelConfig;
 use crate::encoders::{ValueEncoderConfig, ValueEncoderKind};
 use crate::interpret::{self, InterpretOverrides, InterpretProfile};
 use crate::lifecycle::{CandidateSpec, RunStamp};
+use crate::metrics::EvalSource;
 use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
 use crate::split::DEFAULT_FINAL_INIT_SEED;
 use crate::sweep::{self, SearchBudget, SweepAxes, SweepChoice, SweepObjective, SweepRow};
@@ -990,9 +991,6 @@ impl App {
         Ok(CandidateSpec {
             config,
             train,
-            // Кривая по эпохам относится к ручной настройке; здесь число эпох
-            // уже выбрано поиском.
-            eval: EvalSchedule::Never,
             interpret: self.interpret_profile(choice.kind)?,
         })
     }
@@ -1007,7 +1005,6 @@ impl App {
                 Ok(CandidateSpec {
                     config,
                     train,
-                    eval: self.eval_schedule(),
                     interpret,
                 })
             }
@@ -1040,16 +1037,29 @@ impl App {
                 dataset_revision,
                 split,
                 candidate: self.current_candidate()?,
+                // Финальный seed задан заранее: подбирать его по результату
+                // проверки значит подбирать по тем же данным.
+                final_init_seed: DEFAULT_FINAL_INIT_SEED,
             },
         ))
     }
 
+    /// Расписание замеров — настройка запуска, а не личность кандидата: без
+    /// ранней остановки оно не меняет модель, только частоту наблюдений.
+    /// Поэтому оно едет в команде, а не в отпечатке.
     fn send_check(&mut self, data: PreparedData, stamp: RunStamp) {
+        // После поиска число эпох уже выбрано, и отдельная кривая по эпохам
+        // означала бы CV-ломаную по одному fold.
+        let eval = match self.mode {
+            TrainingMode::Single => self.eval_schedule(),
+            TrainingMode::Auto(_) | TrainingMode::Custom => EvalSchedule::Never,
+        };
         self.train_parameter_count = None;
         self.worker.reset_cancel();
         self.worker.send(Command::CheckCandidate {
             data,
             stamp: Box::new(stamp),
+            eval,
         });
     }
 
@@ -1122,7 +1132,12 @@ impl App {
             let final_refit = PlotPoints::from(self.final_loss_curve.clone());
             Plot::new("loss_plot").height(220.0).show(ui, |pui| {
                 if !self.loss_curve.is_empty() {
-                    pui.line(Line::new(development).name("development train loss"));
+                    let name = if self.curve_folds > 1 {
+                        format!("train loss, среднее по {} folds", self.curve_folds)
+                    } else {
+                        "development train loss".to_string()
+                    };
+                    pui.line(Line::new(development).name(name));
                 }
                 if !self.final_loss_curve.is_empty() {
                     pui.line(Line::new(final_refit).name("final train+validation loss"));
@@ -1133,28 +1148,55 @@ impl App {
             // Кривая по эпохам — то, ради чего раньше был отдельный сценарий.
             let points = PlotPoints::from(self.val_curve.clone());
             let recommendation = self.recommended_epochs();
+            // Название говорит, что нарисовано: у K-fold это среднее по
+            // folds, а не кривая одного обучения.
+            let name = if self.curve_folds > 1 {
+                format!("validation R², среднее по {} folds", self.curve_folds)
+            } else {
+                "validation R²".to_string()
+            };
             Plot::new("val_plot")
                 .height(200.0)
-                .show(ui, |pui| pui.line(Line::new(points).name("validation R²")));
+                .show(ui, |pui| pui.line(Line::new(points).name(name)));
             if let Some((epochs, why)) = recommendation {
                 ui.label(format!("Рекомендованная остановка: {epochs} эпох ({why})"));
             }
         }
-        if let Some(m) = &self.metrics {
+        // Результат проверки живёт здесь, а не в разделе «Модель»: он
+        // относится к кандидату, а не к активной модели.
+        if let Some(run) = self.lifecycle.checked() {
             ui.separator();
+            let current = self
+                .current_stamp()
+                .is_ok_and(|(_, stamp)| stamp == run.stamp);
+            let source = match run.stamp.eval_source() {
+                EvalSource::Cv { k } => format!("cv-{k}"),
+                _ => "validation".to_string(),
+            };
+            let m = &run.eval.metrics;
             ui.label(format!(
-                "validation: RMSE={:.5}   MAE={:.5}   rel.error={:.2}%   R²={:.5}",
+                "{source}: RMSE={:.5}   MAE={:.5}   rel.error={:.2}%   R²={:.5}",
                 m.rmse,
                 m.mae,
                 m.rel_error * 100.0,
                 m.r2
             ));
-            if self.final_eval.is_none() {
-                ui.label("Test отложен: его открывает только финальное обучение.");
+            if run.eval.r2_std_folds > 0.0 {
+                ui.label(format!(
+                    "Разброс R² между folds: ±{:.5}",
+                    run.eval.r2_std_folds
+                ));
+            }
+            if !current {
+                ui.colored_label(
+                    egui::Color32::from_rgb(200, 120, 0),
+                    "Проверка относится к другому кандидату: форма изменилась после неё.",
+                );
             }
         }
-        if let Some(f) = &self.final_eval {
+        if let Some(disclosed) = self.lifecycle.disclosure() {
             ui.separator();
+            let f = &disclosed.eval;
             ui.label(format!(
                 "test ({} строк, единственный замер): RMSE={:.5}   MAE={:.5}   \
                  rel.error={:.2}%   R²={:.5}",

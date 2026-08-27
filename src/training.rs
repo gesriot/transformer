@@ -690,9 +690,13 @@ pub(crate) fn train_candidate(
     })
 }
 
-/// Результат проверки кандидата: оценка и — у holdout — сама модель.
+/// Состоявшаяся проверка кандидата.
+///
+/// Отдельного «отменённого» варианта здесь нет: отмена возвращает `None`, и
+/// подставлять вместо метрик нули или NaN нельзя — по ним начали бы принимать
+/// решения.
 #[non_exhaustive]
-pub struct CheckOutcome {
+pub struct CompletedCheck {
     /// Средние метрики по всем folds (у holdout — просто validation).
     pub metrics: Metrics,
     pub per_output: Vec<Metrics>,
@@ -700,15 +704,18 @@ pub struct CheckOutcome {
     pub r2_std_folds: f32,
     /// Чем является оценка: validation у holdout, CV у K-fold.
     pub source: EvalSource,
+    /// История обучения КАЖДОГО fold, по порядку.
+    ///
+    /// Отдельными кривыми, а не одной склейкой: у K-fold номера эпох
+    /// повторяются, и объединённая ломаная не описывает ни один прогон.
+    pub histories: Vec<TrainingHistory>,
     /// Модель фазы разработки. У K-fold её нет: моделей столько же, сколько
     /// folds, и выдавать одну из них за общую оценку нельзя.
     pub model: Option<TrainedModel>,
-    /// Проверка прервана: оценки нет, решение принимать не по чему.
-    pub cancelled: bool,
 }
 
 /// Проверить кандидата: обучить его на каждом fold и снять оценку, не трогая
-/// test.
+/// test. `None` — проверка отменена.
 ///
 /// Единственный путь «проверки» для всех режимов интерфейса. У holdout это одно
 /// обучение на train с метриками на validation; у K-fold — обучение на каждом
@@ -726,7 +733,7 @@ pub fn check_candidate(
     on_point: &mut dyn FnMut(usize, &EpochPoint),
     configure_model: &mut dyn FnMut(&NumericModel),
     post_train: PostCheck<'_>,
-) -> Result<CheckOutcome, String> {
+) -> Result<Option<CompletedCheck>, String> {
     setup.validate()?;
     let prepared = split.prepare(dataset.data())?;
     let pool = prepared.search;
@@ -734,10 +741,11 @@ pub fn check_candidate(
     let init_seed = setup.train.seed;
 
     let mut runs: Vec<RunEval> = Vec::with_capacity(folds);
+    let mut histories = Vec::with_capacity(folds);
     let mut model = None;
     for fold in 0..folds {
         if cancel.load(Ordering::Relaxed) {
-            return Ok(cancelled_check(pool.source()));
+            return Ok(None);
         }
         let mut trained = train_candidate(
             dataset,
@@ -750,16 +758,22 @@ pub fn check_candidate(
             configure_model,
         )?;
         if cancel.load(Ordering::Relaxed) {
-            return Ok(cancelled_check(pool.source()));
+            return Ok(None);
         }
         let (train, val) = pool.fold(fold)?;
         post_train(fold, &mut trained, &train, Some(&val));
+        // Конвейер мог быть прерван внутри хука: тогда модель недоучена, и
+        // мерить её нельзя — оценка описывала бы полуфабрикат.
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         let (metrics, per_output) = evaluate_on(&trained, &val);
         runs.push(RunEval {
             metrics,
             per_output,
             origin: pool.run_origin(fold, init_seed),
         });
+        histories.push(trained.history.clone());
         // Модель отдаём только когда fold один: тогда она и есть оценка.
         if folds == 1 {
             model = Some(trained);
@@ -767,33 +781,14 @@ pub fn check_candidate(
     }
 
     let eval = aggregate_runs(&runs, &[init_seed], pool.source())?;
-    Ok(CheckOutcome {
+    Ok(Some(CompletedCheck {
         metrics: eval.mean,
         per_output: eval.per_output_mean,
         r2_std_folds: eval.r2_std_folds,
         source: eval.origin.source,
+        histories,
         model,
-        cancelled: false,
-    })
-}
-
-/// Отменённая проверка: метрик нет, и подставлять нули нельзя — по ним начали
-/// бы принимать решения.
-fn cancelled_check(source: EvalSource) -> CheckOutcome {
-    let empty = Metrics {
-        rmse: f32::NAN,
-        mae: f32::NAN,
-        rel_error: f32::NAN,
-        r2: f32::NAN,
-    };
-    CheckOutcome {
-        metrics: empty,
-        per_output: Vec::new(),
-        r2_std_folds: f32::NAN,
-        source,
-        model: None,
-        cancelled: true,
-    }
+    }))
 }
 
 /// Полный сценарий: разбиение, фаза разработки и — по запросу — финальное
@@ -1101,7 +1096,8 @@ mod tests {
             &mut |_| {},
             &mut |fold, _, _, _| folds_seen.push(fold),
         )
-        .unwrap();
+        .unwrap()
+        .expect("проверка не отменялась");
         assert_eq!(folds_seen, vec![0]);
         assert_eq!(holdout.source, EvalSource::Validation);
         assert_eq!(holdout.r2_std_folds, 0.0, "у holdout разброса по folds нет");
@@ -1110,7 +1106,6 @@ mod tests {
             "у holdout модель — это и есть оценка"
         );
         assert!(holdout.metrics.r2.is_finite());
-        assert!(!holdout.cancelled);
 
         let mut folds_seen = Vec::new();
         let kfold = check_candidate(
@@ -1127,11 +1122,15 @@ mod tests {
             &mut |_| {},
             &mut |fold, _, _, _| folds_seen.push(fold),
         )
-        .unwrap();
+        .unwrap()
+        .expect("проверка не отменялась");
         assert_eq!(folds_seen, vec![0, 1, 2], "конвейер идёт по каждому fold");
         assert_eq!(kfold.source, EvalSource::Cv { k: 3 });
         assert!(kfold.model.is_none(), "ни один fold не представляет CV");
         assert!(kfold.r2_std_folds.is_finite());
+        // Истории отдельные: склеивать их в одну кривую нельзя — номера эпох
+        // повторяются.
+        assert_eq!(kfold.histories.len(), 3);
     }
 
     /// Конвейер интерпретации меняет саму модель, поэтому метрики снимаются
@@ -1152,7 +1151,8 @@ mod tests {
             &mut |_| {},
             &mut |_, _, _, _| {},
         )
-        .unwrap();
+        .unwrap()
+        .expect("проверка не отменялась");
 
         // Хук портит модель: обнуляет её выход. Если бы оценка снималась до
         // хука, метрики совпали бы с честными.
@@ -1169,7 +1169,8 @@ mod tests {
                 }
             },
         )
-        .unwrap();
+        .unwrap()
+        .expect("проверка не отменялась");
 
         assert!(
             broken.metrics.r2 < honest.metrics.r2,
@@ -1194,9 +1195,7 @@ mod tests {
             &mut |_, _, _, _| {},
         )
         .unwrap();
-        assert!(outcome.cancelled);
-        assert!(outcome.model.is_none());
-        assert!(outcome.metrics.r2.is_nan());
+        assert!(outcome.is_none(), "отменённая проверка не даёт оценки");
     }
 
     #[test]

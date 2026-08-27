@@ -17,7 +17,6 @@ use crate::metrics::{EvalSource, Metrics};
 use crate::numeric_model::NumericConfig;
 use crate::split::{FinalEval, SplitPlan};
 use crate::train::TrainConfig;
-use crate::training::EvalSchedule;
 
 /// Кандидат целиком: разрешённая конфигурация модели, параметры обучения и
 /// профиль интерпретации.
@@ -27,8 +26,9 @@ use crate::training::EvalSchedule;
 #[derive(Clone, Debug, PartialEq)]
 pub struct CandidateSpec {
     pub config: NumericConfig,
+    /// Параметры обучения проверки. `train.seed` — seed инициализации ИМЕННО
+    /// проверки; финальный переобучается со своим, см. [`RunStamp`].
     pub train: TrainConfig,
-    pub eval: EvalSchedule,
     pub interpret: Option<InterpretProfile>,
 }
 
@@ -41,6 +41,10 @@ pub struct RunStamp {
     pub dataset_revision: u64,
     pub split: SplitPlan,
     pub candidate: CandidateSpec,
+    /// Seed инициализации финального переобучения. Отличается от seed
+    /// проверки: выбирать его по результату значит подбирать по тем же данным,
+    /// поэтому он фиксирован заранее — и в отчёте это две разные величины.
+    pub final_init_seed: u64,
 }
 
 impl RunStamp {
@@ -144,6 +148,15 @@ pub struct Lifecycle {
 }
 
 impl Lifecycle {
+    /// Последняя проверка, какому бы кандидату она ни принадлежала.
+    ///
+    /// Нужна интерфейсу: результат показывается там, где его получили, даже
+    /// если форму успели изменить, — с подписью, к какому кандидату он
+    /// относится.
+    pub fn checked(&self) -> Option<&CheckedRun> {
+        self.checked.as_ref()
+    }
+
     /// Запомнить результат проверки. Прежняя проверка вытесняется: актуальна
     /// всегда последняя.
     pub fn record_check(&mut self, run: CheckedRun) {
@@ -238,7 +251,6 @@ mod tests {
                 seed: 0,
                 schedule: LrSchedule::Constant,
             },
-            eval: EvalSchedule::Never,
             interpret: None,
         }
     }
@@ -248,6 +260,7 @@ mod tests {
             dataset_revision: revision,
             split: SplitPlan::default(),
             candidate,
+            final_init_seed: 0,
         }
     }
 

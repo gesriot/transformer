@@ -3,7 +3,7 @@
 use super::messages::Command;
 use super::messages::ModelOrigin;
 use super::session::{split_plan_label, App, KAN_CURVE_SAMPLES};
-use crate::metrics::Metrics;
+use crate::metrics::{EvalSource, Metrics};
 use crate::numeric_model::ModelKind;
 use crate::schema::ModelSchema;
 use eframe::egui;
@@ -126,28 +126,41 @@ impl App {
             );
         }
         ui.separator();
-        if let Some(metrics) = &self.metrics {
+        // Показываем ТОЛЬКО те метрики, чей отпечаток совпадает с активной
+        // моделью. Иначе рядом с одной моделью стояли бы числа другой.
+        let stamp = match &info.origin {
+            ModelOrigin::Development(stamp) | ModelOrigin::Final(stamp) => Some(stamp.as_ref()),
+            ModelOrigin::Checkpoint => None,
+        };
+        let checked = stamp.and_then(|stamp| self.lifecycle.checked_for(stamp));
+        let disclosed = stamp.and_then(|stamp| self.lifecycle.disclosure_for(stamp));
+        if let Some(run) = checked {
+            let source = match run.stamp.eval_source() {
+                EvalSource::Cv { k } => format!("cv-{k}"),
+                _ => "validation".to_string(),
+            };
             show_metrics(
                 ui,
-                "validation",
-                metrics,
-                self.metrics_per_output.as_deref(),
+                &source,
+                &run.eval.metrics,
+                Some(&run.eval.per_output),
                 info.schema.outputs(),
             );
-            if let Some(origin) = self.validation_origin {
-                ui.label(format!(
-                    "Протокол: {}; init seed {}",
-                    split_plan_label(origin.plan),
-                    origin.init_seed
-                ));
-            }
+            ui.label(format!(
+                "Протокол: {}; init seed проверки {}",
+                split_plan_label(run.stamp.split),
+                run.stamp.candidate.train.seed
+            ));
             // У CV одного среднего мало: одинаковое среднее при разном разбросе
             // между folds означает разную надёжность вывода.
-            if let Some(std) = self.r2_std_folds {
-                ui.label(format!("Разброс R² между folds: ±{std:.5}"));
+            if run.eval.r2_std_folds > 0.0 {
+                ui.label(format!(
+                    "Разброс R² между folds: ±{:.5}",
+                    run.eval.r2_std_folds
+                ));
             }
         }
-        if let Some(final_eval) = &self.final_eval {
+        if let Some(final_eval) = disclosed.map(|d| &d.eval) {
             show_metrics(
                 ui,
                 &format!(
@@ -163,10 +176,13 @@ impl App {
                 split_plan_label(final_eval.origin.plan),
                 final_eval.origin.final_init_seed
             ));
-        } else if self.metrics.is_some() {
+        } else if checked.is_some() {
             ui.label("Test отложен: его открывает только финальное обучение.");
         } else {
-            ui.label("Checkpoint не хранит метрики: они появятся после обучения в этой сессии.");
+            ui.label(
+                "Оценок этой модели в сессии нет: checkpoint их не хранит, а проверка \
+                 относилась к другому кандидату.",
+            );
         }
         if let Some(reports) = &self.interpret_reports {
             ui.separator();

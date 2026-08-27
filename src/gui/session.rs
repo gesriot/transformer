@@ -8,8 +8,8 @@ use super::data::{MarkupState, PrepareForm};
 #[cfg(feature = "demo")]
 use super::demo::TextForm;
 use super::messages::{
-    Command, DatasetOrigin, DiagnosticsResult, Event, InterpretReports, KanModelInfo,
-    KanSymbolicInfo, PreparedData, ValidationOrigin,
+    Command, CurvePoint, DatasetOrigin, DiagnosticsResult, Event, InterpretReports, KanModelInfo,
+    KanSymbolicInfo, ModelOrigin, PreparedData,
 };
 use super::model::{ModelInfo, ModelView};
 use super::train::{CustomSearchForm, SearchForm, TrainForm, TrainingMode};
@@ -19,12 +19,12 @@ use crate::encoders::ValueEncoderKind;
 use crate::interpret::InterpretOverrides;
 use crate::lifecycle::{CheckEval, CheckedRun, Lifecycle, TestDisclosure};
 use crate::markup::{Message, TableProfile};
-use crate::metrics::Metrics;
-use crate::split::{FinalEval, SplitPlan};
+use crate::split::SplitPlan;
 use crate::sweep::{self, SweepChoice, SweepRow};
 use crate::train::LrSchedule;
 use crate::training::Phase;
 use eframe::egui;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 /// Разделы окна. Их пять, и они соответствуют шагам работы, а не командам:
@@ -52,6 +52,33 @@ impl Section {
             Section::Demo => "Демо",
         }
     }
+}
+
+/// Средняя кривая по folds.
+///
+/// Точка берётся только там, где замер есть у КАЖДОГО fold: иначе «среднее»
+/// менялось бы вместе с числом слагаемых, и провал одного fold выглядел бы как
+/// улучшение.
+fn mean_curve(
+    curves: &[Vec<CurvePoint>],
+    value: impl Fn(&CurvePoint) -> Option<f32>,
+) -> Vec<[f64; 2]> {
+    let mut by_epoch: BTreeMap<usize, Vec<f32>> = BTreeMap::new();
+    for curve in curves {
+        for point in curve {
+            if let Some(v) = value(point) {
+                by_epoch.entry(point.epoch).or_default().push(v);
+            }
+        }
+    }
+    by_epoch
+        .into_iter()
+        .filter(|(_, values)| values.len() == curves.len())
+        .map(|(epoch, values)| {
+            let mean = values.iter().sum::<f32>() / values.len() as f32;
+            [epoch as f64, mean as f64]
+        })
+        .collect()
 }
 
 /// Одно сообщение на все экраны: данные общие, значит и текст общий.
@@ -197,11 +224,9 @@ pub(crate) struct App {
     /// Как часто снимать validation во время обучения (0 — не снимать).
     pub(super) eval_every: usize,
     pub(super) final_loss_curve: Vec<[f64; 2]>,
-    pub(super) metrics: Option<Metrics>,
-    pub(super) metrics_per_output: Option<Vec<Metrics>>,
-    pub(super) validation_origin: Option<ValidationOrigin>,
-    /// Разброс R² между folds у CV-проверки: у K-fold среднего мало.
-    pub(super) r2_std_folds: Option<f32>,
+    /// Сколько folds стоит за нарисованной кривой: 1 — обычная кривая одного
+    /// обучения, больше — среднее по folds.
+    pub(super) curve_folds: usize,
     pub(super) train_parameter_count: Option<usize>,
     // Predict (UI-M5)
     pub(super) model_info: Option<ModelInfo>,
@@ -242,8 +267,6 @@ pub(crate) struct App {
     /// Запускать ли конвейер интерпретации и с какими переопределениями.
     pub(super) interpret_enabled: bool,
     pub(super) interpret_overrides: InterpretOverrides,
-    /// Единственный замер на test — только у финального обучения.
-    pub(super) final_eval: Option<FinalEval>,
     // Режим и ручная сетка поиска
     pub(super) custom_form: CustomSearchForm,
     pub(super) mode: TrainingMode,
@@ -282,10 +305,7 @@ impl App {
             val_curve: Vec::new(),
             eval_every: 5,
             final_loss_curve: Vec::new(),
-            metrics: None,
-            metrics_per_output: None,
-            validation_origin: None,
-            r2_std_folds: None,
+            curve_folds: 1,
             train_parameter_count: None,
             model_info: None,
             model_view: ModelView::Summary,
@@ -312,7 +332,6 @@ impl App {
             interpret_reports: None,
             interpret_enabled: false,
             interpret_overrides: InterpretOverrides::default(),
-            final_eval: None,
             custom_form: CustomSearchForm::default(),
             mode: TrainingMode::Single,
             search_selected: None,
@@ -363,56 +382,68 @@ impl App {
                 }
                 Event::Epoch {
                     phase,
+                    fold,
                     epoch,
                     loss,
                     val_r2,
                 } => {
-                    let (curve, label) = match phase {
-                        Phase::Development => (&mut self.loss_curve, "development"),
-                        Phase::Final => (&mut self.final_loss_curve, "финальное обучение"),
+                    let label = match phase {
+                        Phase::Development => "development",
+                        Phase::Final => "финальное обучение",
                     };
-                    curve.push([epoch as f64, loss as f64]);
-                    // Кривая validation снимается только в точках расписания и
-                    // только в фазе разработки: финальная фаза validation не
-                    // измеряет — она на ней училась.
-                    if let (Phase::Development, Some(r2)) = (phase, val_r2) {
-                        self.val_curve.push([epoch as f64, r2 as f64]);
+                    // Живая кривая рисуется только для первого fold: у K-fold
+                    // номера эпох повторяются, и общая ломаная не описывает ни
+                    // один прогон. Средняя кривая приходит по завершении.
+                    if fold == 0 {
+                        let curve = match phase {
+                            Phase::Development => &mut self.loss_curve,
+                            Phase::Final => &mut self.final_loss_curve,
+                        };
+                        curve.push([epoch as f64, loss as f64]);
+                        // Validation снимается только в точках расписания и
+                        // только в фазе разработки: финальная на validation
+                        // училась.
+                        if let (Phase::Development, Some(r2)) = (phase, val_r2) {
+                            self.val_curve.push([epoch as f64, r2 as f64]);
+                        }
                     }
-                    self.status = match val_r2 {
-                        Some(r2) => {
+                    self.status = match (fold, val_r2) {
+                        (0, Some(r2)) => {
                             format!("{label}: эпоха {epoch}, loss {loss:.5}, validation R² {r2:.5}")
                         }
-                        None => format!("{label}: эпоха {epoch}, loss {loss:.5}"),
+                        (0, None) => format!("{label}: эпоха {epoch}, loss {loss:.5}"),
+                        (f, _) => format!("{label}: fold {}, эпоха {epoch}, loss {loss:.5}", f + 1),
                     };
                 }
                 Event::TrainDone {
                     stamp,
                     metrics,
                     per_output,
-                    validation_origin,
+                    check_source,
                     r2_std_folds,
+                    curves,
                     final_eval,
                     interpret,
                     cancelled,
                 } => {
                     self.training = false;
                     let mut protocol_error = None;
-                    // До успешного завершения активной остаётся прежняя
-                    // модель worker-а, поэтому отмена не должна стирать её
-                    // метрики из шапки.
+                    let mut disclosed = false;
                     if !cancelled {
                         // Результат подписывается СВОИМ отпечатком, а не
                         // текущей формой: если её успели изменить, проверка
                         // относится к прежнему кандидату и к нему же вернётся,
                         // если поля вернуть обратно.
-                        if let (Some(m), Some(per), Some(origin)) =
-                            (&metrics, &per_output, &validation_origin)
+                        if let (Some(m), Some(per), Some(source)) =
+                            (&metrics, &per_output, check_source)
                         {
-                            // При расхождении безопаснее не разблокировать
-                            // final, чем приписать проверку другому split.
-                            if origin.plan != stamp.split {
+                            // Источник считает пул, который реально работал.
+                            // При расхождении с отпечатком безопаснее не
+                            // разблокировать final, чем приписать проверку
+                            // другому протоколу.
+                            if source != stamp.eval_source() {
                                 protocol_error = Some(
-                                    "внутренняя ошибка: метрика и stamp описывают разные split"
+                                    "внутренняя ошибка: оценка и stamp описывают разные протоколы"
                                         .to_string(),
                                 );
                             } else {
@@ -435,26 +466,29 @@ impl App {
                                         .to_string(),
                                 );
                             }
+                            disclosed = true;
                             self.lifecycle.record_disclosure(TestDisclosure {
                                 stamp: *stamp,
                                 eval: eval.clone(),
                             });
                         }
-                        self.metrics = metrics;
-                        self.metrics_per_output = per_output;
-                        self.validation_origin = validation_origin;
-                        self.r2_std_folds = r2_std_folds;
-                        self.final_eval = final_eval;
+                        // Кривая по нескольким folds — это среднее по эпохам,
+                        // а не склейка: у каждого fold свои номера эпох.
+                        if curves.len() > 1 {
+                            self.loss_curve = mean_curve(&curves, |p| Some(p.train_loss));
+                            self.val_curve = mean_curve(&curves, |p| p.val_r2);
+                        }
+                        self.curve_folds = curves.len().max(1);
                         self.interpret_reports = interpret;
                     }
                     self.status = if let Some(error) = protocol_error {
                         error
                     } else if cancelled {
                         "обучение отменено".to_string()
-                    } else if self.final_eval.is_some() {
+                    } else if disclosed {
                         "финальное обучение завершено, test открыт".to_string()
                     } else {
-                        "обучение завершено".to_string()
+                        "проверка завершена".to_string()
                     };
                 }
                 Event::DatasetOpened { data } => {
@@ -489,22 +523,18 @@ impl App {
                     model_origin,
                     parameter_count,
                     kan,
-                    keep_evaluation,
                 } => {
                     let n_inputs = schema.n_inputs();
-                    if !keep_evaluation {
-                        // Checkpoint не хранит протокол оценки. Оставить здесь
-                        // числа предыдущей модели означало бы приписать их
-                        // только что загруженной.
-                        self.metrics = None;
-                        self.metrics_per_output = None;
-                        self.validation_origin = None;
-                        self.r2_std_folds = None;
-                        self.final_eval = None;
+                    // Метрики не хранятся отдельно от отпечатка: раздел
+                    // «Модель» показывает только те, что относятся к этой
+                    // самой модели. Чистить остаётся лишь кривые чужого
+                    // запуска.
+                    if matches!(model_origin, ModelOrigin::Checkpoint) {
                         self.loss_curve.clear();
                         self.val_curve.clear();
                         self.final_loss_curve.clear();
                         self.train_parameter_count = None;
+                        self.interpret_reports = None;
                     }
                     self.model_info = Some(ModelInfo {
                         schema,
@@ -699,11 +729,24 @@ impl App {
             ui.label("Модель:");
             match &self.model_info {
                 Some(info) => {
-                    ui.label(format!("{} · {}", model_kind_label(info.kind), info.source));
-                    if let Some(final_eval) = &self.final_eval {
-                        ui.label(format!("· test R² {:.3}", final_eval.metrics.r2));
-                    } else if let Some(metrics) = &self.metrics {
-                        ui.label(format!("· validation R² {:.3}", metrics.r2));
+                    ui.label(format!(
+                        "{} · {} · {}",
+                        model_kind_label(info.kind),
+                        info.source,
+                        info.origin.label()
+                    ));
+                    // В шапке — только та метрика, что относится к этой самой
+                    // модели: чужая рядом с ней читалась бы как её собственная.
+                    let stamp = match &info.origin {
+                        ModelOrigin::Development(stamp) | ModelOrigin::Final(stamp) => {
+                            Some(stamp.as_ref())
+                        }
+                        ModelOrigin::Checkpoint => None,
+                    };
+                    if let Some(eval) = stamp.and_then(|s| self.lifecycle.disclosure_for(s)) {
+                        ui.label(format!("· test R² {:.3}", eval.eval.metrics.r2));
+                    } else if let Some(run) = stamp.and_then(|s| self.lifecycle.checked_for(s)) {
+                        ui.label(format!("· validation R² {:.3}", run.eval.metrics.r2));
                     }
                     // Модель и данные могли разойтись: причина важнее самого
                     // факта несовместимости.
@@ -955,6 +998,39 @@ mod tests {
             true,
             revision,
         )
+    }
+
+    fn point(epoch: usize, loss: f32, val: Option<f32>) -> CurvePoint {
+        CurvePoint {
+            epoch,
+            train_loss: loss,
+            val_r2: val,
+        }
+    }
+
+    /// Кривая по нескольким folds — среднее по одинаковым эпохам, а не
+    /// склейка. Эпоха, замеренная не у всех folds, не берётся: иначе «среднее»
+    /// менялось бы вместе с числом слагаемых.
+    #[test]
+    fn cv_curve_averages_only_epochs_measured_in_every_fold() {
+        let curves = vec![
+            vec![point(1, 1.0, Some(0.1)), point(2, 0.5, Some(0.3))],
+            vec![point(1, 3.0, Some(0.3)), point(2, 1.5, None)],
+        ];
+
+        assert_eq!(
+            mean_curve(&curves, |p| Some(p.train_loss)),
+            vec![[1.0, 2.0], [2.0, 1.0]]
+        );
+        // Второй fold не мерил validation на второй эпохе — точки нет вовсе.
+        let val = mean_curve(&curves, |p| p.val_r2);
+        assert_eq!(val.len(), 1);
+        assert_eq!(val[0][0], 1.0);
+        assert!((val[0][1] - 0.2).abs() < 1e-6, "{:?}", val[0]);
+
+        // Одна кривая усредняется сама с собой без изменений.
+        let single = vec![vec![point(1, 2.0, Some(0.5))]];
+        assert_eq!(mean_curve(&single, |p| p.val_r2), vec![[1.0, 0.5]]);
     }
 
     /// Отпечаток результата поиска — данные и разбиение. По нему видно, что

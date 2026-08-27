@@ -6,8 +6,8 @@
 //! для Predict; UI получает только числа/статусы.
 
 use super::messages::{
-    Command, DatasetOrigin, DiagnosticsResult, Event, KanModelInfo, KanSymbolicInfo, KanWeakEdge,
-    ModelOrigin, PreparedData, ValidationOrigin,
+    Command, CurvePoint, DatasetOrigin, DiagnosticsResult, Event, KanModelInfo, KanSymbolicInfo,
+    KanWeakEdge, ModelOrigin, PreparedData,
 };
 use crate::batch_predict::{export_predictions, ExportSummary};
 #[cfg(any(feature = "demo", test))]
@@ -34,7 +34,7 @@ use crate::schema::ModelSchema;
 use crate::serialize::{calibration_sample, load_numeric_full, save_numeric};
 #[cfg(any(feature = "demo", test))]
 use crate::split::DEFAULT_DATA_SEED;
-use crate::split::{FinalEval, SplitPlan, DEFAULT_FINAL_INIT_SEED};
+use crate::split::{FinalEval, SplitPlan};
 use crate::sweep::{self, SweepAxes, SweepObjective};
 use crate::symbolic;
 use crate::table::{Delimiter, Table};
@@ -47,7 +47,8 @@ use crate::train::{evaluate_surrogate, predict_dataset, validate_train};
 #[cfg(feature = "demo")]
 use crate::train::{train_text_cb, TextTrainConfig};
 use crate::training::{
-    check_candidate, refit, Dataset, EpochPoint, Phase, TrainedModel, TrainingSetup,
+    check_candidate, refit, Dataset, EpochPoint, EvalSchedule, Phase, TrainedModel,
+    TrainingHistory, TrainingSetup,
 };
 use eframe::egui;
 use ndarray::Array2;
@@ -164,14 +165,17 @@ fn worker_loop(
     // Собственный учёт worker-а: безопасность не должна зависеть только от
     // того, включена ли кнопка в интерфейсе.
     let mut lifecycle = Lifecycle::default();
+    // Чем является активная модель: по этому решается, можно ли заменить её
+    // отладочной моделью очередной проверки.
+    let mut current_origin: Option<ModelOrigin> = None;
     #[cfg(feature = "demo")]
     let mut current_text: Option<LoadedText> = None;
 
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
-            Command::CheckCandidate { data, stamp } => {
+            Command::CheckCandidate { data, stamp, eval } => {
                 let origin = data.origin.clone();
-                match train_numeric(&data, &stamp, RunKind::Check, &evt_tx, &ctx, &cancel) {
+                match train_numeric(&data, &stamp, RunKind::Check, eval, &evt_tx, &ctx, &cancel) {
                     Ok(outcome) => {
                         if let Some(eval) = outcome.check {
                             lifecycle.record_check(CheckedRun {
@@ -179,13 +183,31 @@ fn worker_loop(
                                 eval,
                             });
                         }
-                        if let Some(loaded) = outcome.loaded {
-                            let _ = evt_tx.send(model_ready(
-                                &loaded,
-                                &origin,
-                                ModelOrigin::Development(stamp.clone()),
-                            ));
-                            current = Some(loaded);
+                        // Проверка не вытесняет готовую модель: финальная и
+                        // загруженная — результат работы, а отладочная годится
+                        // только пока результата нет.
+                        let keep_current = matches!(
+                            current_origin,
+                            Some(ModelOrigin::Final(_)) | Some(ModelOrigin::Checkpoint)
+                        );
+                        match (outcome.loaded, keep_current) {
+                            (Some(loaded), false) => {
+                                let model_origin = ModelOrigin::Development(stamp.clone());
+                                let _ = evt_tx.send(model_ready(
+                                    &loaded,
+                                    &origin,
+                                    model_origin.clone(),
+                                ));
+                                current = Some(loaded);
+                                current_origin = Some(model_origin);
+                            }
+                            (Some(_), true) => {
+                                let _ = evt_tx.send(Event::Status(
+                                    "проверка завершена; активной осталась прежняя модель"
+                                        .to_string(),
+                                ));
+                            }
+                            (None, _) => {}
                         }
                         ctx.request_repaint();
                     }
@@ -205,6 +227,7 @@ fn worker_loop(
                             &data,
                             &stamp,
                             RunKind::Finalize,
+                            EvalSchedule::Never,
                             &evt_tx,
                             &ctx,
                             &cancel,
@@ -217,12 +240,14 @@ fn worker_loop(
                                     });
                                 }
                                 if let Some(loaded) = outcome.loaded {
+                                    let model_origin = ModelOrigin::Final(stamp.clone());
                                     let _ = evt_tx.send(model_ready(
                                         &loaded,
                                         &origin,
-                                        ModelOrigin::Final(stamp.clone()),
+                                        model_origin.clone(),
                                     ));
                                     current = Some(loaded);
+                                    current_origin = Some(model_origin);
                                 }
                                 ctx.request_repaint();
                             }
@@ -240,8 +265,9 @@ fn worker_loop(
                                 stamp: stamp.clone(),
                                 metrics: None,
                                 per_output: None,
-                                validation_origin: None,
+                                check_source: None,
                                 r2_std_folds: None,
+                                curves: Vec::new(),
                                 final_eval: Some(disclosed.eval.clone()),
                                 interpret: None,
                                 cancelled: false,
@@ -268,9 +294,9 @@ fn worker_loop(
                                 &loaded.model,
                                 loaded.diag.is_some() || loaded.calibration.is_some(),
                             ),
-                            keep_evaluation: false,
                         });
                         current = Some(loaded);
+                        current_origin = Some(ModelOrigin::Checkpoint);
                         let _ = evt_tx.send(Event::Status("модель загружена".to_string()));
                     }
                     Err(e) => {
@@ -519,7 +545,6 @@ fn model_ready(loaded: &Loaded, origin: &DatasetOrigin, model_origin: ModelOrigi
             &loaded.model,
             loaded.diag.is_some() || loaded.calibration.is_some(),
         ),
-        keep_evaluation: true,
     }
 }
 
@@ -1029,6 +1054,7 @@ fn train_numeric(
     prepared: &PreparedData,
     stamp: &RunStamp,
     kind: RunKind,
+    eval: EvalSchedule,
     evt_tx: &Sender<Event>,
     ctx: &egui::Context,
     cancel: &AtomicBool,
@@ -1038,7 +1064,6 @@ fn train_numeric(
     let split = stamp.split;
     let nc = &stamp.candidate.config;
     let tcfg = &stamp.candidate.train;
-    let eval = stamp.candidate.eval.clone();
     let interpret = stamp.candidate.interpret;
     validate_numeric(nc)?;
     validate_train(tcfg.lr, tcfg.batch_size)?;
@@ -1112,9 +1137,12 @@ fn train_numeric(
             }
         }
     };
-    let epoch_event = |phase: Phase, point: &EpochPoint| {
+    // Номер fold доходит до интерфейса: при K-fold точки разных folds повторяют
+    // номера эпох, и живая кривая по ним была бы ломаной ни о чём.
+    let epoch_event = |phase: Phase, fold: usize, point: &EpochPoint| {
         let _ = evt_tx.send(Event::Epoch {
             phase,
+            fold,
             epoch: point.epoch,
             loss: point.train_loss,
             val_r2: point.val.as_ref().map(|m| m.r2),
@@ -1122,6 +1150,10 @@ fn train_numeric(
         ctx.request_repaint();
     };
 
+    // Кривые holdout-проверки: у финализации своей кривой нет — она приходит
+    // событиями Epoch и уже нарисована.
+    let mut holdout_curves: Vec<Vec<CurvePoint>> = Vec::new();
+    let mut check_source = None;
     // Проверка идёт по всем folds и не трогает test. Фиксация уже выбранного
     // кандидата сразу делает refit на всём pool — в том числе при K-fold — и
     // только затем один раз открывает test.
@@ -1132,9 +1164,9 @@ fn train_numeric(
                 &dataset,
                 split,
                 &setup,
-                DEFAULT_FINAL_INIT_SEED,
+                stamp.final_init_seed,
                 cancel,
-                &mut |phase, point| epoch_event(phase, point),
+                &mut |phase, point| epoch_event(phase, 0, point),
                 &mut |phase, model| configure(phase, model),
                 &mut |phase, trained, train_data, eval_data| {
                     post_train(phase, trained, train_data, eval_data)
@@ -1162,7 +1194,7 @@ fn train_numeric(
                 split,
                 &setup,
                 cancel,
-                &mut |_fold, point| epoch_event(Phase::Development, point),
+                &mut |fold, point| epoch_event(Phase::Development, fold, point),
                 &mut |model| configure(Phase::Development, model),
                 &mut |_fold, trained, train_data, eval_data| {
                     post_train(Phase::Development, trained, train_data, eval_data)
@@ -1171,29 +1203,31 @@ fn train_numeric(
             if let Some(e) = pipeline_error.borrow_mut().take() {
                 return Err(e);
             }
-            if outcome.cancelled || cancel.load(Ordering::Relaxed) {
+            let (Some(outcome), false) = (outcome, cancel.load(Ordering::Relaxed)) else {
                 send_cancelled(evt_tx, ctx, stamp);
                 return Ok(RunOutcome::default());
-            }
+            };
             let check = CheckEval {
                 metrics: outcome.metrics.clone(),
                 per_output: outcome.per_output.clone(),
                 r2_std_folds: outcome.r2_std_folds,
             };
+            let curves: Vec<Vec<CurvePoint>> = outcome.histories.iter().map(curve).collect();
+            let folds = curves.len();
             let Some(trained) = outcome.model else {
                 // K-fold: моделей столько же, сколько folds, ни одна не
-                // представляет оценку. Отдаём только её.
+                // представляет оценку. Отдаём только её и кривые по folds.
                 let _ = evt_tx.send(Event::TrainDone {
                     stamp: Box::new(stamp.clone()),
                     metrics: Some(outcome.metrics),
                     per_output: Some(outcome.per_output),
-                    validation_origin: Some(ValidationOrigin {
-                        plan: split,
-                        init_seed: tcfg.seed,
-                    }),
+                    check_source: Some(outcome.source),
                     r2_std_folds: Some(outcome.r2_std_folds),
+                    curves,
                     final_eval: None,
-                    interpret: interpret_reports(reports.into_inner()),
+                    // Конвейер отработал на каждом fold, и структура у каждого
+                    // своя. Показывать отчёт первого как общий нельзя.
+                    interpret: None,
                     cancelled: false,
                 });
                 ctx.request_repaint();
@@ -1203,6 +1237,9 @@ fn train_numeric(
                     final_eval: None,
                 });
             };
+            debug_assert_eq!(folds, 1, "модель отдаётся только у holdout");
+            holdout_curves = curves;
+            check_source = Some(outcome.source);
             let splits = split.prepare(dataset.data())?;
             let (train, val) = splits.search.fold(0)?;
             (
@@ -1232,11 +1269,9 @@ fn train_numeric(
         stamp: Box::new(stamp.clone()),
         metrics: check.as_ref().map(|c| c.metrics.clone()),
         per_output: check.as_ref().map(|c| c.per_output.clone()),
-        validation_origin: check.as_ref().map(|_| ValidationOrigin {
-            plan: split,
-            init_seed: tcfg.seed,
-        }),
+        check_source,
         r2_std_folds: check.as_ref().map(|c| c.r2_std_folds),
+        curves: holdout_curves,
         final_eval: final_eval.clone(),
         interpret: interpret_reports(reports),
         cancelled: false,
@@ -1292,14 +1327,28 @@ fn interpret_reports(reports: Vec<(Phase, InterpretReport)>) -> Option<Box<Inter
     })
 }
 
+/// История обучения в виде, пригодном для UI.
+fn curve(history: &TrainingHistory) -> Vec<CurvePoint> {
+    history
+        .points
+        .iter()
+        .map(|point| CurvePoint {
+            epoch: point.epoch,
+            train_loss: point.train_loss,
+            val_r2: point.val.as_ref().map(|m| m.r2),
+        })
+        .collect()
+}
+
 /// Отменённый запуск: ни оценки, ни модели, ни замера на test.
 fn send_cancelled(evt_tx: &Sender<Event>, ctx: &egui::Context, stamp: &RunStamp) {
     let _ = evt_tx.send(Event::TrainDone {
         stamp: Box::new(stamp.clone()),
         metrics: None,
         per_output: None,
-        validation_origin: None,
+        check_source: None,
         r2_std_folds: None,
+        curves: Vec::new(),
         final_eval: None,
         interpret: None,
         cancelled: true,
@@ -1331,9 +1380,9 @@ mod tests {
             candidate: CandidateSpec {
                 config,
                 train,
-                eval: EvalSchedule::Never,
                 interpret,
             },
+            final_init_seed: 0,
         }
     }
 
@@ -1407,6 +1456,7 @@ mod tests {
         // Проверка -> финализация проходит и открывает test.
         cmd_tx
             .send(Command::CheckCandidate {
+                eval: EvalSchedule::Never,
                 data: prepared.clone(),
                 stamp: Box::new(first.clone()),
             })
@@ -1446,6 +1496,7 @@ mod tests {
         // проверка на validation этого не меняет.
         cmd_tx
             .send(Command::CheckCandidate {
+                eval: EvalSchedule::Never,
                 data: prepared.clone(),
                 stamp: Box::new(second.clone()),
             })
@@ -1456,18 +1507,14 @@ mod tests {
             "вторая проверка: {}",
             describe(&event)
         );
-        let event = next_meaningful(&evt_rx);
-        assert!(
-            matches!(event, Event::ModelReady { .. }),
-            "вторая проверка: {}",
-            describe(&event)
-        );
         cmd_tx
             .send(Command::FinalizeCandidate {
                 data: prepared,
                 stamp: Box::new(second),
             })
             .unwrap();
+        // Между двумя событиями нет ModelReady: проверка после финализации не
+        // вытесняет финальную модель отладочной.
         match next_meaningful(&evt_rx) {
             Event::Error(msg) => assert!(msg.contains("уже открыт"), "{msg}"),
             other => panic!("ожидался отказ: {}", event_name(&other)),
@@ -1534,6 +1581,7 @@ mod tests {
                 Some(InterpretProfile::v1()),
             ),
             RunKind::Finalize,
+            EvalSchedule::Never,
             &tx,
             &egui::Context::default(),
             &cancel,
@@ -1595,6 +1643,7 @@ mod tests {
                 Some(InterpretProfile::v1()),
             ),
             RunKind::Finalize,
+            EvalSchedule::Never,
             &tx,
             &egui::Context::default(),
             &cancel,
@@ -1652,6 +1701,7 @@ mod tests {
             &prepared,
             &stamp(split, config, train, None),
             RunKind::Finalize,
+            EvalSchedule::Never,
             &tx,
             &egui::Context::default(),
             &cancel,
@@ -1717,6 +1767,7 @@ mod tests {
             &prepared,
             &stamp(SplitPlan::default(), config, train, Some(profile)),
             RunKind::Finalize,
+            EvalSchedule::Never,
             &tx,
             &egui::Context::default(),
             &AtomicBool::new(false),
@@ -1784,6 +1835,7 @@ mod tests {
             &prepared,
             &stamp(SplitPlan::default(), config, train, None),
             RunKind::Check,
+            EvalSchedule::Never,
             &tx,
             &egui::Context::default(),
             &AtomicBool::new(false),

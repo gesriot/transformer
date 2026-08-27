@@ -9,7 +9,7 @@ use crate::diagnostics::SensitivityReport;
 use crate::interpret::{InterpretProfile, InterpretReport};
 use crate::lifecycle::RunStamp;
 use crate::markup::TableProfile;
-use crate::metrics::Metrics;
+use crate::metrics::{EvalSource, Metrics};
 use crate::numeric_model::ModelKind;
 use crate::schema::ModelSchema;
 use crate::split::{FinalEval, SplitPlan};
@@ -18,6 +18,7 @@ use crate::table::Table;
 use crate::tnum::PrepareSpec;
 #[cfg(feature = "demo")]
 use crate::train::TextTrainConfig;
+use crate::training::EvalSchedule;
 use crate::training::Phase;
 use std::sync::Arc;
 
@@ -139,6 +140,16 @@ pub(crate) struct KanSymbolicInfo {
     pub weak_edges: Vec<KanWeakEdge>,
 }
 
+/// Точка кривой обучения, пригодная для передачи в UI.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CurvePoint {
+    pub epoch: usize,
+    pub train_loss: f32,
+    /// R² на validation этого fold; есть только там, где расписание попросило
+    /// замер.
+    pub val_r2: Option<f32>,
+}
+
 /// Происхождение активной модели.
 ///
 /// Разница не косметическая: отладочная модель обучена только на train, и
@@ -169,13 +180,6 @@ impl ModelOrigin {
     }
 }
 
-/// Происхождение итоговой validation-метрики development-модели.
-#[derive(Clone, Copy)]
-pub(crate) struct ValidationOrigin {
-    pub plan: SplitPlan,
-    pub init_seed: u64,
-}
-
 /// Команды UI -> worker.
 pub(crate) enum Command {
     /// Открыть набор данных: сгенерировать чёрный ящик или прочитать `.tnum`.
@@ -189,6 +193,9 @@ pub(crate) enum Command {
     CheckCandidate {
         data: PreparedData,
         stamp: Box<RunStamp>,
+        /// Когда снимать метрики по ходу обучения. Настройка наблюдения, не
+        /// личность кандидата: без ранней остановки она не меняет модель.
+        eval: EvalSchedule,
     },
     /// Зафиксировать проверенного кандидата: refit на train+validation и
     /// единственный замер на test.
@@ -263,6 +270,9 @@ pub(crate) enum Event {
     },
     Epoch {
         phase: Phase,
+        /// Номер fold: у holdout всегда 0, у K-fold растёт. Живая кривая по
+        /// нескольким folds невозможна — номера эпох повторяются.
+        fold: usize,
         epoch: usize,
         loss: f32,
         /// R² на validation — только в точках, заданных расписанием.
@@ -281,9 +291,15 @@ pub(crate) enum Event {
         interpret: Option<Box<InterpretReports>>,
         /// Поколоночные validation-метрики development-модели.
         per_output: Option<Vec<Metrics>>,
-        validation_origin: Option<ValidationOrigin>,
+        /// Чем оценка ЯВЛЯЕТСЯ по факту прогона: источник берётся у пула,
+        /// который реально считал, и сверяется с тем, что обещал отпечаток.
+        check_source: Option<EvalSource>,
         /// Разброс R² между folds у CV-проверки; `None` у holdout и финала.
         r2_std_folds: Option<f32>,
+        /// Кривые обучения ПО FOLD-ам, по одной на каждый. Склеивать их в одну
+        /// ломаную нельзя: номера эпох повторяются, и результат не описывает
+        /// ни один прогон.
+        curves: Vec<Vec<CurvePoint>>,
         /// Единственный замер на test: есть только у финального обучения.
         final_eval: Option<FinalEval>,
         cancelled: bool,
@@ -315,9 +331,6 @@ pub(crate) enum Event {
         model_origin: ModelOrigin,
         parameter_count: usize,
         kan: Option<KanModelInfo>,
-        /// После обучения `TrainDone` уже установил метрики этой модели. При
-        /// загрузке checkpoint-а метрик в файле нет, и старые надо очистить.
-        keep_evaluation: bool,
     },
     PredictResult {
         outputs: Vec<f32>,

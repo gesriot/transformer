@@ -105,7 +105,7 @@ pub use split::{
     DEFAULT_VAL_FRAC,
 };
 pub use train::{evaluate_surrogate, predict_dataset, validate_train, LrSchedule, TrainConfig};
-pub use training::CheckOutcome;
+pub use training::CompletedCheck;
 pub use training::{
     check_candidate, evaluate_on, recommended_epoch, refit, run_training, ConfigureModel, Dataset,
     EarlyStopping, EpochPoint, EvalSchedule, Phase, PostCheck, PostTrain, RefitOutcome,
