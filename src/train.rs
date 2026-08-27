@@ -35,7 +35,7 @@ pub fn validate_train(lr: f32, batch_size: usize) -> Result<(), String> {
 
 /// Политика learning rate по шагам. Живёт здесь, а не в Adam: оптимизатор
 /// хранит только моменты, расписание решает, какой lr дать на шаге.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LrSchedule {
     Constant,
     /// Линейный warmup до `base_lr`, затем косинусный спад до
@@ -68,7 +68,7 @@ impl LrSchedule {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TrainConfig {
     pub epochs: usize,
     pub batch_size: usize,

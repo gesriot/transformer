@@ -23,6 +23,7 @@ use crate::generate::generate;
 use crate::gui::messages::InterpretReports;
 use crate::init::set_init_seed;
 use crate::interpret::{self, InterpretProfile, InterpretReport};
+use crate::lifecycle::RunStamp;
 use crate::markup::TableProfile;
 use crate::metrics::evaluate;
 use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
@@ -40,11 +41,11 @@ use crate::textmodel::TextModel;
 use crate::tnum::{
     infer_prepare_spec_from_table, prepare_tnum_file, read_numeric_source, PrepareSpec,
 };
-use crate::train::{evaluate_surrogate, predict_dataset, validate_train, TrainConfig};
+use crate::train::{evaluate_surrogate, predict_dataset, validate_train};
 #[cfg(feature = "demo")]
 use crate::train::{train_text_cb, TextTrainConfig};
 use crate::training::{
-    evaluate_on, refit, run_training, Dataset, EvalSchedule, Phase, TrainedModel, TrainingSetup,
+    evaluate_on, refit, run_training, Dataset, Phase, TrainedModel, TrainingSetup,
 };
 use eframe::egui;
 use ndarray::Array2;
@@ -165,26 +166,11 @@ fn worker_loop(
         match cmd {
             Command::TrainNumeric {
                 data,
-                split,
-                nc,
-                tcfg,
-                eval,
-                interpret,
+                stamp,
                 final_phase,
             } => {
                 let origin = data.origin.clone();
-                match train_numeric(
-                    &data,
-                    split,
-                    &nc,
-                    &tcfg,
-                    eval,
-                    interpret,
-                    final_phase,
-                    &evt_tx,
-                    &ctx,
-                    &cancel,
-                ) {
+                match train_numeric(&data, &stamp, final_phase, &evt_tx, &ctx, &cancel) {
                     Ok(Some(loaded)) => {
                         let _ = evt_tx.send(Event::ModelReady {
                             schema: loaded.schema.clone(),
@@ -941,16 +927,19 @@ fn open_table(
 #[allow(clippy::too_many_arguments)]
 fn train_numeric(
     prepared: &PreparedData,
-    split: SplitPlan,
-    nc: &NumericConfig,
-    tcfg: &TrainConfig,
-    eval: EvalSchedule,
-    interpret: Option<InterpretProfile>,
+    stamp: &RunStamp,
     final_phase: bool,
     evt_tx: &Sender<Event>,
     ctx: &egui::Context,
     cancel: &AtomicBool,
 ) -> Result<Option<Loaded>, String> {
+    // Всё, чем запуск будет подписан, берётся из самого отпечатка: разойтись
+    // им негде.
+    let split = stamp.split;
+    let nc = &stamp.candidate.config;
+    let tcfg = &stamp.candidate.train;
+    let eval = stamp.candidate.eval.clone();
+    let interpret = stamp.candidate.interpret;
     validate_numeric(nc)?;
     validate_train(tcfg.lr, tcfg.batch_size)?;
 
@@ -1041,6 +1030,7 @@ fn train_numeric(
             )?;
             let Some(trained) = outcome.model else {
                 let _ = evt_tx.send(Event::TrainDone {
+                    stamp: Box::new(stamp.clone()),
                     metrics: None,
                     per_output: None,
                     validation_origin: None,
@@ -1082,6 +1072,7 @@ fn train_numeric(
             )?;
             if cancel.load(Ordering::Relaxed) {
                 let _ = evt_tx.send(Event::TrainDone {
+                    stamp: Box::new(stamp.clone()),
                     metrics: None,
                     per_output: None,
                     validation_origin: None,
@@ -1129,6 +1120,7 @@ fn train_numeric(
     // test по ней нельзя.
     if reports.iter().any(|(_, r)| r.cancelled) {
         let _ = evt_tx.send(Event::TrainDone {
+            stamp: Box::new(stamp.clone()),
             metrics: None,
             per_output: None,
             validation_origin: None,
@@ -1140,6 +1132,7 @@ fn train_numeric(
         return Ok(None);
     }
     let _ = evt_tx.send(Event::TrainDone {
+        stamp: Box::new(stamp.clone()),
         metrics,
         per_output,
         validation_origin: (!final_phase).then_some(ValidationOrigin {
@@ -1189,8 +1182,29 @@ mod tests {
     use crate::blackbox;
     use crate::config::ModelConfig;
     use crate::encoders::ValueEncoderConfig;
+    use crate::lifecycle::CandidateSpec;
     use crate::numeric_model::{KanConfig, ModelKind};
-    use crate::train::fit_normalizers;
+    use crate::train::{fit_normalizers, TrainConfig};
+    use crate::training::EvalSchedule;
+
+    /// Отпечаток для тестов: всё, чем подписан запуск, в одном месте.
+    fn stamp(
+        split: SplitPlan,
+        config: NumericConfig,
+        train: TrainConfig,
+        interpret: Option<InterpretProfile>,
+    ) -> RunStamp {
+        RunStamp {
+            dataset_revision: 1,
+            split,
+            candidate: CandidateSpec {
+                config,
+                train,
+                eval: EvalSchedule::Never,
+                interpret,
+            },
+        }
+    }
 
     /// Отмена во время конвейера обязана прерывать всё: модель не сохраняется,
     /// test не открывается, а событие честно сообщает об отмене.
@@ -1226,11 +1240,12 @@ mod tests {
 
         let loaded = train_numeric(
             &prepared,
-            SplitPlan::default(),
-            &config,
-            &train,
-            EvalSchedule::Never,
-            Some(InterpretProfile::v1()),
+            &stamp(
+                SplitPlan::default(),
+                config,
+                train,
+                Some(InterpretProfile::v1()),
+            ),
             true,
             &tx,
             &egui::Context::default(),
@@ -1288,11 +1303,7 @@ mod tests {
 
         let loaded = train_numeric(
             &prepared,
-            split,
-            &config,
-            &train,
-            EvalSchedule::Never,
-            None,
+            &stamp(split, config, train, None),
             true,
             &tx,
             &egui::Context::default(),
@@ -1356,11 +1367,7 @@ mod tests {
 
         let loaded = train_numeric(
             &prepared,
-            SplitPlan::default(),
-            &config,
-            &train,
-            EvalSchedule::Never,
-            Some(profile),
+            &stamp(SplitPlan::default(), config, train, Some(profile)),
             true,
             &tx,
             &egui::Context::default(),
@@ -1426,11 +1433,7 @@ mod tests {
 
         train_numeric(
             &prepared,
-            SplitPlan::default(),
-            &config,
-            &train,
-            EvalSchedule::Never,
-            None,
+            &stamp(SplitPlan::default(), config, train, None),
             false,
             &tx,
             &egui::Context::default(),

@@ -1,6 +1,6 @@
 //! Гиперпараметры модели (см. Plan.md §9).
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ModelConfig {
     pub d_model: usize,
     pub n_heads: usize,

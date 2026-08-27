@@ -7,9 +7,10 @@ use crate::config::ModelConfig;
 use crate::data::{NumericDataset, OutOfRange};
 use crate::diagnostics::SensitivityReport;
 use crate::interpret::{InterpretProfile, InterpretReport};
+use crate::lifecycle::RunStamp;
 use crate::markup::TableProfile;
 use crate::metrics::Metrics;
-use crate::numeric_model::{ModelKind, NumericConfig};
+use crate::numeric_model::ModelKind;
 use crate::schema::ModelSchema;
 use crate::split::{FinalEval, SplitPlan};
 use crate::sweep::{SweepAxes, SweepObjective, SweepRow};
@@ -17,8 +18,6 @@ use crate::table::Table;
 use crate::tnum::PrepareSpec;
 #[cfg(feature = "demo")]
 use crate::train::TextTrainConfig;
-use crate::train::TrainConfig;
-use crate::training::EvalSchedule;
 use crate::training::Phase;
 use std::sync::Arc;
 
@@ -156,14 +155,10 @@ pub(crate) enum Command {
     },
     TrainNumeric {
         data: PreparedData,
-        split: SplitPlan,
-        nc: NumericConfig,
-        tcfg: TrainConfig,
-        /// Когда снимать метрики на validation по ходу обучения. Кривая по
-        /// эпохам — настройка обычного обучения, а не отдельный сценарий.
-        eval: EvalSchedule,
-        /// Конвейер интерпретации: применяется в обеих фазах или нигде.
-        interpret: Option<InterpretProfile>,
+        /// Что именно обучаем: разбиение, конфигурация, параметры обучения и
+        /// профиль интерпретации приходят одним отпечатком. Отдельными полями
+        /// они могли бы разойтись с тем, чем результат будет подписан.
+        stamp: RunStamp,
         /// Переобучить выбранную конфигурацию на train+validation и один раз
         /// открыть test. Запрашивается только для финального обучения.
         final_phase: bool,
@@ -239,6 +234,10 @@ pub(crate) enum Event {
     /// Завершение обучения. У development есть validation-метрики, у refit —
     /// финальный test; отмена помечается отдельно, чтобы не смешивать случаи.
     TrainDone {
+        /// Отпечаток запуска, к которому относится результат. Форма могла
+        /// измениться, пока шло обучение, — тогда ответ относится не к ней.
+        /// В боксе: иначе конфигурация кандидата раздувает всё перечисление.
+        stamp: Box<RunStamp>,
         metrics: Option<Metrics>,
         /// Отчёты конвейера по фазам: развитие и финальная модель. В боксе,
         /// потому что иначе один этот вариант раздувает всё перечисление.

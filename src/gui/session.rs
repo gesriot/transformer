@@ -17,8 +17,9 @@ use super::worker::Worker;
 use crate::data::OutOfRange;
 use crate::encoders::ValueEncoderKind;
 use crate::interpret::InterpretOverrides;
+use crate::lifecycle::{CheckEval, CheckedRun, Lifecycle, TestDisclosure};
 use crate::markup::{Message, TableProfile};
-use crate::metrics::Metrics;
+use crate::metrics::{EvalSource, Metrics};
 use crate::split::{FinalEval, SplitPlan};
 use crate::sweep::{self, SweepChoice, SweepRow};
 use crate::train::LrSchedule;
@@ -50,6 +51,15 @@ impl Section {
             #[cfg(feature = "demo")]
             Section::Demo => "Демо",
         }
+    }
+}
+
+/// Чем является итоговая метрика development-модели: validation у holdout,
+/// CV у K-fold. Без разбиения считать нечего — тогда и подписывать нечем.
+fn validation_source(origin: Option<&ValidationOrigin>) -> EvalSource {
+    match origin.map(|o| o.plan) {
+        Some(SplitPlan::KFold { k, .. }) => EvalSource::Cv { k },
+        _ => EvalSource::Validation,
     }
 }
 
@@ -232,6 +242,8 @@ pub(crate) struct App {
     /// данных запускать по нему финальное обучение нельзя: строки описывают
     /// уже другой набор.
     pub(super) search_stamp: Option<(u64, SplitPlan)>,
+    /// Что проверено и не потрачен ли test на этих данных.
+    pub(super) lifecycle: Lifecycle,
     /// Отчёты конвейера интерпретации по фазам.
     pub(super) interpret_reports: Option<Box<InterpretReports>>,
     /// Запускать ли конвейер интерпретации и с какими переопределениями.
@@ -302,6 +314,7 @@ impl App {
             search_total: None,
             search_cancelled: false,
             search_stamp: None,
+            lifecycle: Lifecycle::default(),
             interpret_reports: None,
             interpret_enabled: false,
             interpret_overrides: InterpretOverrides::default(),
@@ -379,6 +392,7 @@ impl App {
                     };
                 }
                 Event::TrainDone {
+                    stamp,
                     metrics,
                     per_output,
                     validation_origin,
@@ -391,6 +405,29 @@ impl App {
                     // модель worker-а, поэтому отмена не должна стирать её
                     // метрики из шапки.
                     if !cancelled {
+                        // Результат подписывается СВОИМ отпечатком, а не
+                        // текущей формой: если её успели изменить, проверка
+                        // относится к прежнему кандидату и к нему же вернётся,
+                        // если поля вернуть обратно.
+                        if let (Some(m), Some(per)) = (&metrics, &per_output) {
+                            self.lifecycle.record_check(CheckedRun {
+                                stamp: (*stamp).clone(),
+                                eval: CheckEval {
+                                    metrics: m.clone(),
+                                    per_output: per.clone(),
+                                    source: validation_source(validation_origin.as_ref()),
+                                },
+                            });
+                        }
+                        // Раскрытие test фиксируется всегда: замер уже сделан,
+                        // и правка формы его не возвращает.
+                        if let Some(eval) = &final_eval {
+                            self.lifecycle.record_disclosure(TestDisclosure {
+                                dataset_revision: stamp.dataset_revision,
+                                stamp: *stamp,
+                                eval: eval.clone(),
+                            });
+                        }
                         self.metrics = metrics;
                         self.metrics_per_output = per_output;
                         self.validation_origin = validation_origin;
@@ -749,6 +786,9 @@ impl App {
     /// покажет, совместима ли она с новым набором.
     pub(super) fn set_dataset(&mut self, dataset: ActiveDataset) {
         self.dataset = Some(dataset);
+        // Проверка относилась к прежним данным. Раскрытие test остаётся: оно
+        // привязано к своей ревизии и новую не блокирует.
+        self.lifecycle.on_dataset_changed();
         self.search_rows.clear();
         self.search_total = None;
         self.search_stamp = None;
@@ -764,6 +804,11 @@ impl App {
     pub(super) fn sort_search_rows(&mut self) {
         let objective = self.search_form.objective();
         sweep::sort_rows(&mut self.search_rows, objective);
+    }
+
+    /// Ревизия активного набора данных.
+    pub(super) fn dataset_revision(&self) -> Option<u64> {
+        self.dataset.as_ref().map(|active| active.revision)
     }
 
     /// Отпечаток активных данных: ревизия набора и план разбиения.
@@ -892,6 +937,33 @@ mod tests {
             true,
             revision,
         )
+    }
+
+    /// Метрика development-модели подписывается тем, чем она является:
+    /// validation у holdout и CV у K-fold. Ошибка здесь означала бы, что
+    /// проверенный кандидат записан с чужим происхождением.
+    #[test]
+    fn validation_source_follows_the_split() {
+        assert_eq!(validation_source(None), EvalSource::Validation);
+        assert_eq!(
+            validation_source(Some(&ValidationOrigin {
+                plan: SplitPlan::default(),
+                init_seed: 0,
+            })),
+            EvalSource::Validation
+        );
+        assert_eq!(
+            validation_source(Some(&ValidationOrigin {
+                plan: SplitPlan::KFold {
+                    k: 4,
+                    folds_seed: 1,
+                    test_frac: 0.15,
+                    test_seed: 1,
+                },
+                init_seed: 0,
+            })),
+            EvalSource::Cv { k: 4 }
+        );
     }
 
     /// Отпечаток результата поиска — данные и разбиение. По нему видно, что

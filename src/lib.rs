@@ -38,6 +38,7 @@ mod heads;
 mod init;
 pub mod interpret;
 mod kan;
+mod lifecycle;
 mod loss;
 mod markup;
 mod metrics;
@@ -108,6 +109,13 @@ pub use training::{
     evaluate_on, recommended_epoch, refit, run_training, ConfigureModel, Dataset, EarlyStopping,
     EpochPoint, EvalSchedule, Phase, PostTrain, RefitOutcome, TrainedModel, TrainingHistory,
     TrainingOutcome, TrainingSetup,
+};
+
+// Жизненный цикл: что проверено и не потрачен ли test на этих данных.
+// Дисциплина «test открывают один раз» — часть протокола оценки, а не деталь
+// интерфейса, поэтому контракт состояния идёт наружу вместе с ним.
+pub use lifecycle::{
+    CandidateSpec, CheckEval, CheckedRun, FinalizeRefusal, Lifecycle, RunStamp, TestDisclosure,
 };
 
 // Поиск конфигурации: сетка поверх того же сценария обучения.

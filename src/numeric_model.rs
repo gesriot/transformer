@@ -78,7 +78,7 @@ pub enum ModelKind {
 
 /// Параметры KAN: ширина скрытых слоёв, число слоёв и размер сплайн-сетки
 /// (число интервалов на [-3, 3]; базисных функций на ребро — grid + 3).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct KanConfig {
     pub width: usize,
     pub layers: usize,
@@ -96,7 +96,10 @@ impl Default for KanConfig {
 }
 
 /// Конфиг численной модели: общий выбор архитектуры + параметры обеих.
-#[derive(Clone)]
+///
+/// `PartialEq` — часть контракта жизненного цикла: по равенству конфигурации
+/// решается, относится ли проверенный прогон к текущей форме.
+#[derive(Clone, Debug, PartialEq)]
 pub struct NumericConfig {
     pub kind: ModelKind,
     pub transformer: ModelConfig,

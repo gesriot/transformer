@@ -2,10 +2,11 @@
 
 use super::messages::Command;
 use super::model::ModelInfo;
-use super::session::App;
+use super::session::{App, NO_DATASET};
 use crate::config::ModelConfig;
 use crate::encoders::{ValueEncoderConfig, ValueEncoderKind};
 use crate::interpret::{self, InterpretOverrides, InterpretProfile};
+use crate::lifecycle::{CandidateSpec, RunStamp};
 use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
 use crate::split::DEFAULT_FINAL_INIT_SEED;
 use crate::sweep::{self, SearchBudget, SweepAxes, SweepChoice, SweepObjective, SweepRow};
@@ -663,8 +664,12 @@ impl App {
                 .add_enabled(!self.busy() && !kfold, egui::Button::new("Обучить"))
                 .clicked()
             {
-                match (self.form.build(), self.active_data()) {
-                    (Ok((nc, tcfg)), Ok((data, split))) => {
+                match (
+                    self.form.build(),
+                    self.active_data(),
+                    self.dataset_revision(),
+                ) {
+                    (Ok((nc, tcfg)), Ok((data, split)), Some(revision)) => {
                         let interpret = match self.interpret_profile(nc.kind) {
                             Ok(profile) => profile,
                             Err(e) => {
@@ -672,20 +677,27 @@ impl App {
                                 return;
                             }
                         };
+                        let stamp = RunStamp {
+                            dataset_revision: revision,
+                            split,
+                            candidate: CandidateSpec {
+                                config: nc,
+                                train: tcfg,
+                                eval: self.eval_schedule(),
+                                interpret,
+                            },
+                        };
                         self.train_parameter_count = None;
                         self.worker.reset_cancel();
                         self.worker.send(Command::TrainNumeric {
                             data,
-                            split,
-                            nc,
-                            tcfg,
-                            eval: self.eval_schedule(),
-                            interpret,
+                            stamp,
                             // Ручной запуск — фаза разработки: test не трогаем.
                             final_phase: false,
                         });
                     }
-                    (Err(e), _) | (_, Err(e)) => self.status = format!("Ошибка: {e}"),
+                    (Err(e), _, _) | (_, Err(e), _) => self.status = format!("Ошибка: {e}"),
+                    (_, _, None) => self.status = format!("Ошибка: {NO_DATASET}"),
                 }
             }
             if ui
@@ -1021,17 +1033,27 @@ impl App {
                 return;
             }
         };
+        let Some(revision) = self.dataset_revision() else {
+            self.status = format!("Ошибка: {NO_DATASET}");
+            return;
+        };
+        let stamp = RunStamp {
+            dataset_revision: revision,
+            split,
+            candidate: CandidateSpec {
+                config: nc,
+                train: tcfg,
+                // Refit учится на train+validation, поэтому validation-кривой
+                // у него быть не может. Число эпох уже выбрано поиском.
+                eval: EvalSchedule::Never,
+                interpret,
+            },
+        };
         self.train_parameter_count = None;
         self.worker.reset_cancel();
         self.worker.send(Command::TrainNumeric {
             data,
-            split,
-            nc,
-            tcfg,
-            // Refit учится на train+validation, поэтому validation-кривой у
-            // него быть не может. Число эпох уже выбрано поиском.
-            eval: EvalSchedule::Never,
-            interpret,
+            stamp,
             final_phase: true,
         });
     }

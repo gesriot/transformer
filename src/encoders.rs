@@ -33,7 +33,7 @@ pub enum ValueEncoderKind {
     Fourier,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ValueEncoderConfig {
     pub kind: ValueEncoderKind,
     pub fourier_bands: usize,
