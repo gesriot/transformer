@@ -21,7 +21,6 @@ use crate::encoders::FeatureSpec;
 use crate::fingerprint::DatasetFingerprint;
 #[cfg(feature = "demo")]
 use crate::generate::generate;
-use crate::gui::messages::InterpretReports;
 use crate::init::set_init_seed;
 use crate::interpret::{self, InterpretProfile, InterpretReport};
 use crate::lifecycle::{
@@ -182,11 +181,13 @@ fn worker_loop(
                             lifecycle.record_check(CheckedRun {
                                 stamp: (*stamp).clone(),
                                 eval,
+                                interpret: outcome.check_interpret.clone(),
                             });
                         }
                         // Проверка не вытесняет готовую модель: финальная и
                         // загруженная — результат работы, а отладочная годится
                         // только пока результата нет.
+                        let model_interpret = outcome.model_interpret;
                         let keep_current = matches!(
                             current_origin,
                             Some(ModelOrigin::Final(_)) | Some(ModelOrigin::Checkpoint)
@@ -198,6 +199,7 @@ fn worker_loop(
                                     &loaded,
                                     &origin,
                                     model_origin.clone(),
+                                    model_interpret,
                                 ));
                                 current = Some(loaded);
                                 current_origin = Some(model_origin);
@@ -246,6 +248,7 @@ fn worker_loop(
                                         &loaded,
                                         &origin,
                                         model_origin.clone(),
+                                        outcome.model_interpret,
                                     ));
                                     current = Some(loaded);
                                     current_origin = Some(model_origin);
@@ -270,7 +273,7 @@ fn worker_loop(
                                 r2_std_folds: None,
                                 curves: Vec::new(),
                                 final_eval: Some(disclosed.eval.clone()),
-                                interpret: None,
+                                check_interpret: Vec::new(),
                                 cancelled: false,
                             });
                             ctx.request_repaint();
@@ -290,6 +293,9 @@ fn worker_loop(
                             kind: loaded.nc.kind,
                             source: format!("файл: {path}"),
                             model_origin: ModelOrigin::Checkpoint,
+                            // Checkpoint хранит профиль, но не отчёт: что
+                            // конвейер сделал, известно только из сессии.
+                            interpret: None,
                             parameter_count: loaded.model.parameter_count(),
                             kan: kan_model_info(
                                 &loaded.model,
@@ -535,7 +541,12 @@ fn worker_loop(
 
 /// Событие о новой активной модели. Происхождение идёт рядом со схемой:
 /// отладочную и финальную модель нельзя показывать одинаково.
-fn model_ready(loaded: &Loaded, origin: &DatasetOrigin, model_origin: ModelOrigin) -> Event {
+fn model_ready(
+    loaded: &Loaded,
+    origin: &DatasetOrigin,
+    model_origin: ModelOrigin,
+    interpret: Option<Box<InterpretReport>>,
+) -> Event {
     Event::ModelReady {
         schema: loaded.schema.clone(),
         kind: loaded.nc.kind,
@@ -546,6 +557,7 @@ fn model_ready(loaded: &Loaded, origin: &DatasetOrigin, model_origin: ModelOrigi
             &loaded.model,
             loaded.diag.is_some() || loaded.calibration.is_some(),
         ),
+        interpret,
     }
 }
 
@@ -1047,6 +1059,10 @@ struct RunOutcome {
     check: Option<CheckEval>,
     /// Состоявшийся замер на test.
     final_eval: Option<FinalEval>,
+    /// Отчёты конвейера проверки — по одному на fold.
+    check_interpret: Vec<InterpretReport>,
+    /// Отчёт конвейера активной модели: он принадлежит ей, а не сессии.
+    model_interpret: Option<Box<InterpretReport>>,
 }
 
 /// Обучение в worker-потоке. Модель остаётся здесь: Rc через границу потока не
@@ -1225,6 +1241,14 @@ fn train_numeric(
             };
             let curves: Vec<Vec<CurvePoint>> = outcome.histories.iter().map(curve).collect();
             let folds = curves.len();
+            // Отчёты проверки собираются здесь: дальше по коду они уже не
+            // отличимы от отчёта финальной фазы.
+            let fold_reports: Vec<InterpretReport> = reports
+                .borrow()
+                .iter()
+                .filter(|(phase, _)| *phase == Phase::Development)
+                .map(|(_, report)| report.clone())
+                .collect();
             let Some(trained) = outcome.model else {
                 // K-fold: моделей столько же, сколько folds, ни одна не
                 // представляет оценку. Отдаём только её и кривые по folds.
@@ -1236,9 +1260,9 @@ fn train_numeric(
                     r2_std_folds: Some(outcome.r2_std_folds),
                     curves,
                     final_eval: None,
-                    // Конвейер отработал на каждом fold, и структура у каждого
-                    // своя. Показывать отчёт первого как общий нельзя.
-                    interpret: None,
+                    // Конвейер отработал на каждом fold: отчётов столько же,
+                    // сколько folds, и отчёт первого не описывает проверку.
+                    check_interpret: fold_reports.clone(),
                     cancelled: false,
                 });
                 ctx.request_repaint();
@@ -1246,6 +1270,8 @@ fn train_numeric(
                     loaded: None,
                     check: Some(check),
                     final_eval: None,
+                    check_interpret: fold_reports,
+                    model_interpret: None,
                 });
             };
             debug_assert_eq!(folds, 1, "модель отдаётся только у holdout");
@@ -1276,6 +1302,20 @@ fn train_numeric(
         send_cancelled(evt_tx, ctx, stamp);
         return Ok(RunOutcome::default());
     }
+    // Отчёт модели — фазы, которая её и получила: у проверки это development
+    // единственного fold, у финализации — финальная фаза.
+    let wanted = match kind {
+        RunKind::Check => Phase::Development,
+        RunKind::Finalize => Phase::Final,
+    };
+    let model_interpret = reports
+        .iter()
+        .find(|(phase, _)| *phase == wanted)
+        .map(|(_, report)| Box::new(report.clone()));
+    let check_interpret: Vec<InterpretReport> = match kind {
+        RunKind::Check => model_interpret.iter().map(|r| (**r).clone()).collect(),
+        RunKind::Finalize => Vec::new(),
+    };
     let _ = evt_tx.send(Event::TrainDone {
         stamp: Box::new(stamp.clone()),
         metrics: check.as_ref().map(|c| c.metrics.clone()),
@@ -1284,7 +1324,7 @@ fn train_numeric(
         r2_std_folds: check.as_ref().map(|c| c.r2_std_folds),
         curves: holdout_curves,
         final_eval: final_eval.clone(),
-        interpret: interpret_reports(reports),
+        check_interpret: check_interpret.clone(),
         cancelled: false,
     });
     ctx.request_repaint();
@@ -1315,26 +1355,8 @@ fn train_numeric(
         loaded: Some(loaded),
         check,
         final_eval,
-    })
-}
-
-/// Отчёты конвейера по фазам: у development видно влияние прунинга на
-/// validation, у финальной — какой стала структура. Публикуем, если есть хотя
-/// бы один: после поиска фаза только финальная, и её отчёт терять нельзя.
-fn interpret_reports(reports: Vec<(Phase, InterpretReport)>) -> Option<Box<InterpretReports>> {
-    let development = reports
-        .iter()
-        .find(|(phase, _)| *phase == Phase::Development)
-        .map(|(_, r)| r.clone());
-    let final_model = reports
-        .iter()
-        .find(|(phase, _)| *phase == Phase::Final)
-        .map(|(_, r)| r.clone());
-    (development.is_some() || final_model.is_some()).then(|| {
-        Box::new(InterpretReports {
-            development,
-            final_model,
-        })
+        check_interpret,
+        model_interpret,
     })
 }
 
@@ -1361,7 +1383,7 @@ fn send_cancelled(evt_tx: &Sender<Event>, ctx: &egui::Context, stamp: &RunStamp)
         r2_std_folds: None,
         curves: Vec::new(),
         final_eval: None,
-        interpret: None,
+        check_interpret: Vec::new(),
         cancelled: true,
     });
     ctx.request_repaint();
@@ -1664,10 +1686,10 @@ mod tests {
             .find_map(|e| match e {
                 Event::TrainDone {
                     final_eval,
-                    interpret,
+                    check_interpret,
                     cancelled,
                     ..
-                } => Some((final_eval.is_some(), interpret.is_some(), cancelled)),
+                } => Some((final_eval.is_some(), !check_interpret.is_empty(), cancelled)),
                 _ => None,
             })
             .expect("событие о завершении");
@@ -1839,7 +1861,7 @@ mod tests {
         };
         let (tx, rx) = mpsc::channel();
 
-        let loaded = train_numeric(
+        let outcome = train_numeric(
             &prepared,
             &stamp(
                 DatasetFingerprint::of(&prepared.data, &prepared.schema).unwrap(),
@@ -1854,30 +1876,31 @@ mod tests {
             &egui::Context::default(),
             &AtomicBool::new(false),
         )
-        .unwrap()
-        .loaded
-        .expect("финальная KAN");
+        .unwrap();
+        let loaded = outcome.loaded.as_ref().expect("финальная KAN");
         assert_eq!(loaded.interpret, Some(profile));
 
-        let reports = rx
+        let done = rx
             .try_iter()
             .find_map(|event| match event {
                 Event::TrainDone {
-                    interpret,
+                    check_interpret,
                     final_eval,
                     cancelled,
                     ..
                 } => {
                     assert!(!cancelled);
                     assert!(final_eval.is_some(), "test измеряется после конвейера");
-                    interpret
+                    // Финализация не даёт отчёта проверки: её отчёт принадлежит
+                    // модели и едет вместе с ней.
+                    Some(check_interpret)
                 }
                 _ => None,
             })
-            .expect("отчёт конвейера");
-        assert!(reports.development.is_none());
-        assert!(reports.final_model.is_some());
-        assert_eq!(reports.profile(), Some(&profile));
+            .expect("событие о завершении");
+        assert!(done.is_empty(), "у финализации отчёта проверки нет");
+        let report = outcome.model_interpret.expect("отчёт финальной модели");
+        assert_eq!(report.profile, profile);
     }
 
     #[test]

@@ -8,8 +8,8 @@ use super::data::{MarkupState, PrepareForm};
 #[cfg(feature = "demo")]
 use super::demo::TextForm;
 use super::messages::{
-    Command, CurvePoint, DatasetOrigin, DiagnosticsResult, Event, InterpretReports, KanModelInfo,
-    KanSymbolicInfo, ModelOrigin, PreparedData,
+    Command, CurvePoint, DatasetOrigin, DiagnosticsResult, Event, KanModelInfo, KanSymbolicInfo,
+    ModelOrigin, PreparedData,
 };
 use super::model::{ModelInfo, ModelView};
 use super::train::{CustomSearchForm, SearchForm, TrainForm, TrainingMode};
@@ -18,7 +18,7 @@ use crate::data::OutOfRange;
 use crate::encoders::ValueEncoderKind;
 use crate::fingerprint::DatasetFingerprint;
 use crate::interpret::InterpretOverrides;
-use crate::lifecycle::{CheckEval, CheckedRun, Lifecycle, RunStamp, TestDisclosure};
+use crate::lifecycle::{CheckEval, CheckedRun, Lifecycle, TestDisclosure};
 use crate::markup::{Message, TableProfile};
 use crate::split::SplitPlan;
 use crate::sweep::{self, SweepChoice, SweepRow};
@@ -52,22 +52,6 @@ impl Section {
             #[cfg(feature = "demo")]
             Section::Demo => "Демо",
         }
-    }
-}
-
-/// Какой отчёт конвейера остаётся у сессии.
-///
-/// Новый отчёт вытесняет прежний; запуск БЕЗ отчёта (например, CV-проверка, где
-/// структура своя у каждого fold) стирает только собственный — иначе проверка
-/// другого кандидата убирала бы отчёт активной модели.
-fn keep_interpret(
-    stored: Option<(RunStamp, Box<InterpretReports>)>,
-    stamp: &RunStamp,
-    incoming: Option<Box<InterpretReports>>,
-) -> Option<(RunStamp, Box<InterpretReports>)> {
-    match incoming {
-        Some(reports) => Some((stamp.clone(), reports)),
-        None => stored.filter(|(stored_stamp, _)| stored_stamp != stamp),
     }
 }
 
@@ -288,10 +272,6 @@ pub(crate) struct App {
     /// Что проверено и не потрачен ли test на этих данных.
     pub(super) lifecycle: Lifecycle,
     /// Отчёты конвейера интерпретации по фазам.
-    /// Отчёт конвейера вместе с отпечатком запуска, который его получил.
-    /// Без отпечатка отчёт одного кандидата показывался бы рядом с моделью
-    /// другого.
-    pub(super) interpret_reports: Option<(RunStamp, Box<InterpretReports>)>,
     /// Запускать ли конвейер интерпретации и с какими переопределениями.
     pub(super) interpret_enabled: bool,
     pub(super) interpret_overrides: InterpretOverrides,
@@ -357,7 +337,6 @@ impl App {
             search_cancelled: false,
             search_stamp: None,
             lifecycle: Lifecycle::default(),
-            interpret_reports: None,
             interpret_enabled: false,
             interpret_overrides: InterpretOverrides::default(),
             custom_form: CustomSearchForm::default(),
@@ -451,7 +430,7 @@ impl App {
                     r2_std_folds,
                     curves,
                     final_eval,
-                    interpret,
+                    check_interpret,
                     cancelled,
                 } => {
                     self.training = false;
@@ -482,6 +461,7 @@ impl App {
                                         per_output: per.clone(),
                                         r2_std_folds: r2_std_folds.unwrap_or(0.0),
                                     },
+                                    interpret: check_interpret,
                                 });
                             }
                         }
@@ -507,8 +487,6 @@ impl App {
                             self.val_curve = mean_curve(&curves, |p| p.val_r2);
                         }
                         self.curve_folds = curves.len().max(1);
-                        self.interpret_reports =
-                            keep_interpret(self.interpret_reports.take(), &stamp, interpret);
                     }
                     self.status = if let Some(error) = protocol_error {
                         error
@@ -552,6 +530,7 @@ impl App {
                     model_origin,
                     parameter_count,
                     kan,
+                    interpret,
                 } => {
                     let n_inputs = schema.n_inputs();
                     // Метрики не хранятся отдельно от отпечатка: раздел
@@ -563,13 +542,13 @@ impl App {
                         self.val_curve.clear();
                         self.final_loss_curve.clear();
                         self.train_parameter_count = None;
-                        self.interpret_reports = None;
                     }
                     self.model_info = Some(ModelInfo {
                         schema,
                         kind,
                         source,
                         origin: model_origin,
+                        interpret: interpret.map(|report| *report),
                         parameter_count,
                     });
                     self.predict_inputs = vec![0.0; n_inputs];
@@ -1032,73 +1011,6 @@ mod tests {
             true,
             revision,
         )
-    }
-
-    /// Отпечаток тестовых данных: ревизия меняет и числа тоже.
-    fn fingerprint(seed: f32) -> DatasetFingerprint {
-        let data = crate::data::NumericDataset::new(
-            ndarray::Array2::from_shape_vec((2, 2), vec![seed, 2.0, 3.0, 4.0]).unwrap(),
-            ndarray::Array2::from_shape_vec((2, 1), vec![5.0, 6.0]).unwrap(),
-        );
-        DatasetFingerprint::of(&data, &ModelSchema::synthetic(2, 1).unwrap()).unwrap()
-    }
-
-    fn stamp(revision: u64, width: usize) -> RunStamp {
-        RunStamp {
-            dataset: fingerprint(revision as f32),
-            dataset_revision: revision,
-            split: SplitPlan::default(),
-            candidate: crate::lifecycle::CandidateSpec {
-                config: crate::numeric_model::NumericConfig {
-                    kind: crate::numeric_model::ModelKind::Mlp,
-                    transformer: crate::config::ModelConfig::default(),
-                    value: crate::encoders::ValueEncoderConfig::default(),
-                    mlp_width: width,
-                    mlp_layers: 2,
-                    kan: crate::numeric_model::KanConfig::default(),
-                },
-                train: crate::train::TrainConfig {
-                    epochs: 1,
-                    batch_size: 8,
-                    lr: 1e-3,
-                    seed: 0,
-                    schedule: LrSchedule::Constant,
-                },
-                interpret: None,
-            },
-            final_init_seed: 0,
-        }
-    }
-
-    fn reports() -> Box<InterpretReports> {
-        Box::new(InterpretReports {
-            development: None,
-            final_model: None,
-        })
-    }
-
-    /// Отчёт конвейера принадлежит своему запуску. Запуск без отчёта не
-    /// стирает чужой: иначе CV-проверка кандидата B убирала бы отчёт активной
-    /// модели A.
-    #[test]
-    fn an_interpret_report_belongs_to_the_run_that_produced_it() {
-        let a = stamp(1, 16);
-        let b = stamp(1, 32);
-
-        // Пусто -> отчёт A.
-        let stored = keep_interpret(None, &a, Some(reports()));
-        assert_eq!(stored.as_ref().map(|(s, _)| s.clone()), Some(a.clone()));
-
-        // Проверка B без отчёта отчёт A не трогает.
-        let stored = keep_interpret(stored, &b, None);
-        assert_eq!(stored.as_ref().map(|(s, _)| s.clone()), Some(a.clone()));
-
-        // Отчёт B вытесняет отчёт A: показывать два одновременно негде.
-        let stored = keep_interpret(stored, &b, Some(reports()));
-        assert_eq!(stored.as_ref().map(|(s, _)| s.clone()), Some(b.clone()));
-
-        // Повтор того же запуска уже без отчёта убирает именно свой.
-        assert!(keep_interpret(stored, &b, None).is_none());
     }
 
     fn point(epoch: usize, loss: f32, val: Option<f32>) -> CurvePoint {

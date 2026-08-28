@@ -6,7 +6,7 @@ use crate::batch_predict::ExportSummary;
 use crate::config::ModelConfig;
 use crate::data::{NumericDataset, OutOfRange};
 use crate::diagnostics::SensitivityReport;
-use crate::interpret::{InterpretProfile, InterpretReport};
+use crate::interpret::InterpretReport;
 use crate::lifecycle::RunStamp;
 use crate::markup::TableProfile;
 use crate::metrics::{EvalSource, Metrics};
@@ -56,28 +56,6 @@ impl DatasetOrigin {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.clone()),
         }
-    }
-}
-
-/// Отчёты конвейера интерпретации по фазам.
-///
-/// Оба необязательны: смысл у них разный (у модели разработки видно влияние
-/// прунинга на validation, у финальной — какая получилась структура), и фазы
-/// бывают по отдельности. Финальное обучение после поиска состоит ТОЛЬКО из
-/// финальной фазы, поэтому обязательный development терял бы её отчёт.
-#[derive(Clone, Debug)]
-pub(crate) struct InterpretReports {
-    pub development: Option<InterpretReport>,
-    pub final_model: Option<InterpretReport>,
-}
-
-impl InterpretReports {
-    /// Профиль общий для обеих фаз — берём у того отчёта, который есть.
-    pub(crate) fn profile(&self) -> Option<&InterpretProfile> {
-        self.development
-            .as_ref()
-            .or(self.final_model.as_ref())
-            .map(|r| &r.profile)
     }
 }
 
@@ -286,9 +264,9 @@ pub(crate) enum Event {
         /// В боксе: иначе конфигурация кандидата раздувает всё перечисление.
         stamp: Box<RunStamp>,
         metrics: Option<Metrics>,
-        /// Отчёты конвейера по фазам: развитие и финальная модель. В боксе,
-        /// потому что иначе один этот вариант раздувает всё перечисление.
-        interpret: Option<Box<InterpretReports>>,
+        /// Отчёты конвейера ПРОВЕРКИ — по одному на fold. У финализации их
+        /// нет: её отчёт принадлежит модели и едет вместе с ней.
+        check_interpret: Vec<InterpretReport>,
         /// Поколоночные validation-метрики development-модели.
         per_output: Option<Vec<Metrics>>,
         /// Чем оценка ЯВЛЯЕТСЯ по факту прогона: источник берётся у пула,
@@ -331,6 +309,9 @@ pub(crate) enum Event {
         model_origin: ModelOrigin,
         parameter_count: usize,
         kan: Option<KanModelInfo>,
+        /// Отчёт конвейера ЭТОЙ модели. Едет вместе с ней: иначе рядом с
+        /// моделью оказывался бы отчёт последней проверки.
+        interpret: Option<Box<InterpretReport>>,
     },
     PredictResult {
         outputs: Vec<f32>,

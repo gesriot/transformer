@@ -3,6 +3,7 @@
 use super::messages::Command;
 use super::messages::ModelOrigin;
 use super::session::{split_plan_label, App, KAN_CURVE_SAMPLES};
+use crate::interpret::InterpretReport;
 use crate::metrics::{EvalSource, Metrics};
 use crate::numeric_model::ModelKind;
 use crate::schema::ModelSchema;
@@ -18,6 +19,9 @@ pub(super) struct ModelInfo {
     pub(super) source: String,
     /// Чем является активная модель: отладочной, финальной или загруженной.
     pub(super) origin: ModelOrigin,
+    /// Отчёт конвейера ЭТОЙ модели: он приходит вместе с ней и не подменяется
+    /// отчётом следующей проверки.
+    pub(super) interpret: Option<InterpretReport>,
     pub(super) parameter_count: usize,
 }
 
@@ -184,46 +188,34 @@ impl App {
                  относилась к другому кандидату.",
             );
         }
-        // Отчёт конвейера показывается только у своей модели: рядом с моделью
-        // A отчёт кандидата B описывал бы не её.
-        let reports = self
-            .interpret_reports
-            .as_ref()
-            .filter(|(reported, _)| Some(reported) == stamp)
-            .map(|(_, reports)| reports);
-        if let Some(reports) = reports {
+        // Отчёт конвейера приходит вместе с моделью, поэтому описывает именно
+        // её: подменить его отчётом следующей проверки уже нечем.
+        if let Some(report) = &info.interpret {
             ui.separator();
-            if let Some(profile) = reports.profile() {
-                ui.label(format!("Конвейер интерпретации {}", profile.describe()));
-            }
-            // У модели разработки виден эффект прунинга на validation…
-            if let Some(d) = &reports.development {
-                if let (Some(before), Some(after), Some(ft)) =
-                    (d.r2_before, d.r2_after_prune, d.r2_after_finetune)
-                {
-                    ui.label(format!(
-                        "R² на validation: до прунинга {before:.5} → после {after:.5} → \
-                         после fine-tune {ft:.5}"
-                    ));
-                }
+            ui.label(format!(
+                "Конвейер интерпретации {}",
+                report.profile.describe()
+            ));
+            if let (Some(before), Some(after), Some(ft)) = (
+                report.r2_before,
+                report.r2_after_prune,
+                report.r2_after_finetune,
+            ) {
                 ui.label(format!(
-                    "Активных рёбер после прунинга: {}/{}",
-                    d.active_edges.0, d.active_edges.1
+                    "R² на validation: до прунинга {before:.5} → после {after:.5} → \
+                     после fine-tune {ft:.5}"
                 ));
             }
-            // …а у финальной — какой стала структура сохранённой модели.
-            if let Some(f) = &reports.final_model {
-                if let Some(c) = f.compaction {
-                    ui.label(format!(
-                        "Финальная модель: скрытых узлов {} → {}, параметров {} → {}",
-                        c.nodes_before, c.nodes_after, c.params_before, c.params_after
-                    ));
-                }
+            if let Some(c) = report.compaction {
                 ui.label(format!(
-                    "Активных рёбер финальной модели: {}/{}",
-                    f.active_edges.0, f.active_edges.1
+                    "Структура: скрытых узлов {} → {}, параметров {} → {}",
+                    c.nodes_before, c.nodes_after, c.params_before, c.params_after
                 ));
             }
+            ui.label(format!(
+                "Активных рёбер: {}/{}",
+                report.active_edges.0, report.active_edges.1
+            ));
         }
 
         if ui

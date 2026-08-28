@@ -8,12 +8,16 @@
 //! Оба вопроса решаются сравнением отпечатков, а не флагами: флаг «результат
 //! актуален» пришлось бы сбрасывать в каждом месте, где меняется поле.
 //!
-//! Ревизия набора защищает только текущую сессию: повторное открытие того же
-//! файла и перезапуск приложения дают новую ревизию и снимают запрет. Честная
-//! защита требует отпечатка самих данных в checkpoint — это отдельный шаг.
+//! Идентичность данных — их отпечаток ([`DatasetFingerprint`]), а не номер
+//! набора в сессии: повторное открытие того же файла потраченный test не
+//! возвращает. Раскрытия помнятся по каждому набору отдельно, поэтому возврат
+//! к прежним данным возвращает и запрет, а не только историю.
+//!
+//! Память при этом живёт в процессе: перезапуск приложения бюджет сбрасывает.
+//! Восстановить его можно только из checkpoint — это отдельный шаг.
 
 use crate::fingerprint::DatasetFingerprint;
-use crate::interpret::InterpretProfile;
+use crate::interpret::{InterpretProfile, InterpretReport};
 use crate::metrics::{EvalSource, Metrics};
 use crate::numeric_model::NumericConfig;
 use crate::split::{FinalEval, SplitPlan};
@@ -80,11 +84,15 @@ pub struct CheckEval {
     pub r2_std_folds: f32,
 }
 
-/// Проверенный кандидат: отпечаток и то, что показал validation.
+/// Проверенный кандидат: отпечаток, оценка и отчёты конвейера.
 #[derive(Clone, Debug)]
 pub struct CheckedRun {
     pub stamp: RunStamp,
     pub eval: CheckEval,
+    /// Отчёт конвейера по каждому fold, по порядку; пусто, если конвейера не
+    /// просили. Отчёт одного fold не описывает CV-проверку, поэтому их
+    /// столько же, сколько folds, а не один.
+    pub interpret: Vec<InterpretReport>,
 }
 
 impl CheckedRun {
@@ -152,7 +160,11 @@ impl FinalizeRefusal {
 #[derive(Debug, Default)]
 pub struct Lifecycle {
     checked: Option<CheckedRun>,
-    disclosed: Option<TestDisclosure>,
+    /// По одному раскрытию на набор данных.
+    ///
+    /// Не «последнее»: с одним слотом цепочка A → B → A снимала бы запрет с A,
+    /// хотя его test давно потрачен.
+    disclosed: Vec<TestDisclosure>,
 }
 
 impl Lifecycle {
@@ -181,27 +193,31 @@ impl Lifecycle {
         matches!(&self.checked, Some(run) if run.stamp != *stamp)
     }
 
+    /// Последнее по времени раскрытие — какому бы набору оно ни принадлежало.
     pub fn disclosure(&self) -> Option<&TestDisclosure> {
-        self.disclosed.as_ref()
+        self.disclosed.last()
+    }
+
+    /// Раскрытие для конкретного набора данных.
+    pub fn disclosure_on(&self, dataset: DatasetFingerprint) -> Option<&TestDisclosure> {
+        self.disclosed.iter().find(|d| d.dataset() == dataset)
     }
 
     /// Результат финального обучения ровно этого кандидата.
     pub fn disclosure_for(&self, stamp: &RunStamp) -> Option<&TestDisclosure> {
-        self.disclosed.as_ref().filter(|d| d.stamp == *stamp)
+        self.disclosed.iter().find(|d| d.stamp == *stamp)
     }
 
     /// Можно ли открывать test под этот отпечаток.
     pub fn can_finalize(&self, stamp: &RunStamp) -> Result<(), FinalizeRefusal> {
-        if let Some(disclosed) = &self.disclosed {
-            // Сравниваются сами данные, а не номер набора в сессии: повторно
-            // открыв тот же файл, потраченный test не вернуть.
-            if disclosed.dataset() == stamp.dataset {
-                return Err(if disclosed.stamp == *stamp {
-                    FinalizeRefusal::AlreadyFinalized
-                } else {
-                    FinalizeRefusal::TestDisclosed
-                });
-            }
+        // Сравниваются сами данные, а не номер набора в сессии: повторно
+        // открыв тот же файл, потраченный test не вернуть.
+        if let Some(disclosed) = self.disclosure_on(stamp.dataset) {
+            return Err(if disclosed.stamp == *stamp {
+                FinalizeRefusal::AlreadyFinalized
+            } else {
+                FinalizeRefusal::TestDisclosed
+            });
         }
         match &self.checked {
             Some(run) if run.stamp == *stamp => Ok(()),
@@ -216,11 +232,16 @@ impl Lifecycle {
     /// раскрытие фиксируется всегда, а решение «пускать ли» принимает
     /// [`Lifecycle::can_finalize`] ДО запуска.
     pub fn record_disclosure(&mut self, disclosure: TestDisclosure) {
-        self.disclosed = Some(disclosure);
+        // На набор приходится одно раскрытие: повтор того же кандидата
+        // обновляет запись, а не заводит вторую.
+        self.disclosed
+            .retain(|d| d.dataset() != disclosure.dataset());
+        self.disclosed.push(disclosure);
     }
 
-    /// Данные сменились: проверка относится к прежнему набору, а раскрытие
-    /// остаётся историей — оно привязано к своей ревизии и на новой не мешает.
+    /// Данные сменились: проверка относится к прежнему набору. Раскрытия
+    /// остаются все — вернувшись к прежним данным, пользователь обязан снова
+    /// упереться в потраченный там test.
     pub fn on_dataset_changed(&mut self) {
         self.checked = None;
     }
@@ -297,6 +318,7 @@ mod tests {
                 per_output: vec![metrics()],
                 r2_std_folds: 0.0,
             },
+            interpret: Vec::new(),
         }
     }
 
@@ -429,6 +451,40 @@ mod tests {
             life.can_finalize(&reopened),
             Err(FinalizeRefusal::TestDisclosed)
         );
+    }
+
+    /// Возврат к прежним данным возвращает и запрет: их test уже потрачен.
+    /// С одним слотом раскрытия цепочка A → B → A разрешала бы второй замер на
+    /// A, хотя первый никуда не делся.
+    #[test]
+    fn returning_to_earlier_data_finds_its_test_already_spent() {
+        let a = fingerprint(1.0);
+        let b = fingerprint(2.0);
+        let mut life = Lifecycle::default();
+
+        let on_a = stamp_on(a, 1, candidate(16));
+        life.record_check(checked(on_a.clone()));
+        life.record_disclosure(disclosure(on_a.clone()));
+
+        // Переходим к другому набору и тратим test и там.
+        life.on_dataset_changed();
+        let on_b = stamp_on(b, 2, candidate(16));
+        life.record_check(checked(on_b.clone()));
+        assert!(life.can_finalize(&on_b).is_ok(), "у B свой бюджет");
+        life.record_disclosure(disclosure(on_b.clone()));
+
+        // Возвращаемся к A: даже другой кандидат упирается в потраченный test.
+        life.on_dataset_changed();
+        let back_to_a = stamp_on(a, 3, candidate(32));
+        life.record_check(checked(back_to_a.clone()));
+        assert_eq!(
+            life.can_finalize(&back_to_a),
+            Err(FinalizeRefusal::TestDisclosed)
+        );
+        // И оба раскрытия остались доступны каждый на своём наборе.
+        assert!(life.disclosure_on(a).is_some());
+        assert!(life.disclosure_on(b).is_some());
+        assert_eq!(life.disclosure_for(&on_a).map(|d| d.dataset()), Some(a));
     }
 
     /// Другие данные начинают жизненный цикл заново.

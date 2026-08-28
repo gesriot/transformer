@@ -1197,22 +1197,29 @@ impl App {
                     "Проверка относится к другому кандидату: форма изменилась после неё.",
                 );
             }
-            // Отчёт конвейера этой же проверки: у активной модели он может быть
-            // своим, и путать их нельзя.
-            let stamp = run.stamp.clone();
-            if let Some((_, reports)) = self
-                .interpret_reports
-                .as_ref()
-                .filter(|(reported, _)| *reported == stamp)
-            {
-                if let Some(profile) = reports.profile() {
-                    ui.label(format!("Конвейер интерпретации {}", profile.describe()));
-                }
-                if let Some(d) = &reports.development {
+            // Отчёты конвейера этой проверки: по одному на fold. У активной
+            // модели отчёт свой, он живёт вместе с ней.
+            match run.interpret.as_slice() {
+                [] => {}
+                [only] => {
                     ui.label(format!(
-                        "Активных рёбер после прунинга: {}/{}",
-                        d.active_edges.0, d.active_edges.1
+                        "Конвейер интерпретации {}; активных рёбер {}/{}",
+                        only.profile.describe(),
+                        only.active_edges.0,
+                        only.active_edges.1
                     ));
+                }
+                many => {
+                    ui.label(format!(
+                        "Конвейер интерпретации {} — по каждому из {} folds",
+                        many[0].profile.describe(),
+                        many.len()
+                    ));
+                    let edges: Vec<String> = many
+                        .iter()
+                        .map(|r| format!("{}/{}", r.active_edges.0, r.active_edges.1))
+                        .collect();
+                    ui.label(format!("Активных рёбер по folds: {}", edges.join(", ")));
                 }
             }
         }
