@@ -9,6 +9,7 @@ use crate::interpret::{self, InterpretOverrides, InterpretProfile};
 use crate::lifecycle::{CandidateSpec, RunStamp};
 use crate::metrics::EvalSource;
 use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
+use crate::report::Selection;
 use crate::split::DEFAULT_FINAL_INIT_SEED;
 use crate::sweep::{self, SearchBudget, SweepAxes, SweepChoice, SweepObjective, SweepRow};
 use crate::train::{validate_train, LrSchedule, TrainConfig};
@@ -995,6 +996,49 @@ impl App {
         })
     }
 
+    /// Как выбрана текущая конфигурация — часть происхождения модели.
+    ///
+    /// У поиска записываются цель, seeds и значение цели у выбранной строки:
+    /// по ним видно, ЧТО именно сравнивали, а не только что «был поиск».
+    fn current_selection(&self) -> Selection {
+        match self.mode {
+            TrainingMode::Single => Selection::Manual,
+            TrainingMode::Auto(_) | TrainingMode::Custom => {
+                let objective = self.search_form.objective();
+                let row = self
+                    .search_selected
+                    .or((!self.search_rows.is_empty()).then_some(0))
+                    .and_then(|i| self.search_rows.get(i));
+                match row {
+                    Some(row) => Selection::Search {
+                        objective,
+                        // Seeds берутся из осей того режима, которым искали:
+                        // «поиск по одному seed» и «по трём» — разные
+                        // основания для выбора.
+                        seeds: match self.mode {
+                            TrainingMode::Auto(budget) => self
+                                .search_form
+                                .axes(budget)
+                                .map(|axes| axes.seeds)
+                                .unwrap_or_default(),
+                            _ => self
+                                .search_form
+                                .model_kinds()
+                                .and_then(|kinds| self.custom_form.build(kinds))
+                                .map(|axes| axes.seeds)
+                                .unwrap_or_default(),
+                        },
+                        objective_value: sweep::row_score(objective, row),
+                        label: row.label.clone(),
+                    },
+                    // Строки нет — значит и запуск не начнётся; подписать
+                    // поиском то, чего не выбирали, было бы неправдой.
+                    None => Selection::Manual,
+                }
+            }
+        }
+    }
+
     /// Кандидат, о котором сейчас идёт речь: из формы в ручном режиме и из
     /// выбранной строки после поиска.
     fn current_candidate(&self) -> Result<CandidateSpec, String> {
@@ -1060,10 +1104,12 @@ impl App {
         };
         self.train_parameter_count = None;
         self.worker.reset_cancel();
+        let selection = self.current_selection();
         self.worker.send(Command::CheckCandidate {
             data,
             stamp: Box::new(stamp),
             eval,
+            selection,
         });
     }
 
@@ -1072,9 +1118,11 @@ impl App {
     fn send_finalize(&mut self, data: PreparedData, stamp: RunStamp) {
         self.train_parameter_count = None;
         self.worker.reset_cancel();
+        let selection = self.current_selection();
         self.worker.send(Command::FinalizeCandidate {
             data,
             stamp: Box::new(stamp),
+            selection,
         });
     }
 

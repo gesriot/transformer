@@ -19,6 +19,7 @@ use ndarray::Array2;
 use rand::rngs::StdRng;
 #[cfg(feature = "demo")]
 use rand::SeedableRng;
+use std::cell::RefCell;
 use std::collections::HashMap;
 // Бинарь ходит в библиотеку только через её публичный фасад: если чего-то в
 // корне нет, значит этого нет и у внешнего потребителя.
@@ -31,11 +32,12 @@ use transformer::{
     calibration_sample, evaluate, evaluate_on, evaluate_surrogate, export_predictions,
     infer_prepare_spec_from_path, load_numeric_full, parse_categorical, predict_dataset,
     prepare_tnum_file, read_numeric_source, recommended_epoch, run_sweep, run_training,
-    save_numeric, sweep_cost, symbolize, validate_numeric, validate_train, Dataset, Delimiter,
-    EvalSchedule, ExportSummary, FeatureSpec, InterpretOverrides, InterpretProfile,
-    InterpretReport, KanConfig, LrSchedule, Metrics, ModelConfig, ModelKind, ModelSchema,
-    Normalizer, NumericConfig, NumericDataset, NumericModel, Phase, PrepareSpec, SearchObjective,
-    SplitPlan, SweepAxes, SweepResult, SweepRow, TrainConfig, TrainedModel, TrainingHistory,
+    save_numeric, sweep_cost, symbolize, validate_numeric, validate_train, CandidateSpec,
+    CheckRecord, Dataset, DatasetFingerprint, Delimiter, EvalSchedule, ExportSummary, FeatureSpec,
+    FinalRecord, InterpretOverrides, InterpretProfile, InterpretReport, KanConfig, LrSchedule,
+    Metrics, ModelConfig, ModelKind, ModelSchema, Normalizer, NumericConfig, NumericDataset,
+    NumericModel, Phase, PrepareSpec, RunStamp, SearchObjective, Selection, SplitPlan, SweepAxes,
+    SweepResult, SweepRow, TrainConfig, TrainedModel, TrainingHistory, TrainingReport,
     TrainingSetup, ValueEncoderConfig, ValueEncoderKind, DEFAULT_FINAL_INIT_SEED,
     DEFAULT_SPLIT_SEED,
 };
@@ -685,6 +687,9 @@ fn run_train_flow(
         ..tcfg.clone()
     };
 
+    // Отчёты конвейера по фазам: они едут в происхождение сохранённой модели,
+    // а не только в вывод на экран.
+    let pipeline_reports: RefCell<Vec<(Phase, InterpretReport)>> = RefCell::new(Vec::new());
     let outcome = run_training(
         &dataset,
         plan,
@@ -722,7 +727,10 @@ fn run_train_flow(
                 Phase::Development => &tcfg,
                 Phase::Final => &final_tcfg,
             };
-            apply_kan_pipeline(trained, train_data, eval, &interpret, phase_tcfg);
+            if let Some(report) = apply_kan_pipeline(trained, train_data, eval, &interpret, phase_tcfg)
+            {
+                pipeline_reports.borrow_mut().push((phase, report));
+            }
             // Рекомендация должна быть видна между development и refit, а не
             // после того, как финальная модель уже обучена и test открыт.
             if phase == Phase::Development {
@@ -780,6 +788,49 @@ fn run_train_flow(
     );
 
     if let Some(path) = save_path {
+        let reports = pipeline_reports.into_inner();
+        let phase_report = |wanted: Phase| {
+            reports
+                .iter()
+                .find(|(phase, _)| *phase == wanted)
+                .map(|(_, report)| report.clone())
+        };
+        // Происхождение собирается там же, где сохраняется модель: собирать
+        // его потом из вывода на экран было бы гаданием.
+        let report = TrainingReport {
+            dataset: DatasetFingerprint::of(dataset.data(), dataset.schema())
+                .unwrap_or_else(|e| fail(&e)),
+            schema: dataset.schema().clone(),
+            stamp: RunStamp {
+                dataset: DatasetFingerprint::of(dataset.data(), dataset.schema())
+                    .unwrap_or_else(|e| fail(&e)),
+                // Сессии у CLI нет, и ревизия здесь ничего не значит.
+                dataset_revision: 0,
+                split: plan,
+                candidate: CandidateSpec {
+                    config: nc.clone(),
+                    train: tcfg.clone(),
+                    interpret,
+                },
+                final_init_seed: DEFAULT_FINAL_INIT_SEED,
+            },
+            // CLI обучает заданную конфигурацию: выбирал её человек.
+            selection: Selection::Manual,
+            check: Some(CheckRecord {
+                source: outcome.development.history.source,
+                metrics: metrics.clone(),
+                per_output: per_output.clone(),
+                // Полный сценарий CLI — holdout: разброса по folds нет.
+                r2_std_folds: 0.0,
+                histories: vec![outcome.development.history.clone()],
+                interpret: phase_report(Phase::Development).into_iter().collect(),
+            }),
+            final_run: Some(FinalRecord {
+                history: final_model.history.clone(),
+                eval: final_eval.clone(),
+                interpret: phase_report(Phase::Final),
+            }),
+        };
         save_and_verify(
             path,
             &nc,
@@ -787,6 +838,7 @@ fn run_train_flow(
             &final_model,
             &pool,
             interpret.as_ref(),
+            Some(&report),
         );
     }
 }
@@ -800,10 +852,8 @@ fn apply_kan_pipeline(
     eval: Option<&NumericDataset>,
     profile: &Option<InterpretProfile>,
     tcfg: &TrainConfig,
-) {
-    let Some(profile) = profile else {
-        return;
-    };
+) -> Option<InterpretReport> {
+    let profile = profile.as_ref()?;
     let report = interpret::run_pipeline(
         &mut trained.model,
         train_data,
@@ -817,6 +867,7 @@ fn apply_kan_pipeline(
     )
     .unwrap_or_else(|e| fail(&e));
     print_interpret_report(&report);
+    Some(report)
 }
 
 /// `train` и `search` работают только с файлом. Существование проверяем до
@@ -920,6 +971,7 @@ fn save_and_verify(
     trained: &TrainedModel,
     pool: &NumericDataset,
     interpret: Option<&InterpretProfile>,
+    report: Option<&TrainingReport>,
 ) {
     // Модель и её нормализаторы врозь бессмысленны, поэтому едут вместе.
     let (model, in_norm, out_norm) = (&trained.model, &trained.in_norm, &trained.out_norm);
@@ -935,6 +987,7 @@ fn save_and_verify(
         out_norm,
         Some(&calibration),
         interpret,
+        report,
     )
     .expect("сохранение модели");
     // Проверка целостности файла, а не качества: test уже потрачен, поэтому

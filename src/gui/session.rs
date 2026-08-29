@@ -531,6 +531,7 @@ impl App {
                     parameter_count,
                     kan,
                     interpret,
+                    report,
                 } => {
                     let n_inputs = schema.n_inputs();
                     // Метрики не хранятся отдельно от отпечатка: раздел
@@ -543,12 +544,23 @@ impl App {
                         self.final_loss_curve.clear();
                         self.train_parameter_count = None;
                     }
+                    // Загруженный checkpoint возвращает потраченный test:
+                    // отпечаток данных в отчёте говорит, на чём он был открыт.
+                    if let Some(report) = &report {
+                        if let Some(final_run) = &report.final_run {
+                            self.lifecycle.record_disclosure(TestDisclosure {
+                                stamp: report.stamp.clone(),
+                                eval: final_run.eval.clone(),
+                            });
+                        }
+                    }
                     self.model_info = Some(ModelInfo {
                         schema,
                         kind,
                         source,
                         origin: model_origin,
                         interpret: interpret.map(|report| *report),
+                        report: report.map(|report| *report),
                         parameter_count,
                     });
                     self.predict_inputs = vec![0.0; n_inputs];

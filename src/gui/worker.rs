@@ -27,9 +27,10 @@ use crate::lifecycle::{
     CheckEval, CheckedRun, FinalizeRefusal, Lifecycle, RunStamp, TestDisclosure,
 };
 use crate::markup::TableProfile;
-use crate::metrics::evaluate;
+use crate::metrics::{evaluate, EvalSource};
 use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
 use crate::predict::predict_rows;
+use crate::report::{CheckRecord, FinalRecord, Selection, TrainingReport};
 use crate::schema::ModelSchema;
 use crate::serialize::{calibration_sample, load_numeric_full, save_numeric};
 #[cfg(any(feature = "demo", test))]
@@ -110,6 +111,9 @@ impl Drop for Worker {
 
 /// Текущая модель + нормализаторы (Rc !Send) — живёт в worker-потоке.
 struct Loaded {
+    /// Происхождение модели. Источник истины здесь: сохраняет модель worker, и
+    /// собирать provenance обратно из состояния интерфейса нельзя.
+    report: Option<Box<TrainingReport>>,
     model: NumericModel,
     nc: NumericConfig,
     /// Схема данных модели: имена, единицы, уровни категорий. `feature_specs`
@@ -168,14 +172,31 @@ fn worker_loop(
     // Чем является активная модель: по этому решается, можно ли заменить её
     // отладочной моделью очередной проверки.
     let mut current_origin: Option<ModelOrigin> = None;
+    // Последняя полная запись о проверке вместе с её отпечатком.
+    let mut last_check: Option<(RunStamp, CheckRecord)> = None;
     #[cfg(feature = "demo")]
     let mut current_text: Option<LoadedText> = None;
 
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
-            Command::CheckCandidate { data, stamp, eval } => {
+            Command::CheckCandidate {
+                data,
+                stamp,
+                eval,
+                selection,
+            } => {
                 let origin = data.origin.clone();
-                match train_numeric(&data, &stamp, RunKind::Check, eval, &evt_tx, &ctx, &cancel) {
+                match train_numeric(
+                    &data,
+                    &stamp,
+                    RunKind::Check,
+                    &selection,
+                    None,
+                    eval,
+                    &evt_tx,
+                    &ctx,
+                    &cancel,
+                ) {
                     Ok(outcome) => {
                         if let Some(eval) = outcome.check {
                             lifecycle.record_check(CheckedRun {
@@ -183,6 +204,11 @@ fn worker_loop(
                                 eval,
                                 interpret: outcome.check_interpret.clone(),
                             });
+                        }
+                        // Полная запись о проверке остаётся здесь: в отчёт
+                        // финальной модели она попадёт отсюда, а не из UI.
+                        if let Some(record) = outcome.check_record.clone() {
+                            last_check = Some(((*stamp).clone(), record));
                         }
                         // Проверка не вытесняет готовую модель: финальная и
                         // загруженная — результат работы, а отладочная годится
@@ -220,16 +246,28 @@ fn worker_loop(
                     }
                 }
             }
-            Command::FinalizeCandidate { data, stamp } => {
+            Command::FinalizeCandidate {
+                data,
+                stamp,
+                selection,
+            } => {
                 // Вторая проверка того же правила: кнопка может быть включена
                 // по устаревшему состоянию, а test тратится здесь.
                 match lifecycle.can_finalize(&stamp) {
                     Ok(()) => {
                         let origin = data.origin.clone();
+                        // Проверка этого же кандидата — часть происхождения
+                        // финальной модели: её истории и отчёты берутся оттуда.
+                        let checked = last_check
+                            .as_ref()
+                            .filter(|(checked_stamp, _)| *checked_stamp == *stamp)
+                            .map(|(_, record)| record.clone());
                         match train_numeric(
                             &data,
                             &stamp,
                             RunKind::Finalize,
+                            &selection,
+                            checked.as_ref(),
                             EvalSchedule::Never,
                             &evt_tx,
                             &ctx,
@@ -293,9 +331,10 @@ fn worker_loop(
                             kind: loaded.nc.kind,
                             source: format!("файл: {path}"),
                             model_origin: ModelOrigin::Checkpoint,
-                            // Checkpoint хранит профиль, но не отчёт: что
-                            // конвейер сделал, известно только из сессии.
+                            // Профиль в файле есть, а отчёта конвейера нет:
+                            // что именно он сделал, хранит происхождение.
                             interpret: None,
+                            report: loaded.report.clone(),
                             parameter_count: loaded.model.parameter_count(),
                             kan: kan_model_info(
                                 &loaded.model,
@@ -547,6 +586,7 @@ fn model_ready(
     model_origin: ModelOrigin,
     interpret: Option<Box<InterpretReport>>,
 ) -> Event {
+    let report = loaded.report.clone();
     Event::ModelReady {
         schema: loaded.schema.clone(),
         kind: loaded.nc.kind,
@@ -558,6 +598,7 @@ fn model_ready(
             loaded.diag.is_some() || loaded.calibration.is_some(),
         ),
         interpret,
+        report,
     }
 }
 
@@ -679,6 +720,9 @@ fn load_model(path: &str) -> Result<Loaded, String> {
     let n_inputs = checkpoint.schema.n_inputs();
     let n_outputs = checkpoint.schema.n_outputs();
     Ok(Loaded {
+        // Происхождение переносится из файла: пересохранение не должно его
+        // терять, а придумывать своё worker-у неоткуда.
+        report: checkpoint.report.map(Box::new),
         model: checkpoint.model,
         nc: checkpoint.config,
         schema: checkpoint.schema,
@@ -702,6 +746,7 @@ fn save_model(loaded: &Loaded, path: &str) -> Result<(), String> {
         &loaded.out_norm,
         loaded.calibration.as_ref(),
         loaded.interpret.as_ref(),
+        loaded.report.as_deref(),
     )
     .map_err(|e| format!("сохранение {path}: {e}"))
 }
@@ -1063,14 +1108,22 @@ struct RunOutcome {
     check_interpret: Vec<InterpretReport>,
     /// Отчёт конвейера активной модели: он принадлежит ей, а не сессии.
     model_interpret: Option<Box<InterpretReport>>,
+    /// Полная запись о проверке — с историями по folds. Хранится у worker-а:
+    /// собрать её обратно из состояния интерфейса нельзя.
+    check_record: Option<CheckRecord>,
 }
 
 /// Обучение в worker-потоке. Модель остаётся здесь: Rc через границу потока не
 /// ходит.
+#[allow(clippy::too_many_arguments)]
 fn train_numeric(
     prepared: &PreparedData,
     stamp: &RunStamp,
     kind: RunKind,
+    selection: &Selection,
+    // Проверка того же кандидата, если она была: её история и отчёты попадают
+    // в происхождение финальной модели.
+    previous_check: Option<&CheckRecord>,
     eval: EvalSchedule,
     evt_tx: &Sender<Event>,
     ctx: &egui::Context,
@@ -1181,6 +1234,11 @@ fn train_numeric(
     // событиями Epoch и уже нарисована.
     let mut holdout_curves: Vec<Vec<CurvePoint>> = Vec::new();
     let mut check_source = None;
+    // Запись о проверке: у K-fold она уходит наверх без модели, поэтому
+    // собирается здесь, а не в конце.
+    let mut check_record: Option<CheckRecord> = None;
+    // История финального refit: у проверки её нет, у финализации она одна.
+    let mut final_history: Option<TrainingHistory> = None;
     // Проверка идёт по всем folds и не трогает test. Фиксация уже выбранного
     // кандидата сразу делает refit на всём pool — в том числе при K-fold — и
     // только затем один раз открывает test.
@@ -1206,6 +1264,7 @@ fn train_numeric(
                 send_cancelled(evt_tx, ctx, stamp);
                 return Ok(RunOutcome::default());
             };
+            final_history = Some(trained.history.clone());
             (
                 trained,
                 None,
@@ -1249,6 +1308,14 @@ fn train_numeric(
                 .filter(|(phase, _)| *phase == Phase::Development)
                 .map(|(_, report)| report.clone())
                 .collect();
+            check_record = Some(CheckRecord {
+                source: outcome.source,
+                metrics: outcome.metrics.clone(),
+                per_output: outcome.per_output.clone(),
+                r2_std_folds: outcome.r2_std_folds,
+                histories: outcome.histories.clone(),
+                interpret: fold_reports.clone(),
+            });
             let Some(trained) = outcome.model else {
                 // K-fold: моделей столько же, сколько folds, ни одна не
                 // представляет оценку. Отдаём только её и кривые по folds.
@@ -1272,6 +1339,7 @@ fn train_numeric(
                     final_eval: None,
                     check_interpret: fold_reports,
                     model_interpret: None,
+                    check_record,
                 });
             };
             debug_assert_eq!(folds, 1, "модель отдаётся только у holdout");
@@ -1329,7 +1397,25 @@ fn train_numeric(
     });
     ctx.request_repaint();
     let calibration = Some(calibration_sample(&diag_train.inputs, 256));
+    // Происхождение собирается здесь, а не в интерфейсе: сохраняет модель
+    // worker, и восстанавливать provenance из состояния UI значило бы
+    // подписывать модель тем, что показано на экране.
+    let final_run = final_eval.as_ref().map(|eval| FinalRecord {
+        history: final_history.unwrap_or_else(|| empty_history(stamp.split)),
+        eval: eval.clone(),
+        interpret: model_interpret.as_deref().cloned(),
+    });
+    let report = TrainingReport {
+        dataset: stamp.dataset,
+        schema: schema.clone(),
+        stamp: stamp.clone(),
+        selection: selection.clone(),
+        // У финализации своей проверки нет: берётся та, что её разрешила.
+        check: check_record.clone().or_else(|| previous_check.cloned()),
+        final_run,
+    };
     let loaded = Loaded {
+        report: Some(Box::new(report)),
         model,
         nc: nc.clone(),
         schema,
@@ -1357,7 +1443,22 @@ fn train_numeric(
         final_eval,
         check_interpret,
         model_interpret,
+        check_record,
     })
+}
+
+/// Пустая история — для случая, когда финальный замер есть, а точек нет
+/// (0 эпох ядро не допускает, но отчёт не должен зависеть от этого).
+fn empty_history(split: SplitPlan) -> TrainingHistory {
+    TrainingHistory {
+        points: Vec::new(),
+        source: match split {
+            SplitPlan::Holdout { .. } => EvalSource::Validation,
+            SplitPlan::KFold { k, .. } => EvalSource::Cv { k },
+        },
+        best_epoch: None,
+        stopped_early: false,
+    }
 }
 
 /// История обучения в виде, пригодном для UI.
@@ -1399,6 +1500,7 @@ mod tests {
     use crate::numeric_model::{KanConfig, ModelKind};
     use crate::train::{fit_normalizers, TrainConfig};
     use crate::training::EvalSchedule;
+    use crate::training::SearchObjective;
 
     /// Отпечаток для тестов: всё, чем подписан запуск, в одном месте.
     fn stamp(
@@ -1432,6 +1534,95 @@ mod tests {
                 Err(e) => panic!("worker молчит: {e}"),
             }
         }
+    }
+
+    /// Происхождение доезжает до файла и обратно: после проверки и
+    /// финализации checkpoint знает, на каких данных открывали test, чем
+    /// выбирали конфигурацию и что показала проверка.
+    #[test]
+    fn a_finalized_model_carries_its_provenance_into_the_checkpoint() {
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let prepared = PreparedData {
+            origin: DatasetOrigin::Blackbox("sum".to_string()),
+            data: Arc::new(blackbox::sum().generate(64, 0)),
+            schema: schema.clone(),
+        };
+        let fp = DatasetFingerprint::of(&prepared.data, &prepared.schema).unwrap();
+        let config = NumericConfig {
+            kind: ModelKind::Mlp,
+            transformer: ModelConfig::default(),
+            value: ValueEncoderConfig::default(),
+            mlp_width: 4,
+            mlp_layers: 1,
+            kan: KanConfig::default(),
+        };
+        let train = TrainConfig {
+            epochs: 1,
+            batch_size: 16,
+            ..Default::default()
+        };
+        let run = stamp(fp, SplitPlan::default(), config, train, None);
+        let (tx, _rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+        let never = AtomicBool::new(false);
+
+        // Проверка даёт запись с историей, финализация — замер на test.
+        let checked = train_numeric(
+            &prepared,
+            &run,
+            RunKind::Check,
+            &Selection::Manual,
+            None,
+            EvalSchedule::Never,
+            &tx,
+            &ctx,
+            &never,
+        )
+        .unwrap();
+        let check_record = checked.check_record.expect("запись о проверке");
+        assert_eq!(check_record.histories.len(), 1, "holdout — один fold");
+
+        let selection = Selection::Search {
+            objective: SearchObjective::WorstOutputR2,
+            seeds: vec![0, 1],
+            objective_value: 0.5,
+            label: "mlp width=4".to_string(),
+        };
+        let finalized = train_numeric(
+            &prepared,
+            &run,
+            RunKind::Finalize,
+            &selection,
+            Some(&check_record),
+            EvalSchedule::Never,
+            &tx,
+            &ctx,
+            &never,
+        )
+        .unwrap();
+        let loaded = finalized.loaded.expect("финальная модель");
+
+        let path =
+            std::env::temp_dir().join(format!("transformer_provenance_{}.bin", std::process::id()));
+        let path = path.to_str().unwrap();
+        save_model(&loaded, path).unwrap();
+        let report = load_model(path)
+            .unwrap()
+            .report
+            .expect("происхождение в checkpoint");
+
+        assert_eq!(report.dataset, fp, "данные подписаны отпечатком");
+        assert_eq!(report.stamp.dataset, fp, "отпечаток восстановлен и в stamp");
+        assert_eq!(report.selection, selection);
+        assert!(report.test_disclosed());
+        // Проверка кандидата не потерялась при финализации.
+        let check = report.check.clone().expect("запись о проверке");
+        assert_eq!(check.histories.len(), 1);
+        assert_eq!(check.source, EvalSource::Validation);
+        // И сам замер на test на месте.
+        let final_run = report.final_run.expect("запись о финале");
+        assert!(final_run.eval.origin.test_rows > 0);
+        std::fs::remove_file(path).ok();
     }
 
     /// Отпечаток сверяется заново там, где тратится test: команда, пришедшая
@@ -1470,6 +1661,8 @@ mod tests {
                 None,
             ),
             RunKind::Check,
+            &Selection::Manual,
+            None,
             EvalSchedule::Never,
             &tx,
             &egui::Context::default(),
@@ -1531,6 +1724,7 @@ mod tests {
         // Без проверки финализировать нельзя.
         cmd_tx
             .send(Command::FinalizeCandidate {
+                selection: Selection::Manual,
                 data: prepared.clone(),
                 stamp: Box::new(first.clone()),
             })
@@ -1546,6 +1740,7 @@ mod tests {
         // Проверка -> финализация проходит и открывает test.
         cmd_tx
             .send(Command::CheckCandidate {
+                selection: Selection::Manual,
                 eval: EvalSchedule::Never,
                 data: prepared.clone(),
                 stamp: Box::new(first.clone()),
@@ -1565,6 +1760,7 @@ mod tests {
         );
         cmd_tx
             .send(Command::FinalizeCandidate {
+                selection: Selection::Manual,
                 data: prepared.clone(),
                 stamp: Box::new(first),
             })
@@ -1586,6 +1782,7 @@ mod tests {
         // проверка на validation этого не меняет.
         cmd_tx
             .send(Command::CheckCandidate {
+                selection: Selection::Manual,
                 eval: EvalSchedule::Never,
                 data: prepared.clone(),
                 stamp: Box::new(second.clone()),
@@ -1599,6 +1796,7 @@ mod tests {
         );
         cmd_tx
             .send(Command::FinalizeCandidate {
+                selection: Selection::Manual,
                 data: prepared,
                 stamp: Box::new(second),
             })
@@ -1672,6 +1870,8 @@ mod tests {
                 Some(InterpretProfile::v1()),
             ),
             RunKind::Finalize,
+            &Selection::Manual,
+            None,
             EvalSchedule::Never,
             &tx,
             &egui::Context::default(),
@@ -1735,6 +1935,8 @@ mod tests {
                 Some(InterpretProfile::v1()),
             ),
             RunKind::Finalize,
+            &Selection::Manual,
+            None,
             EvalSchedule::Never,
             &tx,
             &egui::Context::default(),
@@ -1799,6 +2001,8 @@ mod tests {
                 None,
             ),
             RunKind::Finalize,
+            &Selection::Manual,
+            None,
             EvalSchedule::Never,
             &tx,
             &egui::Context::default(),
@@ -1871,6 +2075,8 @@ mod tests {
                 Some(profile),
             ),
             RunKind::Finalize,
+            &Selection::Manual,
+            None,
             EvalSchedule::Never,
             &tx,
             &egui::Context::default(),
@@ -1946,6 +2152,8 @@ mod tests {
                 None,
             ),
             RunKind::Check,
+            &Selection::Manual,
+            None,
             EvalSchedule::Never,
             &tx,
             &egui::Context::default(),
@@ -2013,6 +2221,7 @@ mod tests {
         let in_specs = vec![FeatureSpec::Continuous; train.inputs.ncols()];
         let (in_norm, out_norm) = fit_normalizers(&train, &in_specs);
         let loaded = Loaded {
+            report: None,
             model: config.build(&in_specs, train.outputs.ncols()),
             nc: config.clone(),
             schema: ModelSchema::synthetic(train.inputs.ncols(), train.outputs.ncols()).unwrap(),
@@ -2064,6 +2273,7 @@ mod tests {
         let (in_norm, out_norm) = fit_normalizers(&data, &specs);
         let profile = InterpretProfile::v1();
         let loaded = Loaded {
+            report: None,
             model: config.build(&specs, 1),
             nc: config,
             schema,

@@ -6,6 +6,7 @@ use super::session::{split_plan_label, App, KAN_CURVE_SAMPLES};
 use crate::interpret::InterpretReport;
 use crate::metrics::{EvalSource, Metrics};
 use crate::numeric_model::ModelKind;
+use crate::report::TrainingReport;
 use crate::schema::ModelSchema;
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
@@ -22,6 +23,9 @@ pub(super) struct ModelInfo {
     /// Отчёт конвейера ЭТОЙ модели: он приходит вместе с ней и не подменяется
     /// отчётом следующей проверки.
     pub(super) interpret: Option<InterpretReport>,
+    /// Происхождение модели из checkpoint-а: копия для показа, источник истины
+    /// живёт в worker-е.
+    pub(super) report: Option<TrainingReport>,
     pub(super) parameter_count: usize,
 }
 
@@ -104,6 +108,11 @@ impl App {
         // Происхождение самой модели, а не данных: по нему видно, на чём она
         // обучена и что означают показанные ниже метрики.
         ui.label(format!("Модель: {}", info.origin.label()));
+        // У загруженной модели это единственный источник сведений о том, как
+        // её получили: сессия про неё ничего не знает.
+        if let Some(report) = &info.report {
+            ui.label(format!("Происхождение: {}", report.describe()));
+        }
         if let ModelOrigin::Development(stamp) | ModelOrigin::Final(stamp) = &info.origin {
             ui.label(format!(
                 "Протокол: {}; конфигурация проверена на этих данных",

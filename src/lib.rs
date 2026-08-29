@@ -49,6 +49,7 @@ mod numeric_model;
 mod ops;
 mod optim;
 pub mod predict;
+mod report;
 mod schema;
 mod serialize;
 mod split;
@@ -131,6 +132,9 @@ pub use sweep::{
 // Цель и цена поиска общие с ядром: `sweep` — только сетка поверх него,
 // поэтому наружу идёт одно имя, а не два синонима.
 pub use training::{SearchCost, SearchObjective};
+
+// Происхождение модели: с чем её обучали и чем измерили.
+pub use report::{CheckRecord, FinalRecord, Selection, TrainingReport, TRAINING_REPORT_VERSION};
 
 // Готовая модель: checkpoint, формулы, прогноз по таблице.
 pub use batch_predict::{export_predictions, ExportSummary};

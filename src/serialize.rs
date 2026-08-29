@@ -15,12 +15,20 @@ use crate::data::Normalizer;
 #[cfg(feature = "demo")]
 use crate::data::Vocab;
 use crate::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
-use crate::interpret::{InterpretProfile, INTERPRET_PROFILE_VERSION};
+use crate::fingerprint::DatasetFingerprint;
+use crate::interpret::{InterpretProfile, InterpretReport, INTERPRET_PROFILE_VERSION};
+use crate::kan::CompactReport;
+use crate::lifecycle::{CandidateSpec, RunStamp};
+use crate::metrics::{EvalSource, Metrics};
 use crate::numeric_model::{KanConfig, ModelKind, NumericConfig, NumericModel};
+use crate::report::{CheckRecord, FinalRecord, Selection, TrainingReport, TRAINING_REPORT_VERSION};
 use crate::schema::{Column, ColumnRole, ColumnType, ModelSchema};
+use crate::split::{FinalEval, FinalOrigin, SplitPlan};
 use crate::tensor::Tensor;
 #[cfg(feature = "demo")]
 use crate::textmodel::TextModel;
+use crate::train::{LrSchedule, TrainConfig};
+use crate::training::{EpochPoint, SearchObjective, TrainingHistory};
 use ndarray::{Array2, ArrayD, Ix2, IxDyn};
 use std::collections::HashMap;
 use std::fs::File;
@@ -65,6 +73,7 @@ const SURROGATE_SECTIONS: &[&str] = &[
     "calibration",
     "in_norm",
     "out_norm",
+    "training_report",
 ];
 #[cfg(feature = "demo")]
 const TEXT_SECTIONS: &[&str] = &["config", "vocab", "params"];
@@ -85,6 +94,10 @@ pub struct NumericCheckpoint {
     /// Выборка СЫРЫХ train-входов — калибровка для symbolic extraction
     /// после загрузки. `None` у старых checkpoint-ов.
     pub calibration: Option<Array2<f32>>,
+    /// Происхождение модели: данные, выбор конфигурации, проверка и финальный
+    /// замер. `None` у старых файлов и у пересохранённых моделей — это
+    /// «неизвестно», а не «test не открывался».
+    pub report: Option<TrainingReport>,
 }
 
 /// Равномерная выборка строк для калибровочной секции checkpoint-а.
@@ -799,6 +812,9 @@ pub fn save_numeric(
     out_norm: &Normalizer,
     calibration: Option<&Array2<f32>>,
     interpret: Option<&InterpretProfile>,
+    // Происхождение модели. `None` — его просто нет (модель загружена и
+    // пересохранена), и это не то же самое, что «test не открывался».
+    report: Option<&TrainingReport>,
 ) -> io::Result<()> {
     let specs = validate_checkpoint_components(nc, schema, model, in_norm, out_norm)?;
     let num_outputs = schema.n_outputs();
@@ -822,6 +838,9 @@ pub fn save_numeric(
         }
         profile.validate().map_err(invalid)?;
         sections.push(("interpret", build_interpret(profile)));
+    }
+    if let Some(report) = report {
+        sections.push(("training_report", build_report(report)));
     }
     if let Some(masks) = model.kan_masks() {
         sections.push(("kan_masks", build_params(&masks)?));
@@ -947,6 +966,12 @@ pub fn load_numeric_full(path: &str) -> io::Result<NumericCheckpoint> {
     } else {
         None
     };
+    // Отчёт необязателен и версионирован: незнакомая версия читается как его
+    // отсутствие, чтобы из-за неё не потерять саму модель.
+    let report = match secs.get("training_report") {
+        Some(bytes) => read_report(bytes)?,
+        None => None,
+    };
     Ok(NumericCheckpoint {
         model,
         in_norm,
@@ -955,6 +980,648 @@ pub fn load_numeric_full(path: &str) -> io::Result<NumericCheckpoint> {
         schema,
         interpret,
         calibration,
+        report,
+    })
+}
+
+/// Секция `training_report`: происхождение модели.
+///
+/// Необязательная и со своей версией: старый checkpoint читается как раньше и
+/// даёт `None` — «неизвестно», а не «test не открывался». Незнакомую версию
+/// тоже читаем как отсутствие отчёта: терять из-за неё саму модель нельзя.
+fn build_report(report: &TrainingReport) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(&TRAINING_REPORT_VERSION.to_le_bytes());
+    p.extend_from_slice(report.dataset.as_bytes());
+    w_blob(&mut p, &build_schema(&report.schema));
+    w_blob(&mut p, &build_stamp(&report.stamp));
+    build_selection(&mut p, &report.selection);
+    w_opt_blob(&mut p, report.check.as_ref().map(build_check));
+    w_opt_blob(&mut p, report.final_run.as_ref().map(build_final));
+    p
+}
+
+fn read_report(bytes: &[u8]) -> io::Result<Option<TrainingReport>> {
+    let mut r = bytes;
+    let version = r_u32(&mut r)?;
+    if version != TRAINING_REPORT_VERSION {
+        return Ok(None);
+    }
+    let mut fingerprint = [0u8; 32];
+    r.read_exact(&mut fingerprint)?;
+    let schema = read_schema(&r_blob(&mut r, "training_report: схема")?)?;
+    let mut stamp = read_stamp(&r_blob(&mut r, "training_report: отпечаток запуска")?)?;
+    // Отпечаток данных хранится один раз — в самом отчёте. Здесь он
+    // восстанавливается в stamp, чтобы дальше эти два поля не расходились.
+    stamp.dataset = DatasetFingerprint::from_bytes(fingerprint);
+    let selection = read_selection(&mut r)?;
+    let check = r_opt_blob(&mut r, "training_report: проверка")?
+        .map(|bytes| read_check(&bytes))
+        .transpose()?;
+    let final_run = r_opt_blob(&mut r, "training_report: финал")?
+        .map(|bytes| read_final(&bytes))
+        .transpose()?;
+    if !r.is_empty() {
+        return Err(invalid("training_report: лишние байты"));
+    }
+    Ok(Some(TrainingReport {
+        dataset: DatasetFingerprint::from_bytes(fingerprint),
+        schema,
+        stamp,
+        selection,
+        check,
+        final_run,
+    }))
+}
+
+/// Длина + содержимое: вложенный блок читается, не зная его устройства.
+fn w_blob(buf: &mut Vec<u8>, payload: &[u8]) {
+    buf.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    buf.extend_from_slice(payload);
+}
+
+fn r_blob(r: &mut &[u8], what: &str) -> io::Result<Vec<u8>> {
+    let len = usize::try_from(r_u64(r)?)
+        .map_err(|_| invalid(format!("{what}: длина не помещается в usize")))?;
+    // Длина сверяется с остатком ДО выделения памяти: иначе битый файл
+    // попросил бы гигабайты.
+    if len > r.len() {
+        return Err(invalid(format!(
+            "{what}: длина {len} больше остатка секции"
+        )));
+    }
+    let (head, tail) = r.split_at(len);
+    *r = tail;
+    Ok(head.to_vec())
+}
+
+fn w_opt_blob(buf: &mut Vec<u8>, payload: Option<Vec<u8>>) {
+    match payload {
+        Some(bytes) => {
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            w_blob(buf, &bytes);
+        }
+        None => buf.extend_from_slice(&0u32.to_le_bytes()),
+    }
+}
+
+fn r_opt_blob(r: &mut &[u8], what: &str) -> io::Result<Option<Vec<u8>>> {
+    match r_u32(r)? {
+        0 => Ok(None),
+        1 => Ok(Some(r_blob(r, what)?)),
+        other => Err(invalid(format!("{what}: флаг наличия {other} не 0 и не 1"))),
+    }
+}
+
+fn w_count(buf: &mut Vec<u8>, n: usize) {
+    buf.extend_from_slice(&(n as u64).to_le_bytes());
+}
+
+/// Количество элементов с проверкой против остатка секции.
+///
+/// `min_item` — сколько байт занимает самый короткий возможный элемент. Без
+/// этой проверки заявленное «миллиард точек» привело бы к выделению памяти по
+/// числу из битого файла.
+fn r_count(r: &mut &[u8], min_item: usize, what: &str) -> io::Result<usize> {
+    let n = usize::try_from(r_u64(r)?)
+        .map_err(|_| invalid(format!("{what}: количество не помещается в usize")))?;
+    let needed = n
+        .checked_mul(min_item)
+        .ok_or_else(|| invalid(format!("{what}: количество {n} переполняет размер")))?;
+    if needed > r.len() {
+        return Err(invalid(format!(
+            "{what}: заявлено {n} элементов, а в секции осталось {} байт",
+            r.len()
+        )));
+    }
+    Ok(n)
+}
+
+fn build_stamp(stamp: &RunStamp) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(&stamp.dataset_revision.to_le_bytes());
+    p.extend_from_slice(&stamp.final_init_seed.to_le_bytes());
+    build_split(&mut p, stamp.split);
+    w_blob(&mut p, &build_numeric_config(&stamp.candidate.config));
+    build_train_config(&mut p, &stamp.candidate.train);
+    w_opt_blob(
+        &mut p,
+        stamp.candidate.interpret.as_ref().map(build_interpret),
+    );
+    p
+}
+
+fn read_stamp(bytes: &[u8]) -> io::Result<RunStamp> {
+    let mut r = bytes;
+    let dataset_revision = r_u64(&mut r)?;
+    let final_init_seed = r_u64(&mut r)?;
+    let split = read_split(&mut r)?;
+    let config = read_numeric_config(&r_blob(&mut r, "stamp: конфигурация")?)?;
+    let train = read_train_config(&mut r)?;
+    let interpret = r_opt_blob(&mut r, "stamp: профиль интерпретации")?
+        .map(|bytes| read_interpret(&bytes))
+        .transpose()?;
+    if !r.is_empty() {
+        return Err(invalid("stamp: лишние байты"));
+    }
+    Ok(RunStamp {
+        // Отпечаток данных лежит в самом отчёте: две копии одного числа рано
+        // или поздно разойдутся.
+        dataset: DatasetFingerprint::from_bytes([0; 32]),
+        dataset_revision,
+        split,
+        candidate: CandidateSpec {
+            config,
+            train,
+            interpret,
+        },
+        final_init_seed,
+    })
+}
+
+fn build_split(buf: &mut Vec<u8>, split: SplitPlan) {
+    match split {
+        SplitPlan::Holdout {
+            train_frac,
+            val_frac,
+            split_seed,
+        } => {
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&train_frac.to_le_bytes());
+            buf.extend_from_slice(&val_frac.to_le_bytes());
+            buf.extend_from_slice(&split_seed.to_le_bytes());
+        }
+        SplitPlan::KFold {
+            k,
+            folds_seed,
+            test_frac,
+            test_seed,
+        } => {
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.extend_from_slice(&(k as u64).to_le_bytes());
+            buf.extend_from_slice(&folds_seed.to_le_bytes());
+            buf.extend_from_slice(&test_frac.to_le_bytes());
+            buf.extend_from_slice(&test_seed.to_le_bytes());
+        }
+    }
+}
+
+fn read_split(r: &mut &[u8]) -> io::Result<SplitPlan> {
+    match r_u32(r)? {
+        0 => Ok(SplitPlan::Holdout {
+            train_frac: r_f32(r)?,
+            val_frac: r_f32(r)?,
+            split_seed: r_u64(r)?,
+        }),
+        1 => Ok(SplitPlan::KFold {
+            k: usize::try_from(r_u64(r)?).map_err(|_| invalid("split: k не помещается в usize"))?,
+            folds_seed: r_u64(r)?,
+            test_frac: r_f32(r)?,
+            test_seed: r_u64(r)?,
+        }),
+        other => Err(invalid(format!("split: неизвестный вид разбиения {other}"))),
+    }
+}
+
+fn build_train_config(buf: &mut Vec<u8>, cfg: &TrainConfig) {
+    buf.extend_from_slice(&(cfg.epochs as u64).to_le_bytes());
+    buf.extend_from_slice(&(cfg.batch_size as u64).to_le_bytes());
+    buf.extend_from_slice(&cfg.lr.to_le_bytes());
+    buf.extend_from_slice(&cfg.seed.to_le_bytes());
+    match cfg.schedule {
+        LrSchedule::Constant => buf.extend_from_slice(&0u32.to_le_bytes()),
+        LrSchedule::WarmupCosine {
+            warmup_frac,
+            min_lr_ratio,
+        } => {
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.extend_from_slice(&warmup_frac.to_le_bytes());
+            buf.extend_from_slice(&min_lr_ratio.to_le_bytes());
+        }
+    }
+}
+
+fn read_train_config(r: &mut &[u8]) -> io::Result<TrainConfig> {
+    let epochs =
+        usize::try_from(r_u64(r)?).map_err(|_| invalid("train: epochs не помещается в usize"))?;
+    let batch_size = usize::try_from(r_u64(r)?)
+        .map_err(|_| invalid("train: batch_size не помещается в usize"))?;
+    let lr = r_f32(r)?;
+    let seed = r_u64(r)?;
+    let schedule = match r_u32(r)? {
+        0 => LrSchedule::Constant,
+        1 => LrSchedule::WarmupCosine {
+            warmup_frac: r_f32(r)?,
+            min_lr_ratio: r_f32(r)?,
+        },
+        other => return Err(invalid(format!("train: неизвестное расписание {other}"))),
+    };
+    Ok(TrainConfig {
+        epochs,
+        batch_size,
+        lr,
+        seed,
+        schedule,
+    })
+}
+
+fn build_selection(buf: &mut Vec<u8>, selection: &Selection) {
+    match selection {
+        Selection::Manual => buf.extend_from_slice(&0u32.to_le_bytes()),
+        Selection::Search {
+            objective,
+            seeds,
+            objective_value,
+            label,
+        } => {
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.extend_from_slice(&objective_code(*objective).to_le_bytes());
+            w_count(buf, seeds.len());
+            for seed in seeds {
+                buf.extend_from_slice(&seed.to_le_bytes());
+            }
+            buf.extend_from_slice(&objective_value.to_le_bytes());
+            w_string(buf, label);
+        }
+    }
+}
+
+fn read_selection(r: &mut &[u8]) -> io::Result<Selection> {
+    match r_u32(r)? {
+        0 => Ok(Selection::Manual),
+        1 => {
+            let objective = read_objective(r_u32(r)?)?;
+            let n = r_count(r, 8, "selection: seeds")?;
+            let mut seeds = Vec::with_capacity(n);
+            for _ in 0..n {
+                seeds.push(r_u64(r)?);
+            }
+            Ok(Selection::Search {
+                objective,
+                seeds,
+                objective_value: r_f32(r)?,
+                label: r_string(r, "selection: подпись строки")?,
+            })
+        }
+        other => Err(invalid(format!(
+            "selection: неизвестный способ выбора {other}"
+        ))),
+    }
+}
+
+fn objective_code(objective: SearchObjective) -> u32 {
+    match objective {
+        SearchObjective::WorstOutputR2 => 0,
+        SearchObjective::AggregateR2 => 1,
+        SearchObjective::MeanOutputR2 => 2,
+        SearchObjective::Nrmse => 3,
+    }
+}
+
+fn read_objective(code: u32) -> io::Result<SearchObjective> {
+    match code {
+        0 => Ok(SearchObjective::WorstOutputR2),
+        1 => Ok(SearchObjective::AggregateR2),
+        2 => Ok(SearchObjective::MeanOutputR2),
+        3 => Ok(SearchObjective::Nrmse),
+        other => Err(invalid(format!(
+            "selection: неизвестная цель поиска {other}"
+        ))),
+    }
+}
+
+fn build_metrics(buf: &mut Vec<u8>, m: &Metrics) {
+    buf.extend_from_slice(&m.rmse.to_le_bytes());
+    buf.extend_from_slice(&m.mae.to_le_bytes());
+    buf.extend_from_slice(&m.rel_error.to_le_bytes());
+    buf.extend_from_slice(&m.r2.to_le_bytes());
+}
+
+/// Самая короткая запись метрик — четыре `f32`.
+const METRICS_BYTES: usize = 16;
+
+fn read_metrics(r: &mut &[u8]) -> io::Result<Metrics> {
+    Ok(Metrics {
+        rmse: r_f32(r)?,
+        mae: r_f32(r)?,
+        rel_error: r_f32(r)?,
+        r2: r_f32(r)?,
+    })
+}
+
+fn build_source(buf: &mut Vec<u8>, source: EvalSource) {
+    match source {
+        EvalSource::Validation => {
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&0u64.to_le_bytes());
+        }
+        EvalSource::Cv { k } => {
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.extend_from_slice(&(k as u64).to_le_bytes());
+        }
+        EvalSource::Test => {
+            buf.extend_from_slice(&2u32.to_le_bytes());
+            buf.extend_from_slice(&0u64.to_le_bytes());
+        }
+    }
+}
+
+fn read_source(r: &mut &[u8]) -> io::Result<EvalSource> {
+    let tag = r_u32(r)?;
+    let k = usize::try_from(r_u64(r)?).map_err(|_| invalid("source: k не помещается в usize"))?;
+    match tag {
+        0 => Ok(EvalSource::Validation),
+        1 => Ok(EvalSource::Cv { k }),
+        2 => Ok(EvalSource::Test),
+        other => Err(invalid(format!(
+            "source: неизвестное происхождение {other}"
+        ))),
+    }
+}
+
+/// Точка истории: эпоха, train loss и — только там, где был замер — метрики.
+const POINT_MIN_BYTES: usize = 8 + 4 + 4;
+
+fn build_history(buf: &mut Vec<u8>, history: &TrainingHistory) {
+    build_source(buf, history.source);
+    match history.best_epoch {
+        Some(epoch) => {
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            buf.extend_from_slice(&(epoch as u64).to_le_bytes());
+        }
+        None => {
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&0u64.to_le_bytes());
+        }
+    }
+    buf.extend_from_slice(&u32::from(history.stopped_early).to_le_bytes());
+    w_count(buf, history.points.len());
+    for point in &history.points {
+        buf.extend_from_slice(&(point.epoch as u64).to_le_bytes());
+        buf.extend_from_slice(&point.train_loss.to_le_bytes());
+        match &point.val {
+            Some(m) => {
+                buf.extend_from_slice(&1u32.to_le_bytes());
+                build_metrics(buf, m);
+            }
+            None => buf.extend_from_slice(&0u32.to_le_bytes()),
+        }
+    }
+}
+
+fn read_history(r: &mut &[u8]) -> io::Result<TrainingHistory> {
+    let source = read_source(r)?;
+    let has_best = r_u32(r)?;
+    if has_best > 1 {
+        return Err(invalid("history: флаг лучшей эпохи не 0 и не 1"));
+    }
+    let best = usize::try_from(r_u64(r)?)
+        .map_err(|_| invalid("history: номер эпохи не помещается в usize"))?;
+    let stopped_early = match r_u32(r)? {
+        0 => false,
+        1 => true,
+        other => {
+            return Err(invalid(format!(
+                "history: флаг остановки {other} не 0 и не 1"
+            )))
+        }
+    };
+    let n = r_count(r, POINT_MIN_BYTES, "history: точки")?;
+    let mut points = Vec::with_capacity(n);
+    for _ in 0..n {
+        let epoch = usize::try_from(r_u64(r)?)
+            .map_err(|_| invalid("history: эпоха не помещается в usize"))?;
+        let train_loss = r_f32(r)?;
+        let val = match r_u32(r)? {
+            0 => None,
+            1 => Some(read_metrics(r)?),
+            other => {
+                return Err(invalid(format!(
+                    "history: флаг наличия метрик {other} не 0 и не 1"
+                )))
+            }
+        };
+        points.push(EpochPoint {
+            epoch,
+            train_loss,
+            val,
+        });
+    }
+    Ok(TrainingHistory {
+        points,
+        source,
+        best_epoch: (has_best == 1).then_some(best),
+        stopped_early,
+    })
+}
+
+fn build_interpret_report(buf: &mut Vec<u8>, report: &InterpretReport) {
+    w_blob(buf, &build_interpret(&report.profile));
+    w_count(buf, report.per_layer.len());
+    for (active, total) in &report.per_layer {
+        buf.extend_from_slice(&(*active as u64).to_le_bytes());
+        buf.extend_from_slice(&(*total as u64).to_le_bytes());
+    }
+    buf.extend_from_slice(&(report.active_edges.0 as u64).to_le_bytes());
+    buf.extend_from_slice(&(report.active_edges.1 as u64).to_le_bytes());
+    for value in [
+        report.r2_before,
+        report.r2_after_prune,
+        report.r2_after_finetune,
+        report.r2_after_compact,
+    ] {
+        buf.extend_from_slice(&u32::from(value.is_some()).to_le_bytes());
+        buf.extend_from_slice(&value.unwrap_or(0.0).to_le_bytes());
+    }
+    match report.compaction {
+        Some(c) => {
+            buf.extend_from_slice(&1u32.to_le_bytes());
+            for value in [
+                c.nodes_before,
+                c.nodes_after,
+                c.params_before,
+                c.params_after,
+            ] {
+                buf.extend_from_slice(&(value as u64).to_le_bytes());
+            }
+        }
+        None => buf.extend_from_slice(&0u32.to_le_bytes()),
+    }
+    buf.extend_from_slice(&u32::from(report.cancelled).to_le_bytes());
+}
+
+fn read_interpret_report(r: &mut &[u8]) -> io::Result<InterpretReport> {
+    let profile = read_interpret(&r_blob(r, "interpret-отчёт: профиль")?)?;
+    let n = r_count(r, 16, "interpret-отчёт: слои")?;
+    let mut per_layer = Vec::with_capacity(n);
+    for _ in 0..n {
+        let active = r_usize(r, "interpret-отчёт: активные рёбра")?;
+        let total = r_usize(r, "interpret-отчёт: всего рёбер")?;
+        per_layer.push((active, total));
+    }
+    let active_edges = (
+        r_usize(r, "interpret-отчёт: активные рёбра")?,
+        r_usize(r, "interpret-отчёт: всего рёбер")?,
+    );
+    let mut r2 = [None; 4];
+    for slot in &mut r2 {
+        let has = r_u32(r)?;
+        if has > 1 {
+            return Err(invalid("interpret-отчёт: флаг наличия R² не 0 и не 1"));
+        }
+        let value = r_f32(r)?;
+        *slot = (has == 1).then_some(value);
+    }
+    let compaction = match r_u32(r)? {
+        0 => None,
+        1 => Some(CompactReport {
+            nodes_before: r_usize(r, "interpret-отчёт: узлы до")?,
+            nodes_after: r_usize(r, "interpret-отчёт: узлы после")?,
+            params_before: r_usize(r, "interpret-отчёт: параметры до")?,
+            params_after: r_usize(r, "interpret-отчёт: параметры после")?,
+        }),
+        other => {
+            return Err(invalid(format!(
+                "interpret-отчёт: флаг сжатия {other} не 0 и не 1"
+            )))
+        }
+    };
+    let cancelled = match r_u32(r)? {
+        0 => false,
+        1 => true,
+        other => {
+            return Err(invalid(format!(
+                "interpret-отчёт: флаг отмены {other} не 0 и не 1"
+            )))
+        }
+    };
+    Ok(InterpretReport {
+        profile,
+        per_layer,
+        active_edges,
+        r2_before: r2[0],
+        r2_after_prune: r2[1],
+        r2_after_finetune: r2[2],
+        compaction,
+        r2_after_compact: r2[3],
+        cancelled,
+    })
+}
+
+fn r_usize(r: &mut &[u8], what: &str) -> io::Result<usize> {
+    usize::try_from(r_u64(r)?).map_err(|_| invalid(format!("{what}: не помещается в usize")))
+}
+
+fn build_check(check: &CheckRecord) -> Vec<u8> {
+    let mut p = Vec::new();
+    build_source(&mut p, check.source);
+    build_metrics(&mut p, &check.metrics);
+    p.extend_from_slice(&check.r2_std_folds.to_le_bytes());
+    w_count(&mut p, check.per_output.len());
+    for m in &check.per_output {
+        build_metrics(&mut p, m);
+    }
+    w_count(&mut p, check.histories.len());
+    for history in &check.histories {
+        let mut block = Vec::new();
+        build_history(&mut block, history);
+        w_blob(&mut p, &block);
+    }
+    w_count(&mut p, check.interpret.len());
+    for report in &check.interpret {
+        let mut block = Vec::new();
+        build_interpret_report(&mut block, report);
+        w_blob(&mut p, &block);
+    }
+    p
+}
+
+fn read_check(bytes: &[u8]) -> io::Result<CheckRecord> {
+    let mut r = bytes;
+    let source = read_source(&mut r)?;
+    let metrics = read_metrics(&mut r)?;
+    let r2_std_folds = r_f32(&mut r)?;
+    let n = r_count(&mut r, METRICS_BYTES, "проверка: метрики выходов")?;
+    let mut per_output = Vec::with_capacity(n);
+    for _ in 0..n {
+        per_output.push(read_metrics(&mut r)?);
+    }
+    let n = r_count(&mut r, 8, "проверка: истории folds")?;
+    let mut histories = Vec::with_capacity(n);
+    for _ in 0..n {
+        let block = r_blob(&mut r, "проверка: история fold")?;
+        histories.push(read_history(&mut block.as_slice())?);
+    }
+    let n = r_count(&mut r, 8, "проверка: отчёты конвейера")?;
+    let mut interpret = Vec::with_capacity(n);
+    for _ in 0..n {
+        let block = r_blob(&mut r, "проверка: отчёт конвейера")?;
+        interpret.push(read_interpret_report(&mut block.as_slice())?);
+    }
+    if !r.is_empty() {
+        return Err(invalid("проверка: лишние байты"));
+    }
+    Ok(CheckRecord {
+        source,
+        metrics,
+        per_output,
+        r2_std_folds,
+        histories,
+        interpret,
+    })
+}
+
+fn build_final(record: &FinalRecord) -> Vec<u8> {
+    let mut p = Vec::new();
+    build_history(&mut p, &record.history);
+    build_metrics(&mut p, &record.eval.metrics);
+    w_count(&mut p, record.eval.per_output.len());
+    for m in &record.eval.per_output {
+        build_metrics(&mut p, m);
+    }
+    p.extend_from_slice(&(record.eval.origin.test_rows as u64).to_le_bytes());
+    p.extend_from_slice(&record.eval.origin.final_init_seed.to_le_bytes());
+    build_split(&mut p, record.eval.origin.plan);
+    let mut interpret = None;
+    if let Some(report) = &record.interpret {
+        let mut block = Vec::new();
+        build_interpret_report(&mut block, report);
+        interpret = Some(block);
+    }
+    w_opt_blob(&mut p, interpret);
+    p
+}
+
+fn read_final(bytes: &[u8]) -> io::Result<FinalRecord> {
+    let mut r = bytes;
+    let history = read_history(&mut r)?;
+    let metrics = read_metrics(&mut r)?;
+    let n = r_count(&mut r, METRICS_BYTES, "финал: метрики выходов")?;
+    let mut per_output = Vec::with_capacity(n);
+    for _ in 0..n {
+        per_output.push(read_metrics(&mut r)?);
+    }
+    let test_rows = r_usize(&mut r, "финал: строк в test")?;
+    let final_init_seed = r_u64(&mut r)?;
+    let plan = read_split(&mut r)?;
+    let interpret = r_opt_blob(&mut r, "финал: отчёт конвейера")?
+        .map(|block| read_interpret_report(&mut block.as_slice()))
+        .transpose()?;
+    if !r.is_empty() {
+        return Err(invalid("финал: лишние байты"));
+    }
+    Ok(FinalRecord {
+        history,
+        eval: FinalEval {
+            metrics,
+            per_output,
+            origin: FinalOrigin {
+                test_rows,
+                final_init_seed,
+                plan,
+            },
+        },
+        interpret,
     })
 }
 
@@ -1048,7 +1715,10 @@ mod tests {
         let before = model.predict(&x).data();
 
         let path = tmp_path(name);
-        save_numeric(&path, &nc, &schema, &model, &in_norm, &out_norm, None, None).unwrap();
+        save_numeric(
+            &path, &nc, &schema, &model, &in_norm, &out_norm, None, None, None,
+        )
+        .unwrap();
         let (loaded, _in2, _out2) = load_numeric(&path).unwrap();
         let after = loaded.predict(&x).data();
         let full = load_numeric_full(&path).unwrap();
@@ -1082,7 +1752,10 @@ mod tests {
         std::fs::write(&path, [0xff_u8, 0xff, 0x00, 0x01]).unwrap();
 
         let model = nc.build(&specs, 1);
-        save_numeric(&path, &nc, &schema, &model, &in_norm, &out_norm, None, None).unwrap();
+        save_numeric(
+            &path, &nc, &schema, &model, &in_norm, &out_norm, None, None, None,
+        )
+        .unwrap();
 
         let x = Tensor::constant(
             Array2::from_shape_vec((1, 2), vec![0.25, -0.5])
@@ -1108,6 +1781,229 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
         std::fs::remove_file(&path).ok();
+    }
+
+    fn sample_history(source: EvalSource) -> TrainingHistory {
+        TrainingHistory {
+            points: vec![
+                EpochPoint {
+                    epoch: 1,
+                    train_loss: 0.5,
+                    val: None,
+                },
+                EpochPoint {
+                    epoch: 2,
+                    train_loss: 0.25,
+                    val: Some(Metrics {
+                        rmse: 1.0,
+                        mae: 0.5,
+                        rel_error: 0.1,
+                        r2: 0.9,
+                    }),
+                },
+            ],
+            source,
+            best_epoch: Some(2),
+            stopped_early: true,
+        }
+    }
+
+    fn sample_report(schema: &ModelSchema) -> TrainingReport {
+        let metrics = Metrics {
+            rmse: 1.0,
+            mae: 0.5,
+            rel_error: 0.1,
+            r2: 0.9,
+        };
+        let split = SplitPlan::KFold {
+            k: 3,
+            folds_seed: 7,
+            test_frac: 0.2,
+            test_seed: 9,
+        };
+        TrainingReport {
+            dataset: DatasetFingerprint::from_bytes([7; 32]),
+            schema: schema.clone(),
+            stamp: RunStamp {
+                dataset: DatasetFingerprint::from_bytes([0; 32]),
+                dataset_revision: 4,
+                split,
+                candidate: CandidateSpec {
+                    config: numeric_cfg(ModelKind::Kan),
+                    train: TrainConfig {
+                        epochs: 7,
+                        batch_size: 16,
+                        lr: 3e-3,
+                        seed: 11,
+                        schedule: LrSchedule::WarmupCosine {
+                            warmup_frac: 0.1,
+                            min_lr_ratio: 0.01,
+                        },
+                    },
+                    interpret: Some(InterpretProfile::v1()),
+                },
+                final_init_seed: 5,
+            },
+            selection: Selection::Search {
+                objective: SearchObjective::Nrmse,
+                seeds: vec![0, 1, 2],
+                objective_value: -0.25,
+                label: "kan width=16 L=2".to_string(),
+            },
+            check: Some(CheckRecord {
+                source: EvalSource::Cv { k: 3 },
+                metrics: metrics.clone(),
+                per_output: vec![metrics.clone()],
+                r2_std_folds: 0.02,
+                histories: vec![
+                    sample_history(EvalSource::Cv { k: 3 }),
+                    sample_history(EvalSource::Cv { k: 3 }),
+                ],
+                interpret: vec![InterpretReport {
+                    profile: InterpretProfile::v1(),
+                    per_layer: vec![(3, 8), (2, 4)],
+                    active_edges: (5, 12),
+                    r2_before: Some(0.8),
+                    r2_after_prune: Some(0.7),
+                    r2_after_finetune: Some(0.85),
+                    compaction: Some(CompactReport {
+                        nodes_before: 16,
+                        nodes_after: 9,
+                        params_before: 400,
+                        params_after: 220,
+                    }),
+                    r2_after_compact: None,
+                    cancelled: false,
+                }],
+            }),
+            final_run: Some(FinalRecord {
+                history: sample_history(EvalSource::Validation),
+                eval: FinalEval {
+                    metrics,
+                    per_output: vec![Metrics {
+                        rmse: 2.0,
+                        mae: 1.0,
+                        rel_error: 0.2,
+                        r2: 0.8,
+                    }],
+                    origin: FinalOrigin {
+                        test_rows: 18,
+                        final_init_seed: 5,
+                        plan: split,
+                    },
+                },
+                interpret: None,
+            }),
+        }
+    }
+
+    /// Отчёт переживает запись и чтение целиком: истории по folds пишутся
+    /// полностью, без прореживания, и `val` остаётся только там, где замер был.
+    #[test]
+    fn training_report_survives_a_round_trip() {
+        let nc = numeric_cfg(ModelKind::Mlp);
+        let specs = vec![FeatureSpec::Continuous, FeatureSpec::Continuous];
+        let schema = ModelSchema::synthetic_from_specs(&specs, 1).unwrap();
+        let model = nc.build(&specs, 1);
+        let data = blackbox::sum().generate(8, 0);
+        let in_norm = Normalizer::fit(&data.inputs, &specs);
+        let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
+        let report = sample_report(&schema);
+
+        let path = tmp_path("training_report.bin");
+        save_numeric(
+            &path,
+            &nc,
+            &schema,
+            &model,
+            &in_norm,
+            &out_norm,
+            None,
+            None,
+            Some(&report),
+        )
+        .unwrap();
+        let loaded = load_numeric_full(&path).unwrap().report.expect("отчёт");
+
+        assert_eq!(loaded.dataset, report.dataset);
+        assert_eq!(loaded.schema, report.schema);
+        assert_eq!(loaded.stamp.split, report.stamp.split);
+        assert_eq!(loaded.stamp.candidate, report.stamp.candidate);
+        assert_eq!(loaded.stamp.final_init_seed, 5);
+        assert_eq!(
+            loaded.stamp.candidate.train.seed, 11,
+            "seed проверки и финальный seed — разные величины"
+        );
+        assert_eq!(loaded.selection, report.selection);
+
+        assert!(loaded.test_disclosed());
+        let check = loaded.check.expect("запись о проверке");
+        assert_eq!(check.source, EvalSource::Cv { k: 3 });
+        assert_eq!(check.histories.len(), 2);
+        assert_eq!(check.histories[0].points.len(), 2);
+        assert!(check.histories[0].points[0].val.is_none());
+        assert_eq!(check.histories[0].points[1].val.as_ref().unwrap().r2, 0.9);
+        assert!(check.histories[0].stopped_early);
+        assert_eq!(check.interpret.len(), 1);
+        assert_eq!(check.interpret[0].per_layer, vec![(3, 8), (2, 4)]);
+        assert_eq!(check.interpret[0].compaction.unwrap().params_after, 220);
+        assert!(check.interpret[0].r2_after_compact.is_none());
+
+        let final_run = loaded.final_run.expect("запись о финале");
+        assert_eq!(final_run.eval.origin.test_rows, 18);
+        assert_eq!(final_run.eval.origin.plan, report.stamp.split);
+        assert!(final_run.interpret.is_none());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Секция необязательна: checkpoint без неё читается как раньше и даёт
+    /// «неизвестно», а не «test не открывался».
+    #[test]
+    fn a_checkpoint_without_a_report_still_loads() {
+        let nc = numeric_cfg(ModelKind::Mlp);
+        let specs = vec![FeatureSpec::Continuous, FeatureSpec::Continuous];
+        let schema = ModelSchema::synthetic_from_specs(&specs, 1).unwrap();
+        let model = nc.build(&specs, 1);
+        let data = blackbox::sum().generate(8, 0);
+        let in_norm = Normalizer::fit(&data.inputs, &specs);
+        let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
+
+        let path = tmp_path("no_training_report.bin");
+        save_numeric(
+            &path, &nc, &schema, &model, &in_norm, &out_norm, None, None, None,
+        )
+        .unwrap();
+        assert!(load_numeric_full(&path).unwrap().report.is_none());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Незнакомая версия отчёта не должна стоить модели: секция читается как
+    /// отсутствующая.
+    #[test]
+    fn an_unknown_report_version_is_ignored() {
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let mut bytes = build_report(&sample_report(&schema));
+        bytes[..4].copy_from_slice(&(TRAINING_REPORT_VERSION + 1).to_le_bytes());
+        assert!(read_report(&bytes).unwrap().is_none());
+    }
+
+    /// Обрезанная секция — ошибка, а не попытка выделить память по числу из
+    /// битого файла.
+    #[test]
+    fn a_truncated_report_is_rejected() {
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let bytes = build_report(&sample_report(&schema));
+        for cut in [8, bytes.len() / 3, bytes.len() / 2, bytes.len() - 1] {
+            assert!(
+                read_report(&bytes[..cut]).is_err(),
+                "обрезка до {cut} байт принята"
+            );
+        }
+        // Заявленная длина больше остатка тоже отвергается до выделения.
+        let mut lying = bytes.clone();
+        let count_at = 4 + 32;
+        lying[count_at..count_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(read_report(&lying).is_err());
     }
 
     #[test]
@@ -1167,6 +2063,7 @@ mod tests {
             &out_norm,
             Some(&data.inputs),
             None,
+            None,
         )
         .unwrap();
         assert!(load_numeric_full(&path).unwrap().calibration.is_none());
@@ -1202,7 +2099,10 @@ mod tests {
         let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
 
         let path = tmp_path("surr_schema.bin");
-        save_numeric(&path, &nc, &schema, &model, &in_norm, &out_norm, None, None).unwrap();
+        save_numeric(
+            &path, &nc, &schema, &model, &in_norm, &out_norm, None, None, None,
+        )
+        .unwrap();
 
         // Симуляция старого reader-а: в списке известных секций schema нет,
         // но все прежние обязательные секции остаются читаемыми.
@@ -1266,6 +2166,7 @@ mod tests {
             &out_norm,
             None,
             Some(&profile),
+            None,
         )
         .unwrap();
         let checkpoint = load_numeric_full(&path).unwrap();
@@ -1297,7 +2198,7 @@ mod tests {
         // Без конвейера секции нет, и это не ошибка.
         let plain = tmp_path("surr_interpret_none.bin");
         save_numeric(
-            &plain, &nc, &schema, &model, &in_norm, &out_norm, None, None,
+            &plain, &nc, &schema, &model, &in_norm, &out_norm, None, None, None,
         )
         .unwrap();
         assert_eq!(load_numeric_full(&plain).unwrap().interpret, None);
@@ -1317,6 +2218,7 @@ mod tests {
             &out_norm,
             None,
             Some(&no_prune),
+            None,
         )
         .unwrap();
         assert_eq!(load_numeric_full(&third).unwrap().interpret, Some(no_prune));
@@ -1374,6 +2276,7 @@ mod tests {
             &out_norm,
             None,
             Some(&InterpretProfile::v1()),
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("только у KAN"), "{err}");
@@ -1416,6 +2319,7 @@ mod tests {
             &out_norm,
             None,
             Some(&unsupported),
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("версия профиля 99"), "{err}");
@@ -1568,6 +2472,7 @@ mod tests {
             &in_norm,
             &out_norm,
             None,
+            None,
             None
         )
         .unwrap_err()
@@ -1582,6 +2487,7 @@ mod tests {
             &model,
             &in_norm,
             &out_norm,
+            None,
             None,
             None
         )
@@ -1601,6 +2507,7 @@ mod tests {
             &model,
             &wrong_norm,
             &out_norm,
+            None,
             None,
             None
         )
@@ -1651,6 +2558,7 @@ mod tests {
             &out_norm,
             Some(&calib),
             None,
+            None,
         )
         .unwrap();
         let checkpoint = load_numeric_full(&path).unwrap();
@@ -1686,6 +2594,7 @@ mod tests {
             &model,
             &in_norm,
             &out_norm,
+            None,
             None,
             None,
         )

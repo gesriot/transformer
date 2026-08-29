@@ -11,6 +11,7 @@ use crate::lifecycle::RunStamp;
 use crate::markup::TableProfile;
 use crate::metrics::{EvalSource, Metrics};
 use crate::numeric_model::ModelKind;
+use crate::report::{Selection, TrainingReport};
 use crate::schema::ModelSchema;
 use crate::split::{FinalEval, SplitPlan};
 use crate::sweep::{SweepAxes, SweepObjective, SweepRow};
@@ -174,6 +175,8 @@ pub(crate) enum Command {
         /// Когда снимать метрики по ходу обучения. Настройка наблюдения, не
         /// личность кандидата: без ранней остановки она не меняет модель.
         eval: EvalSchedule,
+        /// Как выбрана конфигурация — часть происхождения модели.
+        selection: Selection,
     },
     /// Зафиксировать проверенного кандидата: refit на train+validation и
     /// единственный замер на test.
@@ -183,6 +186,7 @@ pub(crate) enum Command {
     FinalizeCandidate {
         data: PreparedData,
         stamp: Box<RunStamp>,
+        selection: Selection,
     },
     LoadModel(String),
     SaveModel(String),
@@ -312,6 +316,9 @@ pub(crate) enum Event {
         /// Отчёт конвейера ЭТОЙ модели. Едет вместе с ней: иначе рядом с
         /// моделью оказывался бы отчёт последней проверки.
         interpret: Option<Box<InterpretReport>>,
+        /// Копия происхождения для показа. Источник истины — worker: он
+        /// сохраняет модель, и собирать provenance из состояния UI нельзя.
+        report: Option<Box<TrainingReport>>,
     },
     PredictResult {
         outputs: Vec<f32>,
