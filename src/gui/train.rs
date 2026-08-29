@@ -1223,16 +1223,23 @@ impl App {
                 }
             }
         }
-        if let Some(disclosed) = self.lifecycle.disclosure() {
-            // Раскрытие переживает смену набора намеренно, но выдавать его за
-            // результат текущих данных нельзя.
-            let historical = self.dataset_fingerprint() != Some(disclosed.dataset());
+        // Раскрытие активного набора важнее любого другого: последнее по
+        // времени может относиться к набору, с которым сейчас не работают.
+        let active = self.dataset_fingerprint();
+        let disclosed = active
+            .and_then(|fp| self.lifecycle.disclosure_on(fp))
+            .or_else(|| self.lifecycle.disclosure());
+        if let Some(disclosed) = disclosed {
+            let current = self
+                .current_stamp()
+                .is_ok_and(|(_, stamp)| stamp == disclosed.stamp);
+            let same_dataset = active == Some(disclosed.dataset());
             ui.separator();
             let f = &disclosed.eval;
-            let prefix = if historical {
-                "test прежнего набора данных"
-            } else {
-                "test"
+            let prefix = match (same_dataset, current) {
+                (true, true) => "test",
+                (true, false) => "test этого набора, раскрытый другим кандидатом",
+                (false, _) => "test прежнего набора данных",
             };
             ui.label(format!(
                 "{prefix} ({} строк, единственный замер): RMSE={:.5}   MAE={:.5}   \
@@ -1243,12 +1250,21 @@ impl App {
                 f.metrics.rel_error * 100.0,
                 f.metrics.r2
             ));
-            if historical {
-                ui.colored_label(
-                    egui::Color32::from_rgb(200, 120, 0),
-                    "Этот замер относится к прежнему набору данных и к активному отношения не \
-                     имеет.",
-                );
+            match (same_dataset, current) {
+                (true, true) => {}
+                (true, false) => {
+                    ui.label(
+                        "Замер сделан по другой конфигурации: повторно открыть test на этих \
+                         данных уже нельзя.",
+                    );
+                }
+                (false, _) => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 120, 0),
+                        "Этот замер относится к прежнему набору данных и к активному отношения \
+                         не имеет.",
+                    );
+                }
             }
         }
         if let Some(warning) = self
