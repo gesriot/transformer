@@ -121,7 +121,7 @@ pub use training::{
 // Дисциплина «test открывают один раз» — часть протокола оценки, а не деталь
 // интерфейса, поэтому контракт состояния идёт наружу вместе с ним.
 pub use lifecycle::{
-    CandidateSpec, CheckEval, CheckedRun, FinalizeRefusal, Lifecycle, RunStamp, TestDisclosure,
+    CandidateSpec, CheckEval, CheckedRun, FinalizeRefusal, Lifecycle, RunIdentity, TestDisclosure,
 };
 
 // Поиск конфигурации: сетка поверх того же сценария обучения.

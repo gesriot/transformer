@@ -36,8 +36,8 @@ use transformer::{
     CheckRecord, Dataset, DatasetFingerprint, Delimiter, EvalSchedule, ExportSummary, FeatureSpec,
     FinalRecord, InterpretOverrides, InterpretProfile, InterpretReport, KanConfig, LrSchedule,
     Metrics, ModelConfig, ModelKind, ModelSchema, Normalizer, NumericConfig, NumericDataset,
-    NumericModel, Phase, PrepareSpec, RunStamp, SearchObjective, Selection, SplitPlan, SweepAxes,
-    SweepResult, SweepRow, TrainConfig, TrainedModel, TrainingHistory, TrainingReport,
+    NumericModel, Phase, PrepareSpec, RunIdentity, SearchObjective, Selection, SplitPlan,
+    SweepAxes, SweepResult, SweepRow, TrainConfig, TrainedModel, TrainingHistory, TrainingReport,
     TrainingSetup, ValueEncoderConfig, ValueEncoderKind, DEFAULT_FINAL_INIT_SEED,
     DEFAULT_SPLIT_SEED,
 };
@@ -801,11 +801,9 @@ fn run_train_flow(
             dataset: DatasetFingerprint::of(dataset.data(), dataset.schema())
                 .unwrap_or_else(|e| fail(&e)),
             schema: dataset.schema().clone(),
-            stamp: RunStamp {
+            stamp: RunIdentity {
                 dataset: DatasetFingerprint::of(dataset.data(), dataset.schema())
                     .unwrap_or_else(|e| fail(&e)),
-                // Сессии у CLI нет, и ревизия здесь ничего не значит.
-                dataset_revision: 0,
                 split: plan,
                 candidate: CandidateSpec {
                     config: nc.clone(),

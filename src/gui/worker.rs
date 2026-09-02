@@ -24,10 +24,10 @@ use crate::generate::generate;
 use crate::init::set_init_seed;
 use crate::interpret::{self, InterpretProfile, InterpretReport};
 use crate::lifecycle::{
-    CheckEval, CheckedRun, FinalizeRefusal, Lifecycle, RunStamp, TestDisclosure,
+    CheckEval, CheckedRun, FinalizeRefusal, Lifecycle, RunIdentity, TestDisclosure,
 };
 use crate::markup::TableProfile;
-use crate::metrics::{evaluate, EvalSource};
+use crate::metrics::evaluate;
 use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
 use crate::predict::predict_rows;
 use crate::report::{CheckRecord, FinalRecord, Selection, TrainingReport};
@@ -173,7 +173,7 @@ fn worker_loop(
     // отладочной моделью очередной проверки.
     let mut current_origin: Option<ModelOrigin> = None;
     // Последняя полная запись о проверке вместе с её отпечатком.
-    let mut last_check: Option<(RunStamp, CheckRecord)> = None;
+    let mut last_check: Option<(RunIdentity, CheckRecord, Selection)> = None;
     #[cfg(feature = "demo")]
     let mut current_text: Option<LoadedText> = None;
 
@@ -208,7 +208,7 @@ fn worker_loop(
                         // Полная запись о проверке остаётся здесь: в отчёт
                         // финальной модели она попадёт отсюда, а не из UI.
                         if let Some(record) = outcome.check_record.clone() {
-                            last_check = Some(((*stamp).clone(), record));
+                            last_check = Some(((*stamp).clone(), record, selection.clone()));
                         }
                         // Проверка не вытесняет готовую модель: финальная и
                         // загруженная — результат работы, а отладочная годится
@@ -246,11 +246,7 @@ fn worker_loop(
                     }
                 }
             }
-            Command::FinalizeCandidate {
-                data,
-                stamp,
-                selection,
-            } => {
+            Command::FinalizeCandidate { data, stamp } => {
                 // Вторая проверка того же правила: кнопка может быть включена
                 // по устаревшему состоянию, а test тратится здесь.
                 match lifecycle.can_finalize(&stamp) {
@@ -258,10 +254,19 @@ fn worker_loop(
                         let origin = data.origin.clone();
                         // Проверка этого же кандидата — часть происхождения
                         // финальной модели: её истории и отчёты берутся оттуда.
+                        // Способ выбора берётся у разрешившей проверки: за
+                        // время до финализации форма могла измениться, а
+                        // происхождение модели — нет.
                         let checked = last_check
                             .as_ref()
-                            .filter(|(checked_stamp, _)| *checked_stamp == *stamp)
-                            .map(|(_, record)| record.clone());
+                            .filter(|(checked_stamp, _, _)| *checked_stamp == *stamp)
+                            .map(|(_, record, selection)| (record.clone(), selection.clone()));
+                        let (checked, selection) = match checked {
+                            Some((record, selection)) => (Some(record), selection),
+                            // Проверку разрешил lifecycle, а записи нет: это
+                            // рассогласование, а не повод придумать выбор.
+                            None => (None, Selection::Manual),
+                        };
                         match train_numeric(
                             &data,
                             &stamp,
@@ -341,6 +346,17 @@ fn worker_loop(
                                 loaded.diag.is_some() || loaded.calibration.is_some(),
                             ),
                         });
+                        // Загруженный отчёт возвращает бюджет test и в
+                        // worker-е: разрешение тратится здесь, и полагаться на
+                        // то, что его вернул интерфейс, нельзя.
+                        if let Some(report) = &loaded.report {
+                            if let Some(final_run) = &report.final_run {
+                                lifecycle.record_disclosure(TestDisclosure {
+                                    stamp: report.stamp.clone(),
+                                    eval: final_run.eval.clone(),
+                                });
+                            }
+                        }
                         current = Some(loaded);
                         current_origin = Some(ModelOrigin::Checkpoint);
                         let _ = evt_tx.send(Event::Status("модель загружена".to_string()));
@@ -1118,7 +1134,7 @@ struct RunOutcome {
 #[allow(clippy::too_many_arguments)]
 fn train_numeric(
     prepared: &PreparedData,
-    stamp: &RunStamp,
+    stamp: &RunIdentity,
     kind: RunKind,
     selection: &Selection,
     // Проверка того же кандидата, если она была: её история и отчёты попадают
@@ -1400,11 +1416,19 @@ fn train_numeric(
     // Происхождение собирается здесь, а не в интерфейсе: сохраняет модель
     // worker, и восстанавливать provenance из состояния UI значило бы
     // подписывать модель тем, что показано на экране.
-    let final_run = final_eval.as_ref().map(|eval| FinalRecord {
-        history: final_history.unwrap_or_else(|| empty_history(stamp.split)),
-        eval: eval.clone(),
-        interpret: model_interpret.as_deref().cloned(),
-    });
+    // Замер на test без истории обучения — внутреннее рассогласование, а не
+    // повод записать правдоподобный пустой отчёт.
+    let final_run = match (final_eval.as_ref(), final_history) {
+        (Some(eval), Some(history)) => Some(FinalRecord {
+            history,
+            eval: eval.clone(),
+            interpret: model_interpret.as_deref().cloned(),
+        }),
+        (Some(_), None) => {
+            return Err("внутренняя ошибка: есть замер на test, но нет истории refit".to_string())
+        }
+        (None, _) => None,
+    };
     let report = TrainingReport {
         dataset: stamp.dataset,
         schema: schema.clone(),
@@ -1447,20 +1471,6 @@ fn train_numeric(
     })
 }
 
-/// Пустая история — для случая, когда финальный замер есть, а точек нет
-/// (0 эпох ядро не допускает, но отчёт не должен зависеть от этого).
-fn empty_history(split: SplitPlan) -> TrainingHistory {
-    TrainingHistory {
-        points: Vec::new(),
-        source: match split {
-            SplitPlan::Holdout { .. } => EvalSource::Validation,
-            SplitPlan::KFold { k, .. } => EvalSource::Cv { k },
-        },
-        best_epoch: None,
-        stopped_early: false,
-    }
-}
-
 /// История обучения в виде, пригодном для UI.
 fn curve(history: &TrainingHistory) -> Vec<CurvePoint> {
     history
@@ -1475,7 +1485,7 @@ fn curve(history: &TrainingHistory) -> Vec<CurvePoint> {
 }
 
 /// Отменённый запуск: ни оценки, ни модели, ни замера на test.
-fn send_cancelled(evt_tx: &Sender<Event>, ctx: &egui::Context, stamp: &RunStamp) {
+fn send_cancelled(evt_tx: &Sender<Event>, ctx: &egui::Context, stamp: &RunIdentity) {
     let _ = evt_tx.send(Event::TrainDone {
         stamp: Box::new(stamp.clone()),
         metrics: None,
@@ -1497,6 +1507,7 @@ mod tests {
     use crate::config::ModelConfig;
     use crate::encoders::ValueEncoderConfig;
     use crate::lifecycle::CandidateSpec;
+    use crate::metrics::EvalSource;
     use crate::numeric_model::{KanConfig, ModelKind};
     use crate::train::{fit_normalizers, TrainConfig};
     use crate::training::EvalSchedule;
@@ -1509,10 +1520,9 @@ mod tests {
         config: NumericConfig,
         train: TrainConfig,
         interpret: Option<InterpretProfile>,
-    ) -> RunStamp {
-        RunStamp {
+    ) -> RunIdentity {
+        RunIdentity {
             dataset: fingerprint,
-            dataset_revision: 1,
             split,
             candidate: CandidateSpec {
                 config,
@@ -1625,6 +1635,120 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    /// Загруженный финальный checkpoint возвращает запрет и в worker-е:
+    /// после перезапуска второй замер на тех же данных недопустим, даже если
+    /// интерфейс об этом не знает.
+    #[test]
+    fn loading_a_final_checkpoint_restores_the_worker_budget() {
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let prepared = PreparedData {
+            origin: DatasetOrigin::Blackbox("sum".to_string()),
+            data: Arc::new(blackbox::sum().generate(64, 0)),
+            schema: schema.clone(),
+        };
+        let fp = DatasetFingerprint::of(&prepared.data, &prepared.schema).unwrap();
+        let config = NumericConfig {
+            kind: ModelKind::Mlp,
+            transformer: ModelConfig::default(),
+            value: ValueEncoderConfig::default(),
+            mlp_width: 4,
+            mlp_layers: 1,
+            kan: KanConfig::default(),
+        };
+        let train = TrainConfig {
+            epochs: 1,
+            batch_size: 16,
+            ..Default::default()
+        };
+        let first = stamp(
+            fp,
+            SplitPlan::default(),
+            config.clone(),
+            train.clone(),
+            None,
+        );
+        let mut other = config;
+        other.mlp_width = 8;
+        let second = stamp(fp, SplitPlan::default(), other, train, None);
+
+        // Готовим checkpoint финальной модели в отдельном worker-е.
+        let path = std::env::temp_dir().join(format!(
+            "transformer_budget_restore_{}.bin",
+            std::process::id()
+        ));
+        let path = path.to_str().unwrap().to_string();
+        {
+            let (tx, _rx) = mpsc::channel();
+            let ctx = egui::Context::default();
+            let never = AtomicBool::new(false);
+            let checked = train_numeric(
+                &prepared,
+                &first,
+                RunKind::Check,
+                &Selection::Manual,
+                None,
+                EvalSchedule::Never,
+                &tx,
+                &ctx,
+                &never,
+            )
+            .unwrap();
+            let record = checked.check_record.expect("запись о проверке");
+            let finalized = train_numeric(
+                &prepared,
+                &first,
+                RunKind::Finalize,
+                &Selection::Manual,
+                Some(&record),
+                EvalSchedule::Never,
+                &tx,
+                &ctx,
+                &never,
+            )
+            .unwrap();
+            save_model(&finalized.loaded.expect("финальная модель"), &path).unwrap();
+        }
+
+        // Новый worker: он ничего не знает о прошлой сессии, кроме файла.
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let ctx = egui::Context::default();
+            let cancel = Arc::clone(&cancel);
+            std::thread::spawn(move || worker_loop(cmd_rx, evt_tx, ctx, cancel))
+        };
+        cmd_tx.send(Command::LoadModel(path.clone())).unwrap();
+        assert!(matches!(next_meaningful(&evt_rx), Event::ModelReady { .. }));
+
+        // Проверка другого кандидата на validation по-прежнему разрешена.
+        cmd_tx
+            .send(Command::CheckCandidate {
+                selection: Selection::Manual,
+                data: prepared.clone(),
+                stamp: Box::new(second.clone()),
+                eval: EvalSchedule::Never,
+            })
+            .unwrap();
+        assert!(matches!(next_meaningful(&evt_rx), Event::TrainDone { .. }));
+
+        // А вот второй замер на test — нет.
+        cmd_tx
+            .send(Command::FinalizeCandidate {
+                data: prepared,
+                stamp: Box::new(second),
+            })
+            .unwrap();
+        match next_meaningful(&evt_rx) {
+            Event::Error(msg) => assert!(msg.contains("уже открыт"), "{msg}"),
+            other => panic!("ожидался отказ: {}", describe(&other)),
+        }
+
+        cmd_tx.send(Command::Shutdown).unwrap();
+        handle.join().unwrap();
+        std::fs::remove_file(&path).ok();
+    }
+
     /// Отпечаток сверяется заново там, где тратится test: команда, пришедшая
     /// с чужими данными, не должна ни учиться, ни списывать бюджет.
     #[test]
@@ -1724,7 +1848,6 @@ mod tests {
         // Без проверки финализировать нельзя.
         cmd_tx
             .send(Command::FinalizeCandidate {
-                selection: Selection::Manual,
                 data: prepared.clone(),
                 stamp: Box::new(first.clone()),
             })
@@ -1760,7 +1883,6 @@ mod tests {
         );
         cmd_tx
             .send(Command::FinalizeCandidate {
-                selection: Selection::Manual,
                 data: prepared.clone(),
                 stamp: Box::new(first),
             })
@@ -1796,7 +1918,6 @@ mod tests {
         );
         cmd_tx
             .send(Command::FinalizeCandidate {
-                selection: Selection::Manual,
                 data: prepared,
                 stamp: Box::new(second),
             })

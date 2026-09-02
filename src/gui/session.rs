@@ -55,6 +55,17 @@ impl Section {
     }
 }
 
+/// Чем был получен набор строк поиска.
+///
+/// Принадлежит строкам, а не форме: цель ранжирования можно честно поменять
+/// потом — все метрики уже посчитаны, — а вот seeds и разбиение относятся к
+/// самому прогону и задним числом не меняются.
+pub(super) struct SearchRun {
+    pub(super) revision: u64,
+    pub(super) split: SplitPlan,
+    pub(super) seeds: Vec<u64>,
+}
+
 /// Средняя кривая по folds.
 ///
 /// Точка берётся только там, где замер есть у КАЖДОГО fold: иначе «среднее»
@@ -268,7 +279,10 @@ pub(crate) struct App {
     /// Данные и разбиение, на которых получен результат поиска. После смены
     /// данных запускать по нему финальное обучение нельзя: строки описывают
     /// уже другой набор.
-    pub(super) search_stamp: Option<(u64, SplitPlan)>,
+    /// Чем был получен текущий набор строк поиска. Seeds здесь заморожены:
+    /// восстанавливать их из формы значило бы подписать выбор тем, чем его не
+    /// делали.
+    pub(super) search_run: Option<SearchRun>,
     /// Что проверено и не потрачен ли test на этих данных.
     pub(super) lifecycle: Lifecycle,
     /// Отчёты конвейера интерпретации по фазам.
@@ -335,7 +349,7 @@ impl App {
             search_rows: Vec::new(),
             search_total: None,
             search_cancelled: false,
-            search_stamp: None,
+            search_run: None,
             lifecycle: Lifecycle::default(),
             interpret_enabled: false,
             interpret_overrides: InterpretOverrides::default(),
@@ -872,7 +886,7 @@ impl App {
         self.lifecycle.on_dataset_changed();
         self.search_rows.clear();
         self.search_total = None;
-        self.search_stamp = None;
+        self.search_run = None;
         self.search_selected = None;
     }
 
@@ -885,11 +899,6 @@ impl App {
     pub(super) fn sort_search_rows(&mut self) {
         let objective = self.search_form.objective();
         sweep::sort_rows(&mut self.search_rows, objective);
-    }
-
-    /// Ревизия активного набора данных.
-    pub(super) fn dataset_revision(&self) -> Option<u64> {
-        self.dataset.as_ref().map(|active| active.revision)
     }
 
     /// Отпечаток активного набора данных.
@@ -906,7 +915,10 @@ impl App {
 
     /// Результат поиска годен, только если данные и разбиение не менялись.
     pub(super) fn search_matches_dataset(&self) -> bool {
-        self.search_stamp.is_some() && self.search_stamp == self.dataset_stamp()
+        match (&self.search_run, self.dataset_stamp()) {
+            (Some(run), Some((revision, split))) => run.revision == revision && run.split == split,
+            _ => false,
+        }
     }
 
     pub(super) fn open_table(&mut self, path: String, has_header: bool) {

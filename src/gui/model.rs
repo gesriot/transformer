@@ -11,6 +11,53 @@ use crate::schema::ModelSchema;
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
+/// Метрики из происхождения загруженной модели: сеанс о ней ничего не знает,
+/// но сам checkpoint знает всё.
+fn report_metrics(ui: &mut egui::Ui, report: &TrainingReport, info: &ModelInfo) {
+    if let Some(check) = &report.check {
+        show_metrics(
+            ui,
+            &check.source.label(),
+            &check.metrics,
+            Some(&check.per_output),
+            info.schema.outputs(),
+        );
+        ui.label(format!(
+            "Протокол: {}; init seed проверки {}",
+            split_plan_label(report.stamp.split),
+            report.stamp.candidate.train.seed
+        ));
+        if check.r2_std_folds > 0.0 {
+            ui.label(format!(
+                "Разброс R² между folds: ±{:.5}",
+                check.r2_std_folds
+            ));
+        }
+    }
+    match &report.final_run {
+        Some(final_run) => {
+            show_metrics(
+                ui,
+                &format!(
+                    "test ({} строк, единственный замер)",
+                    final_run.eval.origin.test_rows
+                ),
+                &final_run.eval.metrics,
+                Some(&final_run.eval.per_output),
+                info.schema.outputs(),
+            );
+            ui.label(format!(
+                "Протокол: {}; final init seed {}",
+                split_plan_label(final_run.eval.origin.plan),
+                final_run.eval.origin.final_init_seed
+            ));
+        }
+        None => {
+            ui.label("Test по этой модели не открывался: в её происхождении замера нет.");
+        }
+    }
+}
+
 /// Активная модель глазами UI. Схема — источник истины про число входов и
 /// выходов и про их имена, поэтому отдельных счётчиков рядом нет.
 #[derive(Clone)]
@@ -119,7 +166,11 @@ impl App {
                 split_plan_label(stamp.split)
             ));
         }
-        if !info.origin.is_final() {
+        // Загруженная модель тоже бывает финальной — об этом говорит её
+        // происхождение, а не то, что она пришла из файла.
+        let is_final =
+            info.origin.is_final() || info.report.as_ref().is_some_and(|r| r.test_disclosed());
+        if !is_final {
             ui.colored_label(
                 egui::Color32::from_rgb(200, 120, 0),
                 "Доступные данные использованы не полностью: validation осталась вне обучения. \
@@ -147,6 +198,9 @@ impl App {
         };
         let checked = stamp.and_then(|stamp| self.lifecycle.checked_for(stamp));
         let disclosed = stamp.and_then(|stamp| self.lifecycle.disclosure_for(stamp));
+        // У загруженной модели оценок в сессии нет, зато они есть в её
+        // происхождении: раньше здесь стояло «checkpoint их не хранит».
+        let from_report = info.report.as_ref().filter(|_| checked.is_none());
         if let Some(run) = checked {
             let source = match run.stamp.eval_source() {
                 EvalSource::Cv { k } => format!("cv-{k}"),
@@ -189,13 +243,12 @@ impl App {
                 split_plan_label(final_eval.origin.plan),
                 final_eval.origin.final_init_seed
             ));
+        } else if let Some(report) = from_report {
+            report_metrics(ui, report, info);
         } else if checked.is_some() {
             ui.label("Test отложен: его открывает только финальное обучение.");
         } else {
-            ui.label(
-                "Оценок этой модели в сессии нет: checkpoint их не хранит, а проверка \
-                 относилась к другому кандидату.",
-            );
+            ui.label("Оценок этой модели нет: их не сохранил ни сеанс, ни checkpoint.");
         }
         // Отчёт конвейера приходит вместе с моделью, поэтому описывает именно
         // её: подменить его отчётом следующей проверки уже нечем.

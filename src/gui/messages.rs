@@ -7,7 +7,7 @@ use crate::config::ModelConfig;
 use crate::data::{NumericDataset, OutOfRange};
 use crate::diagnostics::SensitivityReport;
 use crate::interpret::InterpretReport;
-use crate::lifecycle::RunStamp;
+use crate::lifecycle::RunIdentity;
 use crate::markup::TableProfile;
 use crate::metrics::{EvalSource, Metrics};
 use crate::numeric_model::ModelKind;
@@ -137,9 +137,9 @@ pub(crate) struct CurvePoint {
 pub(crate) enum ModelOrigin {
     /// Проверка кандидата: обучена на train, доступные данные использованы не
     /// полностью.
-    Development(Box<RunStamp>),
+    Development(Box<RunIdentity>),
     /// Финальная: train + validation, test открыт ровно один раз.
-    Final(Box<RunStamp>),
+    Final(Box<RunIdentity>),
     /// Загружена из checkpoint: происхождение известно только из файла.
     Checkpoint,
 }
@@ -171,7 +171,7 @@ pub(crate) enum Command {
     /// CV-оценку, а не модель одного произвольного fold.
     CheckCandidate {
         data: PreparedData,
-        stamp: Box<RunStamp>,
+        stamp: Box<RunIdentity>,
         /// Когда снимать метрики по ходу обучения. Настройка наблюдения, не
         /// личность кандидата: без ранней остановки она не меняет модель.
         eval: EvalSchedule,
@@ -183,10 +183,11 @@ pub(crate) enum Command {
     ///
     /// Отпечаток приходит из проверки как есть, а не собирается заново по
     /// форме: иначе «зафиксировать» могло бы обучить не то, что проверяли.
+    /// Способа выбора здесь нет: он принадлежит проверке, которая разрешила
+    /// финализацию, и меняться между шагами не должен.
     FinalizeCandidate {
         data: PreparedData,
-        stamp: Box<RunStamp>,
-        selection: Selection,
+        stamp: Box<RunIdentity>,
     },
     LoadModel(String),
     SaveModel(String),
@@ -266,7 +267,7 @@ pub(crate) enum Event {
         /// Отпечаток запуска, к которому относится результат. Форма могла
         /// измениться, пока шло обучение, — тогда ответ относится не к ней.
         /// В боксе: иначе конфигурация кандидата раздувает всё перечисление.
-        stamp: Box<RunStamp>,
+        stamp: Box<RunIdentity>,
         metrics: Option<Metrics>,
         /// Отчёты конвейера ПРОВЕРКИ — по одному на fold. У финализации их
         /// нет: её отчёт принадлежит модели и едет вместе с ней.

@@ -2,11 +2,11 @@
 
 use super::messages::{Command, ModelOrigin, PreparedData};
 use super::model::ModelInfo;
-use super::session::{App, NO_DATASET};
+use super::session::{App, SearchRun, NO_DATASET};
 use crate::config::ModelConfig;
 use crate::encoders::{ValueEncoderConfig, ValueEncoderKind};
 use crate::interpret::{self, InterpretOverrides, InterpretProfile};
-use crate::lifecycle::{CandidateSpec, RunStamp};
+use crate::lifecycle::{CandidateSpec, RunIdentity};
 use crate::metrics::EvalSource;
 use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
 use crate::report::Selection;
@@ -806,7 +806,11 @@ impl App {
                         self.worker.reset_cancel();
                         // Отпечаток фиксируется в момент отправки команды, а не
                         // когда worker успеет ответить SearchStarted.
-                        self.search_stamp = self.dataset_stamp();
+                        self.search_run = self.dataset_stamp().map(|(revision, split)| SearchRun {
+                            revision,
+                            split,
+                            seeds: axes.seeds.clone(),
+                        });
                         self.searching = true;
                         self.search_selected = None;
                         self.search_rows.clear();
@@ -1012,22 +1016,14 @@ impl App {
                 match row {
                     Some(row) => Selection::Search {
                         objective,
-                        // Seeds берутся из осей того режима, которым искали:
-                        // «поиск по одному seed» и «по трём» — разные
-                        // основания для выбора.
-                        seeds: match self.mode {
-                            TrainingMode::Auto(budget) => self
-                                .search_form
-                                .axes(budget)
-                                .map(|axes| axes.seeds)
-                                .unwrap_or_default(),
-                            _ => self
-                                .search_form
-                                .model_kinds()
-                                .and_then(|kinds| self.custom_form.build(kinds))
-                                .map(|axes| axes.seeds)
-                                .unwrap_or_default(),
-                        },
+                        // Seeds заморожены в момент поиска: в форме их могли
+                        // поменять после, и тогда отчёт описывал бы прогон,
+                        // которого не было.
+                        seeds: self
+                            .search_run
+                            .as_ref()
+                            .map(|run| run.seeds.clone())
+                            .unwrap_or_default(),
                         objective_value: sweep::row_score(objective, row),
                         label: row.label.clone(),
                     },
@@ -1070,19 +1066,15 @@ impl App {
     }
 
     /// Активные данные и отпечаток текущего кандидата.
-    pub(super) fn current_stamp(&self) -> Result<(PreparedData, RunStamp), String> {
+    pub(super) fn current_stamp(&self) -> Result<(PreparedData, RunIdentity), String> {
         let (data, split) = self.active_data()?;
-        let dataset_revision = self
-            .dataset_revision()
-            .ok_or_else(|| NO_DATASET.to_string())?;
         let dataset = self
             .dataset_fingerprint()
             .ok_or_else(|| NO_DATASET.to_string())?;
         Ok((
             data,
-            RunStamp {
+            RunIdentity {
                 dataset,
-                dataset_revision,
                 split,
                 candidate: self.current_candidate()?,
                 // Финальный seed задан заранее: подбирать его по результату
@@ -1095,7 +1087,7 @@ impl App {
     /// Расписание замеров — настройка запуска, а не личность кандидата: без
     /// ранней остановки оно не меняет модель, только частоту наблюдений.
     /// Поэтому оно едет в команде, а не в отпечатке.
-    fn send_check(&mut self, data: PreparedData, stamp: RunStamp) {
+    fn send_check(&mut self, data: PreparedData, stamp: RunIdentity) {
         // После поиска число эпох уже выбрано, и отдельная кривая по эпохам
         // означала бы CV-ломаную по одному fold.
         let eval = match self.mode {
@@ -1115,14 +1107,12 @@ impl App {
 
     /// Зафиксировать проверенного кандидата. Отпечаток берётся из проверки как
     /// есть: пересобранный по форме мог бы отличаться от проверенного.
-    fn send_finalize(&mut self, data: PreparedData, stamp: RunStamp) {
+    fn send_finalize(&mut self, data: PreparedData, stamp: RunIdentity) {
         self.train_parameter_count = None;
         self.worker.reset_cancel();
-        let selection = self.current_selection();
         self.worker.send(Command::FinalizeCandidate {
             data,
             stamp: Box::new(stamp),
-            selection,
         });
     }
 

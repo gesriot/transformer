@@ -18,7 +18,7 @@ use crate::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
 use crate::fingerprint::DatasetFingerprint;
 use crate::interpret::{InterpretProfile, InterpretReport, INTERPRET_PROFILE_VERSION};
 use crate::kan::CompactReport;
-use crate::lifecycle::{CandidateSpec, RunStamp};
+use crate::lifecycle::{CandidateSpec, RunIdentity};
 use crate::metrics::{EvalSource, Metrics};
 use crate::numeric_model::{KanConfig, ModelKind, NumericConfig, NumericModel};
 use crate::report::{CheckRecord, FinalRecord, Selection, TrainingReport, TRAINING_REPORT_VERSION};
@@ -226,6 +226,17 @@ fn field_f32(map: &HashMap<u16, Vec<u8>>, tag: u16) -> Option<f32> {
 
 // --- секции ---
 
+/// Заявленная длина против остатка файла — до выделения памяти.
+fn checked_len(len: u64, end: u64, at: u64, what: &str) -> io::Result<usize> {
+    let left = end.saturating_sub(at);
+    if len > left {
+        return Err(invalid(format!(
+            "{what}: заявлено {len} байт, а в файле осталось {left}"
+        )));
+    }
+    usize::try_from(len).map_err(|_| invalid(format!("{what}: длина не помещается в usize")))
+}
+
 fn w_section<W: Write>(w: &mut W, name: &str, payload: &[u8]) -> io::Result<()> {
     let nb = name.as_bytes();
     w_u64(w, nb.len() as u64)?;
@@ -233,18 +244,31 @@ fn w_section<W: Write>(w: &mut W, name: &str, payload: &[u8]) -> io::Result<()> 
     w_u64(w, payload.len() as u64)?;
     w.write_all(payload)
 }
+/// Читает секции файла.
+///
+/// Каждая заявленная длина сверяется с тем, сколько РЕАЛЬНО осталось в файле, и
+/// только после этого выделяется память: битый или враждебный файл не должен
+/// заставлять программу запрашивать гигабайты по числу из своего заголовка.
 fn read_sections<R: Read + Seek>(
     r: &mut R,
     known: &[&str],
 ) -> io::Result<HashMap<String, Vec<u8>>> {
+    let at = r.stream_position()?;
+    let end = r.seek(SeekFrom::End(0))?;
+    r.seek(SeekFrom::Start(at))?;
     let count = r_u64(r)?;
     let mut map = HashMap::new();
     for _ in 0..count {
-        let nlen = r_u64(r)? as usize;
+        let nlen = checked_len(r_u64(r)?, end, r.stream_position()?, "имя секции")?;
         let mut nb = vec![0u8; nlen];
         r.read_exact(&mut nb)?;
         let name = String::from_utf8(nb).map_err(|_| invalid("имя секции не UTF-8"))?;
-        let plen = r_u64(r)? as usize;
+        let plen = checked_len(
+            r_u64(r)?,
+            end,
+            r.stream_position()?,
+            &format!("секция {name}"),
+        )?;
         if known.contains(&name.as_str()) {
             let mut payload = vec![0u8; plen];
             r.read_exact(&mut payload)?;
@@ -252,7 +276,9 @@ fn read_sections<R: Read + Seek>(
         } else {
             // Неизвестная секция (из будущей версии) — пропускаем по payload_len,
             // не загружая её в память.
-            r.seek(SeekFrom::Current(plen as i64))?;
+            r.seek(SeekFrom::Current(i64::try_from(plen).map_err(|_| {
+                invalid("длина секции не помещается в смещение")
+            })?))?;
         }
     }
     Ok(map)
@@ -840,6 +866,11 @@ pub fn save_numeric(
         sections.push(("interpret", build_interpret(profile)));
     }
     if let Some(report) = report {
+        // Отчёт, противоречащий модели, рядом с которой лежит, хуже
+        // отсутствующего: он выглядит как достоверное происхождение.
+        report
+            .validate_against(nc, schema, interpret)
+            .map_err(|e| invalid(format!("training_report: {e}")))?;
         sections.push(("training_report", build_report(report)));
     }
     if let Some(masks) = model.kan_masks() {
@@ -972,6 +1003,12 @@ pub fn load_numeric_full(path: &str) -> io::Result<NumericCheckpoint> {
         Some(bytes) => read_report(bytes)?,
         None => None,
     };
+    // Та же проверка на чтении: файл мог быть собран другой версией или руками.
+    if let Some(report) = &report {
+        report
+            .validate_against(&nc, &schema, interpret.as_ref())
+            .map_err(|e| invalid(format!("training_report: {e}")))?;
+    }
     Ok(NumericCheckpoint {
         model,
         in_norm,
@@ -1009,11 +1046,12 @@ fn read_report(bytes: &[u8]) -> io::Result<Option<TrainingReport>> {
     }
     let mut fingerprint = [0u8; 32];
     r.read_exact(&mut fingerprint)?;
+    let dataset = DatasetFingerprint::from_bytes(fingerprint);
     let schema = read_schema(&r_blob(&mut r, "training_report: схема")?)?;
-    let mut stamp = read_stamp(&r_blob(&mut r, "training_report: отпечаток запуска")?)?;
-    // Отпечаток данных хранится один раз — в самом отчёте. Здесь он
-    // восстанавливается в stamp, чтобы дальше эти два поля не расходились.
-    stamp.dataset = DatasetFingerprint::from_bytes(fingerprint);
+    let stamp = read_stamp(
+        &r_blob(&mut r, "training_report: личность запуска")?,
+        dataset,
+    )?;
     let selection = read_selection(&mut r)?;
     let check = r_opt_blob(&mut r, "training_report: проверка")?
         .map(|bytes| read_check(&bytes))
@@ -1025,7 +1063,7 @@ fn read_report(bytes: &[u8]) -> io::Result<Option<TrainingReport>> {
         return Err(invalid("training_report: лишние байты"));
     }
     Ok(Some(TrainingReport {
-        dataset: DatasetFingerprint::from_bytes(fingerprint),
+        dataset,
         schema,
         stamp,
         selection,
@@ -1097,9 +1135,8 @@ fn r_count(r: &mut &[u8], min_item: usize, what: &str) -> io::Result<usize> {
     Ok(n)
 }
 
-fn build_stamp(stamp: &RunStamp) -> Vec<u8> {
+fn build_stamp(stamp: &RunIdentity) -> Vec<u8> {
     let mut p = Vec::new();
-    p.extend_from_slice(&stamp.dataset_revision.to_le_bytes());
     p.extend_from_slice(&stamp.final_init_seed.to_le_bytes());
     build_split(&mut p, stamp.split);
     w_blob(&mut p, &build_numeric_config(&stamp.candidate.config));
@@ -1111,9 +1148,10 @@ fn build_stamp(stamp: &RunStamp) -> Vec<u8> {
     p
 }
 
-fn read_stamp(bytes: &[u8]) -> io::Result<RunStamp> {
+/// Отпечаток данных приходит от родительского отчёта: он там уже есть, и
+/// вторая копия рано или поздно разошлась бы с первой.
+fn read_stamp(bytes: &[u8], dataset: DatasetFingerprint) -> io::Result<RunIdentity> {
     let mut r = bytes;
-    let dataset_revision = r_u64(&mut r)?;
     let final_init_seed = r_u64(&mut r)?;
     let split = read_split(&mut r)?;
     let config = read_numeric_config(&r_blob(&mut r, "stamp: конфигурация")?)?;
@@ -1124,11 +1162,8 @@ fn read_stamp(bytes: &[u8]) -> io::Result<RunStamp> {
     if !r.is_empty() {
         return Err(invalid("stamp: лишние байты"));
     }
-    Ok(RunStamp {
-        // Отпечаток данных лежит в самом отчёте: две копии одного числа рано
-        // или поздно разойдутся.
-        dataset: DatasetFingerprint::from_bytes([0; 32]),
-        dataset_revision,
+    Ok(RunIdentity {
+        dataset,
         split,
         candidate: CandidateSpec {
             config,
@@ -1808,7 +1843,10 @@ mod tests {
         }
     }
 
-    fn sample_report(schema: &ModelSchema) -> TrainingReport {
+    /// Отчёт, согласованный с checkpoint: та же конфигурация, схема и профиль,
+    /// число историй и отчётов конвейера равно числу folds. Несогласованный
+    /// отчёт запись отвергает — на то и проверка.
+    fn sample_report(nc: &NumericConfig, schema: &ModelSchema) -> TrainingReport {
         let metrics = Metrics {
             rmse: 1.0,
             mae: 0.5,
@@ -1816,20 +1854,37 @@ mod tests {
             r2: 0.9,
         };
         let split = SplitPlan::KFold {
-            k: 3,
+            k: 2,
             folds_seed: 7,
             test_frac: 0.2,
             test_seed: 9,
         };
+        let profile = InterpretProfile::v1();
+        let fold_report = || InterpretReport {
+            profile,
+            per_layer: vec![(3, 8), (2, 4)],
+            active_edges: (5, 12),
+            r2_before: Some(0.8),
+            r2_after_prune: Some(0.7),
+            r2_after_finetune: Some(0.85),
+            compaction: Some(CompactReport {
+                nodes_before: 16,
+                nodes_after: 9,
+                params_before: 400,
+                params_after: 220,
+            }),
+            r2_after_compact: None,
+            cancelled: false,
+        };
+        let dataset = DatasetFingerprint::from_bytes([7; 32]);
         TrainingReport {
-            dataset: DatasetFingerprint::from_bytes([7; 32]),
+            dataset,
             schema: schema.clone(),
-            stamp: RunStamp {
-                dataset: DatasetFingerprint::from_bytes([0; 32]),
-                dataset_revision: 4,
+            stamp: RunIdentity {
+                dataset,
                 split,
                 candidate: CandidateSpec {
-                    config: numeric_cfg(ModelKind::Kan),
+                    config: nc.clone(),
                     train: TrainConfig {
                         epochs: 7,
                         batch_size: 16,
@@ -1840,7 +1895,7 @@ mod tests {
                             min_lr_ratio: 0.01,
                         },
                     },
-                    interpret: Some(InterpretProfile::v1()),
+                    interpret: Some(profile),
                 },
                 final_init_seed: 5,
             },
@@ -1848,36 +1903,21 @@ mod tests {
                 objective: SearchObjective::Nrmse,
                 seeds: vec![0, 1, 2],
                 objective_value: -0.25,
-                label: "kan width=16 L=2".to_string(),
+                label: "mlp width=4".to_string(),
             },
             check: Some(CheckRecord {
-                source: EvalSource::Cv { k: 3 },
+                source: EvalSource::Cv { k: 2 },
                 metrics: metrics.clone(),
                 per_output: vec![metrics.clone()],
                 r2_std_folds: 0.02,
                 histories: vec![
-                    sample_history(EvalSource::Cv { k: 3 }),
-                    sample_history(EvalSource::Cv { k: 3 }),
+                    sample_history(EvalSource::Cv { k: 2 }),
+                    sample_history(EvalSource::Cv { k: 2 }),
                 ],
-                interpret: vec![InterpretReport {
-                    profile: InterpretProfile::v1(),
-                    per_layer: vec![(3, 8), (2, 4)],
-                    active_edges: (5, 12),
-                    r2_before: Some(0.8),
-                    r2_after_prune: Some(0.7),
-                    r2_after_finetune: Some(0.85),
-                    compaction: Some(CompactReport {
-                        nodes_before: 16,
-                        nodes_after: 9,
-                        params_before: 400,
-                        params_after: 220,
-                    }),
-                    r2_after_compact: None,
-                    cancelled: false,
-                }],
+                interpret: vec![fold_report(), fold_report()],
             }),
             final_run: Some(FinalRecord {
-                history: sample_history(EvalSource::Validation),
+                history: sample_history(EvalSource::Cv { k: 2 }),
                 eval: FinalEval {
                     metrics,
                     per_output: vec![Metrics {
@@ -1892,7 +1932,7 @@ mod tests {
                         plan: split,
                     },
                 },
-                interpret: None,
+                interpret: Some(fold_report()),
             }),
         }
     }
@@ -1901,14 +1941,17 @@ mod tests {
     /// полностью, без прореживания, и `val` остаётся только там, где замер был.
     #[test]
     fn training_report_survives_a_round_trip() {
-        let nc = numeric_cfg(ModelKind::Mlp);
+        // KAN: профиль интерпретации хранится только у неё, а отчёт обязан
+        // описывать именно тот профиль, что записан в checkpoint.
+        let nc = numeric_cfg(ModelKind::Kan);
         let specs = vec![FeatureSpec::Continuous, FeatureSpec::Continuous];
         let schema = ModelSchema::synthetic_from_specs(&specs, 1).unwrap();
         let model = nc.build(&specs, 1);
         let data = blackbox::sum().generate(8, 0);
         let in_norm = Normalizer::fit(&data.inputs, &specs);
         let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
-        let report = sample_report(&schema);
+        let profile = InterpretProfile::v1();
+        let report = sample_report(&nc, &schema);
 
         let path = tmp_path("training_report.bin");
         save_numeric(
@@ -1919,7 +1962,7 @@ mod tests {
             &in_norm,
             &out_norm,
             None,
-            None,
+            Some(&profile),
             Some(&report),
         )
         .unwrap();
@@ -1938,13 +1981,17 @@ mod tests {
 
         assert!(loaded.test_disclosed());
         let check = loaded.check.expect("запись о проверке");
-        assert_eq!(check.source, EvalSource::Cv { k: 3 });
-        assert_eq!(check.histories.len(), 2);
+        assert_eq!(check.source, EvalSource::Cv { k: 2 });
+        assert_eq!(check.histories.len(), 2, "по истории на каждый fold");
         assert_eq!(check.histories[0].points.len(), 2);
         assert!(check.histories[0].points[0].val.is_none());
         assert_eq!(check.histories[0].points[1].val.as_ref().unwrap().r2, 0.9);
         assert!(check.histories[0].stopped_early);
-        assert_eq!(check.interpret.len(), 1);
+        assert_eq!(
+            check.interpret.len(),
+            2,
+            "по отчёту конвейера на каждый fold"
+        );
         assert_eq!(check.interpret[0].per_layer, vec![(3, 8), (2, 4)]);
         assert_eq!(check.interpret[0].compaction.unwrap().params_after, 220);
         assert!(check.interpret[0].r2_after_compact.is_none());
@@ -1952,8 +1999,85 @@ mod tests {
         let final_run = loaded.final_run.expect("запись о финале");
         assert_eq!(final_run.eval.origin.test_rows, 18);
         assert_eq!(final_run.eval.origin.plan, report.stamp.split);
-        assert!(final_run.interpret.is_none());
+        assert!(final_run.interpret.is_some(), "отчёт сохраняемой модели");
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Противоречивый отчёт не записывается: рядом с моделью он выглядел бы
+    /// достоверным происхождением, хотя описывает что-то другое.
+    #[test]
+    fn a_report_that_contradicts_the_checkpoint_is_refused() {
+        let nc = numeric_cfg(ModelKind::Kan);
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let profile = InterpretProfile::v1();
+        let good = sample_report(&nc, &schema);
+        assert!(good.validate_against(&nc, &schema, Some(&profile)).is_ok());
+
+        // Данные отчёта и его личности запуска разошлись.
+        let mut wrong_dataset = good.clone();
+        wrong_dataset.dataset = DatasetFingerprint::from_bytes([1; 32]);
+        assert!(wrong_dataset
+            .validate_against(&nc, &schema, Some(&profile))
+            .unwrap_err()
+            .contains("разные данные"));
+
+        // Модель в checkpoint не та, что описана кандидатом.
+        let other_model = numeric_cfg(ModelKind::Mlp);
+        assert!(good
+            .validate_against(&other_model, &schema, Some(&profile))
+            .unwrap_err()
+            .contains("конфигурация кандидата"));
+
+        // Историй меньше, чем folds.
+        let mut short_histories = good.clone();
+        short_histories
+            .check
+            .as_mut()
+            .unwrap()
+            .histories
+            .truncate(1);
+        assert!(short_histories
+            .validate_against(&nc, &schema, Some(&profile))
+            .unwrap_err()
+            .contains("историй проверки"));
+
+        // Источник оценки не соответствует разбиению.
+        let mut wrong_source = good.clone();
+        wrong_source.check.as_mut().unwrap().source = EvalSource::Validation;
+        assert!(wrong_source
+            .validate_against(&nc, &schema, Some(&profile))
+            .unwrap_err()
+            .contains("подписана как"));
+
+        // Финальный замер без проверки.
+        let mut orphan_final = good.clone();
+        orphan_final.check = None;
+        assert!(orphan_final
+            .validate_against(&nc, &schema, Some(&profile))
+            .unwrap_err()
+            .contains("без проверки"));
+
+        // Прерванный конвейер сохранять нельзя.
+        let mut cancelled = good.clone();
+        cancelled.check.as_mut().unwrap().interpret[0].cancelled = true;
+        assert!(cancelled
+            .validate_against(&nc, &schema, Some(&profile))
+            .unwrap_err()
+            .contains("прерванный конвейер"));
+
+        // Seed финального замера разошёлся с личностью запуска.
+        let mut wrong_seed = good;
+        wrong_seed
+            .final_run
+            .as_mut()
+            .unwrap()
+            .eval
+            .origin
+            .final_init_seed = 42;
+        assert!(wrong_seed
+            .validate_against(&nc, &schema, Some(&profile))
+            .unwrap_err()
+            .contains("final seed"));
     }
 
     /// Секция необязательна: checkpoint без неё читается как раньше и даёт
@@ -1982,7 +2106,7 @@ mod tests {
     #[test]
     fn an_unknown_report_version_is_ignored() {
         let schema = ModelSchema::synthetic(2, 1).unwrap();
-        let mut bytes = build_report(&sample_report(&schema));
+        let mut bytes = build_report(&sample_report(&numeric_cfg(ModelKind::Mlp), &schema));
         bytes[..4].copy_from_slice(&(TRAINING_REPORT_VERSION + 1).to_le_bytes());
         assert!(read_report(&bytes).unwrap().is_none());
     }
@@ -1992,7 +2116,7 @@ mod tests {
     #[test]
     fn a_truncated_report_is_rejected() {
         let schema = ModelSchema::synthetic(2, 1).unwrap();
-        let bytes = build_report(&sample_report(&schema));
+        let bytes = build_report(&sample_report(&numeric_cfg(ModelKind::Mlp), &schema));
         for cut in [8, bytes.len() / 3, bytes.len() / 2, bytes.len() - 1] {
             assert!(
                 read_report(&bytes[..cut]).is_err(),

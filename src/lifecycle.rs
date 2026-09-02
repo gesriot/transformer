@@ -32,24 +32,24 @@ use crate::train::TrainConfig;
 pub struct CandidateSpec {
     pub config: NumericConfig,
     /// Параметры обучения проверки. `train.seed` — seed инициализации ИМЕННО
-    /// проверки; финальный переобучается со своим, см. [`RunStamp`].
+    /// проверки; финальный переобучается со своим, см. [`RunIdentity`].
     pub train: TrainConfig,
     pub interpret: Option<InterpretProfile>,
 }
 
-/// Отпечаток запуска: на каких данных, с каким разбиением и какого кандидата.
+/// Личность запуска: на каких данных, с каким разбиением и какого кандидата.
 ///
 /// Разбиение входит сюда наравне с кандидатом: те же гиперпараметры при другом
 /// split — другой результат, и выдавать один за другой нельзя.
+///
+/// Номера сессии здесь нет намеренно: он транспортный, живёт в интерфейсе и в
+/// checkpoint попадать не должен — иначе CLI пришлось бы выдумывать ревизию,
+/// которой у него нет.
 #[derive(Clone, Debug, PartialEq)]
-pub struct RunStamp {
-    /// Что за данные. Именно по нему считается «те же данные»: ревизия — лишь
-    /// номер внутри сессии, а отпечаток переживает и повторное открытие файла,
-    /// и перезапуск приложения.
+pub struct RunIdentity {
+    /// Что за данные. Именно по нему считается «те же данные»: отпечаток
+    /// переживает и повторное открытие файла, и перезапуск приложения.
     pub dataset: DatasetFingerprint,
-    /// Номер набора в текущей сессии. Нужен интерфейсу, чтобы отличать
-    /// устаревшие ответы worker-а, но идентичностью данных не является.
-    pub dataset_revision: u64,
     pub split: SplitPlan,
     pub candidate: CandidateSpec,
     /// Seed инициализации финального переобучения. Отличается от seed
@@ -58,7 +58,7 @@ pub struct RunStamp {
     pub final_init_seed: u64,
 }
 
-impl RunStamp {
+impl RunIdentity {
     /// Чем является development-метрика этого запуска. Источник выводится из
     /// разбиения, а не хранится вторым полем, которое могло бы с ним разойтись.
     pub fn eval_source(&self) -> EvalSource {
@@ -87,7 +87,7 @@ pub struct CheckEval {
 /// Проверенный кандидат: отпечаток, оценка и отчёты конвейера.
 #[derive(Clone, Debug)]
 pub struct CheckedRun {
-    pub stamp: RunStamp,
+    pub stamp: RunIdentity,
     pub eval: CheckEval,
     /// Отчёт конвейера по каждому fold, по порядку; пусто, если конвейера не
     /// просили. Отчёт одного fold не описывает CV-проверку, поэтому их
@@ -106,7 +106,7 @@ impl CheckedRun {
 /// каким результатом.
 #[derive(Clone, Debug)]
 pub struct TestDisclosure {
-    pub stamp: RunStamp,
+    pub stamp: RunIdentity,
     pub eval: FinalEval,
 }
 
@@ -184,12 +184,12 @@ impl Lifecycle {
     }
 
     /// Проверка ровно этого отпечатка, если она есть.
-    pub fn checked_for(&self, stamp: &RunStamp) -> Option<&CheckedRun> {
+    pub fn checked_for(&self, stamp: &RunIdentity) -> Option<&CheckedRun> {
         self.checked.as_ref().filter(|run| run.stamp == *stamp)
     }
 
     /// Есть ли проверка, и относится ли она к текущему отпечатку.
-    pub fn check_is_stale(&self, stamp: &RunStamp) -> bool {
+    pub fn check_is_stale(&self, stamp: &RunIdentity) -> bool {
         matches!(&self.checked, Some(run) if run.stamp != *stamp)
     }
 
@@ -204,12 +204,12 @@ impl Lifecycle {
     }
 
     /// Результат финального обучения ровно этого кандидата.
-    pub fn disclosure_for(&self, stamp: &RunStamp) -> Option<&TestDisclosure> {
+    pub fn disclosure_for(&self, stamp: &RunIdentity) -> Option<&TestDisclosure> {
         self.disclosed.iter().find(|d| d.stamp == *stamp)
     }
 
     /// Можно ли открывать test под этот отпечаток.
-    pub fn can_finalize(&self, stamp: &RunStamp) -> Result<(), FinalizeRefusal> {
+    pub fn can_finalize(&self, stamp: &RunIdentity) -> Result<(), FinalizeRefusal> {
         // Сравниваются сами данные, а не номер набора в сессии: повторно
         // открыв тот же файл, потраченный test не вернуть.
         if let Some(disclosed) = self.disclosure_on(stamp.dataset) {
@@ -296,21 +296,20 @@ mod tests {
         DatasetFingerprint::of(&data, &schema).unwrap()
     }
 
-    fn stamp(revision: u64, candidate: CandidateSpec) -> RunStamp {
-        stamp_on(fingerprint(1.0), revision, candidate)
+    fn stamp(candidate: CandidateSpec) -> RunIdentity {
+        stamp_on(fingerprint(1.0), candidate)
     }
 
-    fn stamp_on(dataset: DatasetFingerprint, revision: u64, candidate: CandidateSpec) -> RunStamp {
-        RunStamp {
+    fn stamp_on(dataset: DatasetFingerprint, candidate: CandidateSpec) -> RunIdentity {
+        RunIdentity {
             dataset,
-            dataset_revision: revision,
             split: SplitPlan::default(),
             candidate,
             final_init_seed: 0,
         }
     }
 
-    fn checked(stamp: RunStamp) -> CheckedRun {
+    fn checked(stamp: RunIdentity) -> CheckedRun {
         CheckedRun {
             stamp,
             eval: CheckEval {
@@ -322,7 +321,7 @@ mod tests {
         }
     }
 
-    fn disclosure(stamp: RunStamp) -> TestDisclosure {
+    fn disclosure(stamp: RunIdentity) -> TestDisclosure {
         TestDisclosure {
             stamp,
             eval: FinalEval {
@@ -340,7 +339,7 @@ mod tests {
     #[test]
     fn finalize_requires_a_check_of_exactly_this_candidate() {
         let mut life = Lifecycle::default();
-        let current = stamp(1, candidate(16));
+        let current = stamp(candidate(16));
         assert_eq!(
             life.can_finalize(&current),
             Err(FinalizeRefusal::NotChecked)
@@ -358,7 +357,7 @@ mod tests {
 
     #[test]
     fn check_source_is_derived_from_the_split() {
-        let mut cv = stamp(1, candidate(16));
+        let mut cv = stamp(candidate(16));
         cv.split = SplitPlan::KFold {
             k: 4,
             folds_seed: 1,
@@ -371,12 +370,12 @@ mod tests {
 
     #[test]
     fn changing_the_candidate_split_or_profile_makes_the_check_stale() {
-        let base = stamp(1, candidate(16));
+        let base = stamp(candidate(16));
         let mut life = Lifecycle::default();
         life.record_check(checked(base.clone()));
 
         // Другая ширина модели.
-        let other_model = stamp(1, candidate(32));
+        let other_model = stamp(candidate(32));
         assert_eq!(life.can_finalize(&other_model), Err(FinalizeRefusal::Stale));
         assert!(life.check_is_stale(&other_model));
         assert!(life.checked_for(&other_model).is_none());
@@ -405,7 +404,7 @@ mod tests {
 
     #[test]
     fn test_stays_disclosed_for_the_whole_dataset() {
-        let first = stamp(1, candidate(16));
+        let first = stamp(candidate(16));
         let mut life = Lifecycle::default();
         life.record_check(checked(first.clone()));
         life.record_disclosure(disclosure(first.clone()));
@@ -418,7 +417,7 @@ mod tests {
         assert!(life.disclosure_for(&first).is_some());
 
         // Другой кандидат на тех же данных: test уже потрачен.
-        let second = stamp(1, candidate(32));
+        let second = stamp(candidate(32));
         life.record_check(checked(second.clone()));
         assert_eq!(
             life.can_finalize(&second),
@@ -433,7 +432,7 @@ mod tests {
     /// потраченный test: идентичность данных — это их отпечаток.
     #[test]
     fn reopening_the_same_data_does_not_return_the_spent_test() {
-        let first = stamp(1, candidate(16));
+        let first = stamp(candidate(16));
         let mut life = Lifecycle::default();
         life.record_check(checked(first.clone()));
         life.record_disclosure(disclosure(first.clone()));
@@ -445,7 +444,7 @@ mod tests {
         );
 
         // Тот же файл открыт заново: ревизия другая, данные те же.
-        let reopened = stamp(2, candidate(32));
+        let reopened = stamp(candidate(32));
         life.record_check(checked(reopened.clone()));
         assert_eq!(
             life.can_finalize(&reopened),
@@ -462,20 +461,20 @@ mod tests {
         let b = fingerprint(2.0);
         let mut life = Lifecycle::default();
 
-        let on_a = stamp_on(a, 1, candidate(16));
+        let on_a = stamp_on(a, candidate(16));
         life.record_check(checked(on_a.clone()));
         life.record_disclosure(disclosure(on_a.clone()));
 
         // Переходим к другому набору и тратим test и там.
         life.on_dataset_changed();
-        let on_b = stamp_on(b, 2, candidate(16));
+        let on_b = stamp_on(b, candidate(16));
         life.record_check(checked(on_b.clone()));
         assert!(life.can_finalize(&on_b).is_ok(), "у B свой бюджет");
         life.record_disclosure(disclosure(on_b.clone()));
 
         // Возвращаемся к A: даже другой кандидат упирается в потраченный test.
         life.on_dataset_changed();
-        let back_to_a = stamp_on(a, 3, candidate(32));
+        let back_to_a = stamp_on(a, candidate(32));
         life.record_check(checked(back_to_a.clone()));
         assert_eq!(
             life.can_finalize(&back_to_a),
@@ -490,13 +489,13 @@ mod tests {
     /// Другие данные начинают жизненный цикл заново.
     #[test]
     fn other_data_starts_a_new_lifecycle() {
-        let old = stamp(1, candidate(16));
+        let old = stamp(candidate(16));
         let mut life = Lifecycle::default();
         life.record_check(checked(old.clone()));
         life.record_disclosure(disclosure(old));
         life.on_dataset_changed();
 
-        let fresh = stamp_on(fingerprint(9.0), 2, candidate(16));
+        let fresh = stamp_on(fingerprint(9.0), candidate(16));
         assert_eq!(life.can_finalize(&fresh), Err(FinalizeRefusal::NotChecked));
         life.record_check(checked(fresh.clone()));
         assert!(life.can_finalize(&fresh).is_ok());
@@ -506,14 +505,14 @@ mod tests {
 
     #[test]
     fn editing_the_form_does_not_return_a_spent_test() {
-        let first = stamp(1, candidate(16));
+        let first = stamp(candidate(16));
         let mut life = Lifecycle::default();
         life.record_check(checked(first.clone()));
         life.record_disclosure(disclosure(first));
 
         // Любая правка формы на той же ревизии упирается в потраченный test,
         // а не в «нужна проверка».
-        let edited = stamp(1, candidate(64));
+        let edited = stamp(candidate(64));
         assert_eq!(
             life.can_finalize(&edited),
             Err(FinalizeRefusal::TestDisclosed)

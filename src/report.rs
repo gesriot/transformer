@@ -14,16 +14,19 @@
 //! - [`FinalRecord`] — переобучение на train + validation и единственный замер
 //!   на test.
 //!
-//! Оба seed берутся из [`RunStamp`]: `candidate.train.seed` — инициализация
+//! Оба seed берутся из [`RunIdentity`]: `candidate.train.seed` — инициализация
 //! проверки, `final_init_seed` — финального переобучения. Дублировать их
 //! рядом нельзя: две копии одного числа рано или поздно разойдутся.
 
 use crate::fingerprint::DatasetFingerprint;
+use crate::interpret::InterpretProfile;
 use crate::interpret::InterpretReport;
-use crate::lifecycle::RunStamp;
+use crate::lifecycle::RunIdentity;
 use crate::metrics::{EvalSource, Metrics};
+use crate::numeric_model::NumericConfig;
 use crate::schema::ModelSchema;
 use crate::split::FinalEval;
+use crate::split::SplitPlan;
 use crate::training::{SearchObjective, TrainingHistory};
 
 /// Версия отчёта. Секция необязательна, поэтому старый checkpoint даёт `None`,
@@ -86,7 +89,7 @@ pub struct TrainingReport {
     /// нечитаем.
     pub schema: ModelSchema,
     /// Разбиение, конфигурация кандидата и оба seed.
-    pub stamp: RunStamp,
+    pub stamp: RunIdentity,
     pub selection: Selection,
     /// Проверка: `None`, если модель получена без неё (например, загружена и
     /// пересохранена).
@@ -96,6 +99,92 @@ pub struct TrainingReport {
 }
 
 impl TrainingReport {
+    /// Проверить отчёт против самого checkpoint.
+    ///
+    /// Вызывается и перед записью, и после чтения: отчёт, противоречащий
+    /// модели, рядом с которой лежит, хуже отсутствующего — он выглядит как
+    /// достоверное происхождение.
+    pub fn validate_against(
+        &self,
+        config: &NumericConfig,
+        schema: &ModelSchema,
+        interpret: Option<&InterpretProfile>,
+    ) -> Result<(), String> {
+        if self.dataset != self.stamp.dataset {
+            return Err("отчёт и его личность запуска описывают разные данные".to_string());
+        }
+        if self.schema != *schema {
+            return Err("схема отчёта не совпадает со схемой checkpoint".to_string());
+        }
+        if self.stamp.candidate.config != *config {
+            return Err("конфигурация кандидата не совпадает с сохраняемой моделью".to_string());
+        }
+        if self.stamp.candidate.interpret.as_ref() != interpret {
+            return Err(
+                "профиль интерпретации в отчёте не совпадает с профилем модели".to_string(),
+            );
+        }
+        let folds = match self.stamp.split {
+            SplitPlan::Holdout { .. } => 1,
+            SplitPlan::KFold { k, .. } => k,
+        };
+        if let Some(check) = &self.check {
+            if check.source != self.stamp.eval_source() {
+                return Err(format!(
+                    "проверка подписана как {}, а разбиение даёт {}",
+                    check.source.label(),
+                    self.stamp.eval_source().label()
+                ));
+            }
+            if check.histories.len() != folds {
+                return Err(format!(
+                    "историй проверки {}, а folds {folds}",
+                    check.histories.len()
+                ));
+            }
+            if !check.interpret.is_empty() && check.interpret.len() != folds {
+                return Err(format!(
+                    "отчётов конвейера {}, а folds {folds}: отчёт одного fold не описывает \
+                     проверку",
+                    check.interpret.len()
+                ));
+            }
+            if check.per_output.len() != schema.n_outputs() {
+                return Err(format!(
+                    "поколоночных метрик проверки {}, а выходов {}",
+                    check.per_output.len(),
+                    schema.n_outputs()
+                ));
+            }
+            validate_reports(&check.interpret, self.stamp.candidate.interpret.as_ref())?;
+        }
+        if let Some(final_run) = &self.final_run {
+            // Финальная модель существует только после проверки: test
+            // открывают по разрешённому кандидату, а не по любому.
+            if self.check.is_none() {
+                return Err("финальный замер без проверки кандидата".to_string());
+            }
+            if final_run.eval.origin.plan != self.stamp.split {
+                return Err("test и личность запуска описывают разные разбиения".to_string());
+            }
+            if final_run.eval.origin.final_init_seed != self.stamp.final_init_seed {
+                return Err("final seed в замере не совпадает с личностью запуска".to_string());
+            }
+            if final_run.eval.per_output.len() != schema.n_outputs() {
+                return Err(format!(
+                    "поколоночных метрик test {}, а выходов {}",
+                    final_run.eval.per_output.len(),
+                    schema.n_outputs()
+                ));
+            }
+            validate_reports(
+                final_run.interpret.as_slice(),
+                self.stamp.candidate.interpret.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Открывался ли test для этих данных. Именно этот факт восстанавливает
     /// бюджет после перезапуска.
     pub fn test_disclosed(&self) -> bool {
@@ -118,4 +207,22 @@ impl TrainingReport {
         };
         format!("{selection}; {evaluation}; данные {}", self.dataset.short())
     }
+}
+
+/// Сохранённый отчёт конвейера обязан быть завершённым и относиться к тому же
+/// профилю: прерванный конвейер оставляет модель в промежуточном состоянии, и
+/// описывать её как результат нельзя.
+fn validate_reports(
+    reports: &[InterpretReport],
+    profile: Option<&InterpretProfile>,
+) -> Result<(), String> {
+    for report in reports {
+        if report.cancelled {
+            return Err("в отчёте сохранён прерванный конвейер интерпретации".to_string());
+        }
+        if Some(&report.profile) != profile {
+            return Err("отчёт конвейера описывает другой профиль".to_string());
+        }
+    }
+    Ok(())
 }
