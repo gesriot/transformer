@@ -1041,16 +1041,22 @@ pub fn load_numeric_full(path: &str) -> io::Result<NumericCheckpoint> {
 /// тоже читаем как отсутствие отчёта: терять из-за неё саму модель нельзя.
 fn build_report(report: &TrainingReport) -> Vec<u8> {
     let mut p = Vec::new();
-    p.extend_from_slice(&TRAINING_REPORT_VERSION.to_le_bytes());
-    p.extend_from_slice(report.dataset.as_bytes());
-    // Отпечаток модели пишется всегда: отчёт без него — это v1, который уже не
-    // создаётся, а только читается.
+    // Один тип представляет обе прочитанные версии, но формат остаётся
+    // строгим: v2 всегда связан с моделью, а неподтверждённый отчёт остаётся
+    // v1 и при повторном сохранении не получает ложного повышения гарантии.
     match &report.model {
         Some(model) => {
+            p.extend_from_slice(&TRAINING_REPORT_VERSION.to_le_bytes());
+            p.extend_from_slice(report.dataset.as_bytes());
+            // Маркер сохранён как часть уже выпущенного кодирования v2, но
+            // единственное допустимое значение теперь 1.
             p.extend_from_slice(&1u32.to_le_bytes());
             p.extend_from_slice(model.as_bytes());
         }
-        None => p.extend_from_slice(&0u32.to_le_bytes()),
+        None => {
+            p.extend_from_slice(&TRAINING_REPORT_VERSION_V1.to_le_bytes());
+            p.extend_from_slice(report.dataset.as_bytes());
+        }
     }
     w_blob(&mut p, &build_schema(&report.schema));
     w_blob(&mut p, &build_stamp(&report.stamp));
@@ -1070,10 +1076,11 @@ fn read_report(bytes: &[u8]) -> io::Result<Option<TrainingReport>> {
     }
     let mut fingerprint = [0u8; 32];
     r.read_exact(&mut fingerprint)?;
-    // У v1 отпечатка модели не было; у v2 он есть, пусть и как «отсутствует».
+    // У v1 отпечатка модели не было; у v2 он обязателен. Маркер наличия
+    // оставлен ради совместимости с первоначальным кодированием v2, но ноль
+    // означал бы противоречащий версии «непроверенный v2».
     let model = if version == TRAINING_REPORT_VERSION {
         match r_u32(&mut r)? {
-            0 => None,
             1 => {
                 let mut bytes = [0u8; 32];
                 r.read_exact(&mut bytes)?;
@@ -1081,7 +1088,7 @@ fn read_report(bytes: &[u8]) -> io::Result<Option<TrainingReport>> {
             }
             other => {
                 return Err(invalid(format!(
-                    "training_report: флаг отпечатка модели {other} не 0 и не 1"
+                    "training_report v2: обязательный флаг отпечатка модели {other} не равен 1"
                 )))
             }
         }
@@ -2271,13 +2278,13 @@ mod tests {
         let schema = ModelSchema::synthetic(2, 1).unwrap();
         let report = sample_report(&nc, &schema, None);
 
-        // Собираем секцию в формате v1: версия и сразу отпечаток данных.
-        let v2 = build_report(&report);
-        let mut v1 = Vec::new();
-        v1.extend_from_slice(&TRAINING_REPORT_VERSION_V1.to_le_bytes());
-        v1.extend_from_slice(&v2[4..36]);
-        // У v2 дальше идёт флаг отпечатка модели; у v1 его не было.
-        v1.extend_from_slice(&v2[40..]);
+        // Неподтверждённый отчёт и при повторной записи остаётся v1: добавлять
+        // связь с весами writer не имеет права.
+        let v1 = build_report(&report);
+        assert_eq!(
+            u32::from_le_bytes(v1[..4].try_into().unwrap()),
+            TRAINING_REPORT_VERSION_V1
+        );
 
         let loaded = read_report(&v1).unwrap().expect("отчёт v1 читается");
         assert!(loaded.model.is_none(), "отпечатка модели у v1 нет");
@@ -2297,6 +2304,31 @@ mod tests {
         assert!(loaded
             .validate_against(any_model, &nc, &schema, Some(&profile))
             .is_ok());
+    }
+
+    /// Вторая версия формата означает подтверждённую связь с весами. Значение
+    /// `None` нужно общему Rust-типу для v1, но не является состоянием v2 на
+    /// диске.
+    #[test]
+    fn a_v2_report_requires_its_model_fingerprint() {
+        let nc = numeric_cfg(ModelKind::Mlp);
+        let specs = vec![FeatureSpec::Continuous, FeatureSpec::Continuous];
+        let schema = ModelSchema::synthetic_from_specs(&specs, 1).unwrap();
+        let model = nc.build(&specs, 1);
+        let data = blackbox::sum().generate(8, 0);
+        let in_norm = Normalizer::fit(&data.inputs, &specs);
+        let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
+        let model_fp = ModelFingerprint::of(&model, &nc, &in_norm, &out_norm);
+
+        let mut v2 = build_report(&sample_report(&nc, &schema, Some(model_fp)));
+        assert_eq!(
+            u32::from_le_bytes(v2[..4].try_into().unwrap()),
+            TRAINING_REPORT_VERSION
+        );
+        // После версии и 32 байт dataset fingerprint лежит обязательный маркер.
+        v2[36..40].copy_from_slice(&0u32.to_le_bytes());
+        let err = read_report(&v2).unwrap_err();
+        assert!(err.to_string().contains("обязательный флаг"), "{err}");
     }
 
     /// Отчёт, посчитанный по другой модели, не проходит проверку: раньше его

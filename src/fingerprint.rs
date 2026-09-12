@@ -117,6 +117,14 @@ mod tests {
         184, 44, 36, 129, 40, 247, 160, 167, 199, 24, 8, 179, 0, 37, 145, 218, 13, 109, 80, 52,
         254, 37, 21, 109, 109, 220, 50, 11, 225, 136, 167, 216,
     ];
+    const GOLDEN_TRANSFORMER_FINGERPRINT: [u8; 32] = [
+        29, 235, 94, 17, 44, 48, 250, 196, 152, 179, 102, 190, 90, 197, 49, 121, 38, 137, 240, 62,
+        202, 179, 46, 100, 226, 24, 56, 246, 52, 168, 255, 81,
+    ];
+    const GOLDEN_KAN_FINGERPRINT: [u8; 32] = [
+        114, 168, 247, 233, 49, 2, 152, 162, 150, 61, 7, 121, 14, 17, 35, 74, 206, 218, 118, 191,
+        165, 236, 246, 95, 40, 85, 134, 150, 33, 153, 4, 169,
+    ];
 
     fn dataset(inputs: Vec<f32>, outputs: Vec<f32>, rows: usize, cols: usize) -> NumericDataset {
         NumericDataset::new(
@@ -160,6 +168,49 @@ mod tests {
         (model, config, norm(0.5, 2), norm(1.5, 1))
     }
 
+    /// Компактные представители остальных архитектур. Веса заполняются явно,
+    /// чтобы golden-тест фиксировал обход, а не генератор инициализации.
+    fn fixed_model_of_kind(
+        kind: ModelKind,
+    ) -> (NumericModel, NumericConfig, Normalizer, Normalizer) {
+        let config = NumericConfig {
+            kind,
+            transformer: crate::config::ModelConfig {
+                d_model: 8,
+                n_heads: 2,
+                n_enc_layers: 1,
+                n_dec_layers: 1,
+                d_ff: 16,
+                ln_eps: 1e-5,
+            },
+            value: crate::encoders::ValueEncoderConfig::default(),
+            mlp_width: 3,
+            mlp_layers: 1,
+            kan: crate::numeric_model::KanConfig {
+                width: 3,
+                layers: 1,
+                grid: 4,
+            },
+        };
+        let specs = vec![FeatureSpec::Continuous, FeatureSpec::Continuous];
+        let model = config.build(&specs, 1);
+        for (i, tensor) in model.parameters().iter().enumerate() {
+            tensor.update_data(|data, _| {
+                for (j, value) in data.iter_mut().enumerate() {
+                    *value = (i * 100 + j) as f32 / 32.0;
+                }
+            });
+        }
+        let norm = |offset: f32, n: usize| Normalizer {
+            mean: (0..n).map(|i| offset + i as f32).collect(),
+            std: (0..n).map(|i| 1.0 + i as f32).collect(),
+            min: (0..n).map(|i| -(i as f32)).collect(),
+            max: (0..n).map(|i| 10.0 + i as f32).collect(),
+            specs: vec![FeatureSpec::Continuous; n],
+        };
+        (model, config, norm(0.5, 2), norm(1.5, 1))
+    }
+
     /// Golden-значение: отпечаток зависит от порядка обхода `parameters()`,
     /// который является частью формата checkpoint. Если этот тест упал, а
     /// изменение обхода было намеренным, версия отпечатка обязана вырасти —
@@ -174,6 +225,33 @@ mod tests {
             "отпечаток изменился: {}",
             fp.short()
         );
+    }
+
+    /// Порядок параметров фиксируется отдельно для каждой архитектуры: golden
+    /// одной MLP не заметил бы перестановку обхода в transformer или KAN.
+    #[test]
+    fn every_model_kind_has_a_stable_parameter_order() {
+        for (kind, expected) in [
+            (ModelKind::Transformer, GOLDEN_TRANSFORMER_FINGERPRINT),
+            (ModelKind::Kan, GOLDEN_KAN_FINGERPRINT),
+        ] {
+            let (model, config, in_norm, out_norm) = fixed_model_of_kind(kind);
+            let actual = ModelFingerprint::of(&model, &config, &in_norm, &out_norm);
+            assert_eq!(actual.as_bytes(), &expected, "изменился отпечаток {kind:?}");
+        }
+    }
+
+    /// Маски KAN не входят в `parameters()`, но меняют предсказание и потому
+    /// обязаны менять отпечаток независимо от весов.
+    #[test]
+    fn kan_hard_prune_masks_are_part_of_the_fingerprint() {
+        let (model, config, in_norm, out_norm) = fixed_model_of_kind(ModelKind::Kan);
+        let before = ModelFingerprint::of(&model, &config, &in_norm, &out_norm);
+        model.kan_masks().unwrap()[0].update_data(|data, _| {
+            *data.iter_mut().next().unwrap() = 0.0;
+        });
+        let after = ModelFingerprint::of(&model, &config, &in_norm, &out_norm);
+        assert_ne!(before, after);
     }
 
     /// Любое изменение весов, конфигурации или нормализаторов меняет отпечаток:
@@ -320,8 +398,8 @@ pub const MODEL_FINGERPRINT_VERSION: u32 = 1;
 ///
 /// Здесь, в отличие от [`DatasetFingerprint`], равенство ПОБИТОВОЕ: NaN и −0
 /// не нормализуются. Связывается конкретный файл с конкретным утверждением, и
-/// любое изменение бита обязано это ломать. Неконечные параметры отсекаются
-/// проверкой отдельно — отпечаток их просто фиксирует.
+/// любое изменение бита обязано это ломать. Неконечные параметры отпечаток
+/// тоже фиксирует побитово; допустимость checkpoint-а — отдельный контракт.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ModelFingerprint([u8; 32]);
 
