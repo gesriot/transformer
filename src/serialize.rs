@@ -1093,6 +1093,24 @@ fn r_blob(r: &mut &[u8], what: &str) -> io::Result<Vec<u8>> {
     Ok(head.to_vec())
 }
 
+/// Разобрать вложенный блок целиком: лишний хвост означает, что писали и
+/// читают разные версии формата, и принимать его молча нельзя.
+fn parse_exact<T>(
+    bytes: &[u8],
+    what: &str,
+    parse: impl FnOnce(&mut &[u8]) -> io::Result<T>,
+) -> io::Result<T> {
+    let mut r = bytes;
+    let value = parse(&mut r)?;
+    if !r.is_empty() {
+        return Err(invalid(format!(
+            "{what}: лишние {} байт в конце блока",
+            r.len()
+        )));
+    }
+    Ok(value)
+}
+
 fn w_opt_blob(buf: &mut Vec<u8>, payload: Option<Vec<u8>>) {
     match payload {
         Some(bytes) => {
@@ -1585,13 +1603,17 @@ fn read_check(bytes: &[u8]) -> io::Result<CheckRecord> {
     let mut histories = Vec::with_capacity(n);
     for _ in 0..n {
         let block = r_blob(&mut r, "проверка: история fold")?;
-        histories.push(read_history(&mut block.as_slice())?);
+        histories.push(parse_exact(&block, "проверка: история fold", read_history)?);
     }
     let n = r_count(&mut r, 8, "проверка: отчёты конвейера")?;
     let mut interpret = Vec::with_capacity(n);
     for _ in 0..n {
         let block = r_blob(&mut r, "проверка: отчёт конвейера")?;
-        interpret.push(read_interpret_report(&mut block.as_slice())?);
+        interpret.push(parse_exact(
+            &block,
+            "проверка: отчёт конвейера",
+            read_interpret_report,
+        )?);
     }
     if !r.is_empty() {
         return Err(invalid("проверка: лишние байты"));
@@ -1640,7 +1662,7 @@ fn read_final(bytes: &[u8]) -> io::Result<FinalRecord> {
     let final_init_seed = r_u64(&mut r)?;
     let plan = read_split(&mut r)?;
     let interpret = r_opt_blob(&mut r, "финал: отчёт конвейера")?
-        .map(|block| read_interpret_report(&mut block.as_slice()))
+        .map(|block| parse_exact(&block, "финал: отчёт конвейера", read_interpret_report))
         .transpose()?;
     if !r.is_empty() {
         return Err(invalid("финал: лишние байты"));
@@ -1818,6 +1840,28 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// История финального refit: validation в ней не снимается — модель на
+    /// ней училась.
+    fn final_history(source: EvalSource) -> TrainingHistory {
+        TrainingHistory {
+            points: vec![
+                EpochPoint {
+                    epoch: 1,
+                    train_loss: 0.5,
+                    val: None,
+                },
+                EpochPoint {
+                    epoch: 2,
+                    train_loss: 0.2,
+                    val: None,
+                },
+            ],
+            source,
+            best_epoch: None,
+            stopped_early: false,
+        }
+    }
+
     fn sample_history(source: EvalSource) -> TrainingHistory {
         TrainingHistory {
             points: vec![
@@ -1917,7 +1961,7 @@ mod tests {
                 interpret: vec![fold_report(), fold_report()],
             }),
             final_run: Some(FinalRecord {
-                history: sample_history(EvalSource::Cv { k: 2 }),
+                history: final_history(EvalSource::Cv { k: 2 }),
                 eval: FinalEval {
                     metrics,
                     per_output: vec![Metrics {
@@ -2064,6 +2108,67 @@ mod tests {
             .validate_against(&nc, &schema, Some(&profile))
             .unwrap_err()
             .contains("прерванный конвейер"));
+
+        // Профиль запрошен, а отчётов конвейера нет: что он сделал —
+        // неизвестно, и молча принимать это нельзя.
+        let mut no_reports = good.clone();
+        no_reports.check.as_mut().unwrap().interpret.clear();
+        assert!(no_reports
+            .validate_against(&nc, &schema, Some(&profile))
+            .unwrap_err()
+            .contains("отчётов конвейера у проверки"));
+
+        let mut no_final_report = good.clone();
+        no_final_report.final_run.as_mut().unwrap().interpret = None;
+        assert!(no_final_report
+            .validate_against(&nc, &schema, Some(&profile))
+            .unwrap_err()
+            .contains("финальной модели"));
+
+        // История проверки подписана не тем протоколом.
+        let mut wrong_history = good.clone();
+        wrong_history.check.as_mut().unwrap().histories[0].source = EvalSource::Validation;
+        assert!(wrong_history
+            .validate_against(&nc, &schema, Some(&profile))
+            .unwrap_err()
+            .contains("история проверки подписана"));
+
+        // Refit не мог мерить validation: он на ней учился.
+        let mut refit_measured_validation = good.clone();
+        refit_measured_validation
+            .final_run
+            .as_mut()
+            .unwrap()
+            .history
+            .points[0]
+            .val = Some(Metrics {
+            rmse: 1.0,
+            mae: 0.5,
+            rel_error: 0.1,
+            r2: 0.9,
+        });
+        assert!(refit_measured_validation
+            .validate_against(&nc, &schema, Some(&profile))
+            .unwrap_err()
+            .contains("validation-метрики"));
+
+        // Поиск без seeds или с повторами.
+        let mut no_seeds = good.clone();
+        if let Selection::Search { seeds, .. } = &mut no_seeds.selection {
+            seeds.clear();
+        }
+        assert!(no_seeds
+            .validate_against(&nc, &schema, Some(&profile))
+            .unwrap_err()
+            .contains("без seeds"));
+        let mut repeated = good.clone();
+        if let Selection::Search { seeds, .. } = &mut repeated.selection {
+            *seeds = vec![1, 1];
+        }
+        assert!(repeated
+            .validate_against(&nc, &schema, Some(&profile))
+            .unwrap_err()
+            .contains("повторы"));
 
         // Seed финального замера разошёлся с личностью запуска.
         let mut wrong_seed = good;

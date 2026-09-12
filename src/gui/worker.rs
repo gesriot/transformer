@@ -253,20 +253,18 @@ fn worker_loop(
                     Ok(()) => {
                         let origin = data.origin.clone();
                         // Проверка этого же кандидата — часть происхождения
-                        // финальной модели: её истории и отчёты берутся оттуда.
-                        // Способ выбора берётся у разрешившей проверки: за
-                        // время до финализации форма могла измениться, а
-                        // происхождение модели — нет.
-                        let checked = last_check
-                            .as_ref()
-                            .filter(|(checked_stamp, _, _)| *checked_stamp == *stamp)
-                            .map(|(_, record, selection)| (record.clone(), selection.clone()));
-                        let (checked, selection) = match checked {
-                            Some((record, selection)) => (Some(record), selection),
-                            // Проверку разрешил lifecycle, а записи нет: это
-                            // рассогласование, а не повод придумать выбор.
-                            None => (None, Selection::Manual),
-                        };
+                        // финальной модели: её истории, отчёты и способ выбора
+                        // берутся оттуда, а не из текущего состояния формы.
+                        let (checked, selection) =
+                            match finalize_inputs(last_check.as_ref(), &stamp) {
+                                Ok(inputs) => inputs,
+                                Err(e) => {
+                                    let _ = evt_tx.send(Event::Error(e));
+                                    ctx.request_repaint();
+                                    continue;
+                                }
+                            };
+                        let checked = Some(checked);
                         match train_numeric(
                             &data,
                             &stamp,
@@ -336,9 +334,9 @@ fn worker_loop(
                             kind: loaded.nc.kind,
                             source: format!("файл: {path}"),
                             model_origin: ModelOrigin::Checkpoint,
-                            // Профиль в файле есть, а отчёта конвейера нет:
-                            // что именно он сделал, хранит происхождение.
-                            interpret: None,
+                            // Отчёт конвейера берётся из происхождения: он там
+                            // есть, и прятать его после загрузки незачем.
+                            interpret: loaded_interpret(loaded.report.as_deref()),
                             report: loaded.report.clone(),
                             parameter_count: loaded.model.parameter_count(),
                             kan: kan_model_info(
@@ -1484,6 +1482,43 @@ fn curve(history: &TrainingHistory) -> Vec<CurvePoint> {
         .collect()
 }
 
+/// Отчёт конвейера загруженной модели.
+///
+/// У финальной модели это отчёт её же refit; у отладочной holdout-модели —
+/// единственный отчёт проверки. У CV-проверки отчётов столько же, сколько
+/// folds, и ни один не описывает конкретную модель — тогда показывать нечего.
+fn loaded_interpret(report: Option<&TrainingReport>) -> Option<Box<InterpretReport>> {
+    let report = report?;
+    match &report.final_run {
+        Some(final_run) => final_run.interpret.clone().map(Box::new),
+        None => match report.check.as_ref()?.interpret.as_slice() {
+            [only] => Some(Box::new(only.clone())),
+            _ => None,
+        },
+    }
+}
+
+/// Что финализация берёт у разрешившей её проверки.
+///
+/// Ошибка здесь означает рассогласование внутреннего состояния: раскрытие
+/// test разрешено, а записи о проверке нет. Подставить «ручной выбор» и всё
+/// равно открыть test значило бы подписать модель происхождением, которого не
+/// было.
+fn finalize_inputs(
+    last_check: Option<&(RunIdentity, CheckRecord, Selection)>,
+    stamp: &RunIdentity,
+) -> Result<(CheckRecord, Selection), String> {
+    match last_check {
+        Some((checked, record, selection)) if checked == stamp => {
+            Ok((record.clone(), selection.clone()))
+        }
+        _ => Err(
+            "внутренняя ошибка: финализация разрешена, но записи о проверке этого кандидата нет"
+                .to_string(),
+        ),
+    }
+}
+
 /// Отменённый запуск: ни оценки, ни модели, ни замера на test.
 fn send_cancelled(evt_tx: &Sender<Event>, ctx: &egui::Context, stamp: &RunIdentity) {
     let _ = evt_tx.send(Event::TrainDone {
@@ -1507,7 +1542,7 @@ mod tests {
     use crate::config::ModelConfig;
     use crate::encoders::ValueEncoderConfig;
     use crate::lifecycle::CandidateSpec;
-    use crate::metrics::EvalSource;
+    use crate::metrics::{EvalSource, Metrics};
     use crate::numeric_model::{KanConfig, ModelKind};
     use crate::train::{fit_normalizers, TrainConfig};
     use crate::training::EvalSchedule;
@@ -1633,6 +1668,149 @@ mod tests {
         let final_run = report.final_run.expect("запись о финале");
         assert!(final_run.eval.origin.test_rows > 0);
         std::fs::remove_file(path).ok();
+    }
+
+    /// После загрузки виден и отчёт конвейера: происхождение его хранит, и
+    /// прятать его незачем.
+    #[test]
+    fn a_loaded_model_shows_the_pipeline_report_from_its_provenance() {
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let profile = InterpretProfile::v1();
+        let fold_report = InterpretReport {
+            profile,
+            per_layer: vec![(2, 4)],
+            active_edges: (2, 4),
+            r2_before: Some(0.5),
+            r2_after_prune: Some(0.4),
+            r2_after_finetune: Some(0.6),
+            compaction: None,
+            r2_after_compact: None,
+            cancelled: false,
+        };
+        let metrics = Metrics {
+            rmse: 1.0,
+            mae: 0.5,
+            rel_error: 0.1,
+            r2: 0.9,
+        };
+        let identity = stamp(
+            DatasetFingerprint::from_bytes([3; 32]),
+            SplitPlan::default(),
+            NumericConfig {
+                kind: ModelKind::Kan,
+                transformer: ModelConfig::default(),
+                value: ValueEncoderConfig::default(),
+                mlp_width: 4,
+                mlp_layers: 1,
+                kan: KanConfig::default(),
+            },
+            TrainConfig {
+                epochs: 1,
+                batch_size: 8,
+                ..Default::default()
+            },
+            Some(profile),
+        );
+        let check = CheckRecord {
+            source: EvalSource::Validation,
+            metrics: metrics.clone(),
+            per_output: vec![metrics.clone()],
+            r2_std_folds: 0.0,
+            histories: Vec::new(),
+            interpret: vec![fold_report.clone()],
+        };
+        let report = TrainingReport {
+            dataset: identity.dataset,
+            schema,
+            stamp: identity,
+            selection: Selection::Manual,
+            check: Some(check.clone()),
+            final_run: None,
+        };
+
+        // Отладочная holdout-модель: единственный отчёт проверки.
+        let shown = loaded_interpret(Some(&report)).expect("отчёт проверки");
+        assert_eq!(shown.active_edges, (2, 4));
+
+        // CV-проверка: ни один отчёт fold не описывает конкретную модель.
+        let mut cv = report.clone();
+        cv.check.as_mut().unwrap().interpret = vec![fold_report.clone(), fold_report];
+        assert!(loaded_interpret(Some(&cv)).is_none());
+
+        // Ни отчёта, ни происхождения — показывать нечего.
+        assert!(loaded_interpret(None).is_none());
+    }
+
+    /// Рассогласование внутреннего состояния — отказ, а не выдуманное
+    /// происхождение: test тратится здесь, и подписывать модель тем, чего не
+    /// было, нельзя.
+    #[test]
+    fn finalization_refuses_when_the_check_record_is_missing() {
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let data = blackbox::sum().generate(16, 0);
+        let fp = DatasetFingerprint::of(&data, &schema).unwrap();
+        let config = NumericConfig {
+            kind: ModelKind::Mlp,
+            transformer: ModelConfig::default(),
+            value: ValueEncoderConfig::default(),
+            mlp_width: 4,
+            mlp_layers: 1,
+            kan: KanConfig::default(),
+        };
+        let train = TrainConfig {
+            epochs: 1,
+            batch_size: 8,
+            ..Default::default()
+        };
+        let wanted = stamp(
+            fp,
+            SplitPlan::default(),
+            config.clone(),
+            train.clone(),
+            None,
+        );
+        let other = stamp(
+            DatasetFingerprint::from_bytes([9; 32]),
+            SplitPlan::default(),
+            config,
+            train,
+            None,
+        );
+        let record = CheckRecord {
+            source: EvalSource::Validation,
+            metrics: Metrics {
+                rmse: 1.0,
+                mae: 0.5,
+                rel_error: 0.1,
+                r2: 0.9,
+            },
+            per_output: Vec::new(),
+            r2_std_folds: 0.0,
+            histories: Vec::new(),
+            interpret: Vec::new(),
+        };
+
+        // Записи нет вовсе.
+        assert!(finalize_inputs(None, &wanted)
+            .unwrap_err()
+            .contains("записи о проверке"));
+
+        // Запись есть, но от другого кандидата.
+        let foreign = (other, record.clone(), Selection::Manual);
+        assert!(finalize_inputs(Some(&foreign), &wanted)
+            .unwrap_err()
+            .contains("записи о проверке"));
+
+        // Совпадающая запись отдаёт и способ выбора — тот, что был у проверки.
+        let selection = Selection::Search {
+            objective: SearchObjective::AggregateR2,
+            seeds: vec![0],
+            objective_value: 0.5,
+            label: "mlp".to_string(),
+        };
+        let own = (wanted.clone(), record, selection.clone());
+        let (_, taken) = finalize_inputs(Some(&own), &wanted).unwrap();
+        assert_eq!(taken, selection);
     }
 
     /// Загруженный финальный checkpoint возвращает запрет и в worker-е:

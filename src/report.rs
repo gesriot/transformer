@@ -28,6 +28,7 @@ use crate::schema::ModelSchema;
 use crate::split::FinalEval;
 use crate::split::SplitPlan;
 use crate::training::{SearchObjective, TrainingHistory};
+use std::collections::BTreeSet;
 
 /// Версия отчёта. Секция необязательна, поэтому старый checkpoint даёт `None`,
 /// а не «test точно не открывался»: отсутствие записи означает неизвестность.
@@ -124,6 +125,15 @@ impl TrainingReport {
                 "профиль интерпретации в отчёте не совпадает с профилем модели".to_string(),
             );
         }
+        if let Selection::Search { seeds, .. } = &self.selection {
+            if seeds.is_empty() {
+                return Err("поиск записан без seeds: усреднять было не по чему".to_string());
+            }
+            let unique: BTreeSet<u64> = seeds.iter().copied().collect();
+            if unique.len() != seeds.len() {
+                return Err("seeds поиска содержат повторы".to_string());
+            }
+        }
         let folds = match self.stamp.split {
             SplitPlan::Holdout { .. } => 1,
             SplitPlan::KFold { k, .. } => k,
@@ -142,12 +152,28 @@ impl TrainingReport {
                     check.histories.len()
                 ));
             }
-            if !check.interpret.is_empty() && check.interpret.len() != folds {
+            // Правило точное: с профилем — отчёт на каждый fold, без профиля
+            // — ни одного. «Пусто при заданном профиле» означало бы, что
+            // конвейер просили, но что он сделал — неизвестно.
+            let expected = if self.stamp.candidate.interpret.is_some() {
+                folds
+            } else {
+                0
+            };
+            if check.interpret.len() != expected {
                 return Err(format!(
-                    "отчётов конвейера {}, а folds {folds}: отчёт одного fold не описывает \
-                     проверку",
+                    "отчётов конвейера у проверки {}, а ожидается {expected}",
                     check.interpret.len()
                 ));
+            }
+            for history in &check.histories {
+                if history.source != check.source {
+                    return Err(format!(
+                        "история проверки подписана как {}, а сама проверка — как {}",
+                        history.source.label(),
+                        check.source.label()
+                    ));
+                }
             }
             if check.per_output.len() != schema.n_outputs() {
                 return Err(format!(
@@ -169,6 +195,20 @@ impl TrainingReport {
             }
             if final_run.eval.origin.final_init_seed != self.stamp.final_init_seed {
                 return Err("final seed в замере не совпадает с личностью запуска".to_string());
+            }
+            if final_run.interpret.is_some() != self.stamp.candidate.interpret.is_some() {
+                return Err(
+                    "отчёт конвейера финальной модели не соответствует запрошенному профилю"
+                        .to_string(),
+                );
+            }
+            // Refit учится на train + validation: validation-метрик в его
+            // истории быть не может — они означали бы замер по своим же
+            // обучающим данным.
+            if final_run.history.points.iter().any(|p| p.val.is_some()) {
+                return Err(
+                    "история финального переобучения содержит validation-метрики".to_string(),
+                );
             }
             if final_run.eval.per_output.len() != schema.n_outputs() {
                 return Err(format!(
