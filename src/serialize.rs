@@ -15,13 +15,16 @@ use crate::data::Normalizer;
 #[cfg(feature = "demo")]
 use crate::data::Vocab;
 use crate::encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
-use crate::fingerprint::DatasetFingerprint;
+use crate::fingerprint::{DatasetFingerprint, ModelFingerprint};
 use crate::interpret::{InterpretProfile, InterpretReport, INTERPRET_PROFILE_VERSION};
 use crate::kan::CompactReport;
 use crate::lifecycle::{CandidateSpec, RunIdentity};
 use crate::metrics::{EvalSource, Metrics};
 use crate::numeric_model::{KanConfig, ModelKind, NumericConfig, NumericModel};
-use crate::report::{CheckRecord, FinalRecord, Selection, TrainingReport, TRAINING_REPORT_VERSION};
+use crate::report::{
+    CheckRecord, FinalRecord, Selection, TrainingReport, TRAINING_REPORT_VERSION,
+    TRAINING_REPORT_VERSION_V1,
+};
 use crate::schema::{Column, ColumnRole, ColumnType, ModelSchema};
 use crate::split::{FinalEval, FinalOrigin, SplitPlan};
 use crate::tensor::Tensor;
@@ -869,7 +872,12 @@ pub fn save_numeric(
         // Отчёт, противоречащий модели, рядом с которой лежит, хуже
         // отсутствующего: он выглядит как достоверное происхождение.
         report
-            .validate_against(nc, schema, interpret)
+            .validate_against(
+                ModelFingerprint::of(model, nc, in_norm, out_norm),
+                nc,
+                schema,
+                interpret,
+            )
             .map_err(|e| invalid(format!("training_report: {e}")))?;
         sections.push(("training_report", build_report(report)));
     }
@@ -1006,7 +1014,12 @@ pub fn load_numeric_full(path: &str) -> io::Result<NumericCheckpoint> {
     // Та же проверка на чтении: файл мог быть собран другой версией или руками.
     if let Some(report) = &report {
         report
-            .validate_against(&nc, &schema, interpret.as_ref())
+            .validate_against(
+                ModelFingerprint::of(&model, &nc, &in_norm, &out_norm),
+                &nc,
+                &schema,
+                interpret.as_ref(),
+            )
             .map_err(|e| invalid(format!("training_report: {e}")))?;
     }
     Ok(NumericCheckpoint {
@@ -1030,6 +1043,15 @@ fn build_report(report: &TrainingReport) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&TRAINING_REPORT_VERSION.to_le_bytes());
     p.extend_from_slice(report.dataset.as_bytes());
+    // Отпечаток модели пишется всегда: отчёт без него — это v1, который уже не
+    // создаётся, а только читается.
+    match &report.model {
+        Some(model) => {
+            p.extend_from_slice(&1u32.to_le_bytes());
+            p.extend_from_slice(model.as_bytes());
+        }
+        None => p.extend_from_slice(&0u32.to_le_bytes()),
+    }
     w_blob(&mut p, &build_schema(&report.schema));
     w_blob(&mut p, &build_stamp(&report.stamp));
     build_selection(&mut p, &report.selection);
@@ -1041,11 +1063,31 @@ fn build_report(report: &TrainingReport) -> Vec<u8> {
 fn read_report(bytes: &[u8]) -> io::Result<Option<TrainingReport>> {
     let mut r = bytes;
     let version = r_u32(&mut r)?;
-    if version != TRAINING_REPORT_VERSION {
+    // Две версии читаются, остальные игнорируются: незнакомая версия не должна
+    // стоить самой модели.
+    if version != TRAINING_REPORT_VERSION && version != TRAINING_REPORT_VERSION_V1 {
         return Ok(None);
     }
     let mut fingerprint = [0u8; 32];
     r.read_exact(&mut fingerprint)?;
+    // У v1 отпечатка модели не было; у v2 он есть, пусть и как «отсутствует».
+    let model = if version == TRAINING_REPORT_VERSION {
+        match r_u32(&mut r)? {
+            0 => None,
+            1 => {
+                let mut bytes = [0u8; 32];
+                r.read_exact(&mut bytes)?;
+                Some(ModelFingerprint::from_bytes(bytes))
+            }
+            other => {
+                return Err(invalid(format!(
+                    "training_report: флаг отпечатка модели {other} не 0 и не 1"
+                )))
+            }
+        }
+    } else {
+        None
+    };
     let dataset = DatasetFingerprint::from_bytes(fingerprint);
     let schema = read_schema(&r_blob(&mut r, "training_report: схема")?)?;
     let stamp = read_stamp(
@@ -1064,6 +1106,7 @@ fn read_report(bytes: &[u8]) -> io::Result<Option<TrainingReport>> {
     }
     Ok(Some(TrainingReport {
         dataset,
+        model,
         schema,
         stamp,
         selection,
@@ -1890,7 +1933,11 @@ mod tests {
     /// Отчёт, согласованный с checkpoint: та же конфигурация, схема и профиль,
     /// число историй и отчётов конвейера равно числу folds. Несогласованный
     /// отчёт запись отвергает — на то и проверка.
-    fn sample_report(nc: &NumericConfig, schema: &ModelSchema) -> TrainingReport {
+    fn sample_report(
+        nc: &NumericConfig,
+        schema: &ModelSchema,
+        model: Option<ModelFingerprint>,
+    ) -> TrainingReport {
         let metrics = Metrics {
             rmse: 1.0,
             mae: 0.5,
@@ -1923,6 +1970,7 @@ mod tests {
         let dataset = DatasetFingerprint::from_bytes([7; 32]);
         TrainingReport {
             dataset,
+            model,
             schema: schema.clone(),
             stamp: RunIdentity {
                 dataset,
@@ -1995,7 +2043,8 @@ mod tests {
         let in_norm = Normalizer::fit(&data.inputs, &specs);
         let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
         let profile = InterpretProfile::v1();
-        let report = sample_report(&nc, &schema);
+        let model_fp = ModelFingerprint::of(&model, &nc, &in_norm, &out_norm);
+        let report = sample_report(&nc, &schema, Some(model_fp));
 
         let path = tmp_path("training_report.bin");
         save_numeric(
@@ -2052,23 +2101,31 @@ mod tests {
     #[test]
     fn a_report_that_contradicts_the_checkpoint_is_refused() {
         let nc = numeric_cfg(ModelKind::Kan);
-        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let specs = vec![FeatureSpec::Continuous, FeatureSpec::Continuous];
+        let schema = ModelSchema::synthetic_from_specs(&specs, 1).unwrap();
+        let model = nc.build(&specs, 1);
+        let data = blackbox::sum().generate(8, 0);
+        let in_norm = Normalizer::fit(&data.inputs, &specs);
+        let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
         let profile = InterpretProfile::v1();
-        let good = sample_report(&nc, &schema);
-        assert!(good.validate_against(&nc, &schema, Some(&profile)).is_ok());
+        let model_fp = ModelFingerprint::of(&model, &nc, &in_norm, &out_norm);
+        let good = sample_report(&nc, &schema, Some(model_fp));
+        assert!(good
+            .validate_against(model_fp, &nc, &schema, Some(&profile))
+            .is_ok());
 
         // Данные отчёта и его личности запуска разошлись.
         let mut wrong_dataset = good.clone();
         wrong_dataset.dataset = DatasetFingerprint::from_bytes([1; 32]);
         assert!(wrong_dataset
-            .validate_against(&nc, &schema, Some(&profile))
+            .validate_against(model_fp, &nc, &schema, Some(&profile))
             .unwrap_err()
             .contains("разные данные"));
 
         // Модель в checkpoint не та, что описана кандидатом.
         let other_model = numeric_cfg(ModelKind::Mlp);
         assert!(good
-            .validate_against(&other_model, &schema, Some(&profile))
+            .validate_against(model_fp, &other_model, &schema, Some(&profile))
             .unwrap_err()
             .contains("конфигурация кандидата"));
 
@@ -2081,7 +2138,7 @@ mod tests {
             .histories
             .truncate(1);
         assert!(short_histories
-            .validate_against(&nc, &schema, Some(&profile))
+            .validate_against(model_fp, &nc, &schema, Some(&profile))
             .unwrap_err()
             .contains("историй проверки"));
 
@@ -2089,7 +2146,7 @@ mod tests {
         let mut wrong_source = good.clone();
         wrong_source.check.as_mut().unwrap().source = EvalSource::Validation;
         assert!(wrong_source
-            .validate_against(&nc, &schema, Some(&profile))
+            .validate_against(model_fp, &nc, &schema, Some(&profile))
             .unwrap_err()
             .contains("подписана как"));
 
@@ -2097,7 +2154,7 @@ mod tests {
         let mut orphan_final = good.clone();
         orphan_final.check = None;
         assert!(orphan_final
-            .validate_against(&nc, &schema, Some(&profile))
+            .validate_against(model_fp, &nc, &schema, Some(&profile))
             .unwrap_err()
             .contains("без проверки"));
 
@@ -2105,7 +2162,7 @@ mod tests {
         let mut cancelled = good.clone();
         cancelled.check.as_mut().unwrap().interpret[0].cancelled = true;
         assert!(cancelled
-            .validate_against(&nc, &schema, Some(&profile))
+            .validate_against(model_fp, &nc, &schema, Some(&profile))
             .unwrap_err()
             .contains("прерванный конвейер"));
 
@@ -2114,14 +2171,14 @@ mod tests {
         let mut no_reports = good.clone();
         no_reports.check.as_mut().unwrap().interpret.clear();
         assert!(no_reports
-            .validate_against(&nc, &schema, Some(&profile))
+            .validate_against(model_fp, &nc, &schema, Some(&profile))
             .unwrap_err()
             .contains("отчётов конвейера у проверки"));
 
         let mut no_final_report = good.clone();
         no_final_report.final_run.as_mut().unwrap().interpret = None;
         assert!(no_final_report
-            .validate_against(&nc, &schema, Some(&profile))
+            .validate_against(model_fp, &nc, &schema, Some(&profile))
             .unwrap_err()
             .contains("финальной модели"));
 
@@ -2129,7 +2186,7 @@ mod tests {
         let mut wrong_history = good.clone();
         wrong_history.check.as_mut().unwrap().histories[0].source = EvalSource::Validation;
         assert!(wrong_history
-            .validate_against(&nc, &schema, Some(&profile))
+            .validate_against(model_fp, &nc, &schema, Some(&profile))
             .unwrap_err()
             .contains("история проверки подписана"));
 
@@ -2148,7 +2205,7 @@ mod tests {
             r2: 0.9,
         });
         assert!(refit_measured_validation
-            .validate_against(&nc, &schema, Some(&profile))
+            .validate_against(model_fp, &nc, &schema, Some(&profile))
             .unwrap_err()
             .contains("validation-метрики"));
 
@@ -2158,7 +2215,7 @@ mod tests {
             seeds.clear();
         }
         assert!(no_seeds
-            .validate_against(&nc, &schema, Some(&profile))
+            .validate_against(model_fp, &nc, &schema, Some(&profile))
             .unwrap_err()
             .contains("без seeds"));
         let mut repeated = good.clone();
@@ -2166,7 +2223,7 @@ mod tests {
             *seeds = vec![1, 1];
         }
         assert!(repeated
-            .validate_against(&nc, &schema, Some(&profile))
+            .validate_against(model_fp, &nc, &schema, Some(&profile))
             .unwrap_err()
             .contains("повторы"));
 
@@ -2180,7 +2237,7 @@ mod tests {
             .origin
             .final_init_seed = 42;
         assert!(wrong_seed
-            .validate_against(&nc, &schema, Some(&profile))
+            .validate_against(model_fp, &nc, &schema, Some(&profile))
             .unwrap_err()
             .contains("final seed"));
     }
@@ -2206,12 +2263,79 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Отчёт v1 читается без отпечатка модели и не «повышается» молча: связь с
+    /// весами эта версия не наблюдала, и утверждать обратное нельзя.
+    #[test]
+    fn a_v1_report_keeps_its_unverified_weights() {
+        let nc = numeric_cfg(ModelKind::Mlp);
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let report = sample_report(&nc, &schema, None);
+
+        // Собираем секцию в формате v1: версия и сразу отпечаток данных.
+        let v2 = build_report(&report);
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(&TRAINING_REPORT_VERSION_V1.to_le_bytes());
+        v1.extend_from_slice(&v2[4..36]);
+        // У v2 дальше идёт флаг отпечатка модели; у v1 его не было.
+        v1.extend_from_slice(&v2[40..]);
+
+        let loaded = read_report(&v1).unwrap().expect("отчёт v1 читается");
+        assert!(loaded.model.is_none(), "отпечатка модели у v1 нет");
+        assert!(!loaded.weights_verified());
+        assert_eq!(loaded.dataset, report.dataset);
+        assert_eq!(loaded.selection, report.selection);
+
+        // Отчёт без отпечатка проходит проверку по конфигурации и схеме: он
+        // просто не утверждает ничего про веса.
+        let specs = vec![FeatureSpec::Continuous, FeatureSpec::Continuous];
+        let model = nc.build(&specs, 1);
+        let data = blackbox::sum().generate(8, 0);
+        let in_norm = Normalizer::fit(&data.inputs, &specs);
+        let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
+        let any_model = ModelFingerprint::of(&model, &nc, &in_norm, &out_norm);
+        let profile = InterpretProfile::v1();
+        assert!(loaded
+            .validate_against(any_model, &nc, &schema, Some(&profile))
+            .is_ok());
+    }
+
+    /// Отчёт, посчитанный по другой модели, не проходит проверку: раньше его
+    /// можно было переставить к любой модели с той же конфигурацией.
+    #[test]
+    fn a_report_from_another_model_is_refused() {
+        let nc = numeric_cfg(ModelKind::Mlp);
+        let specs = vec![FeatureSpec::Continuous, FeatureSpec::Continuous];
+        let schema = ModelSchema::synthetic_from_specs(&specs, 1).unwrap();
+        let data = blackbox::sum().generate(8, 0);
+        let in_norm = Normalizer::fit(&data.inputs, &specs);
+        let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
+
+        // Две модели одной конфигурации и схемы, но с разными весами.
+        let first = nc.build(&specs, 1);
+        let second = nc.build(&specs, 1);
+        second.parameters()[0].update_data(|data, _| {
+            if let Some(value) = data.iter_mut().next() {
+                *value += 1.0;
+            }
+        });
+        let first_fp = ModelFingerprint::of(&first, &nc, &in_norm, &out_norm);
+        let second_fp = ModelFingerprint::of(&second, &nc, &in_norm, &out_norm);
+        assert_ne!(first_fp, second_fp);
+
+        let report = sample_report(&nc, &schema, Some(first_fp));
+        let profile = InterpretProfile::v1();
+        let err = report
+            .validate_against(second_fp, &nc, &schema, Some(&profile))
+            .unwrap_err();
+        assert!(err.contains("другую модель"), "{err}");
+    }
+
     /// Незнакомая версия отчёта не должна стоить модели: секция читается как
     /// отсутствующая.
     #[test]
     fn an_unknown_report_version_is_ignored() {
         let schema = ModelSchema::synthetic(2, 1).unwrap();
-        let mut bytes = build_report(&sample_report(&numeric_cfg(ModelKind::Mlp), &schema));
+        let mut bytes = build_report(&sample_report(&numeric_cfg(ModelKind::Mlp), &schema, None));
         bytes[..4].copy_from_slice(&(TRAINING_REPORT_VERSION + 1).to_le_bytes());
         assert!(read_report(&bytes).unwrap().is_none());
     }
@@ -2221,7 +2345,7 @@ mod tests {
     #[test]
     fn a_truncated_report_is_rejected() {
         let schema = ModelSchema::synthetic(2, 1).unwrap();
-        let bytes = build_report(&sample_report(&numeric_cfg(ModelKind::Mlp), &schema));
+        let bytes = build_report(&sample_report(&numeric_cfg(ModelKind::Mlp), &schema, None));
         for cut in [8, bytes.len() / 3, bytes.len() / 2, bytes.len() - 1] {
             assert!(
                 read_report(&bytes[..cut]).is_err(),

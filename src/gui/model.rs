@@ -159,6 +159,13 @@ impl App {
         // её получили: сессия про неё ничего не знает.
         if let Some(report) = &info.report {
             ui.label(format!("Происхождение: {}", report.describe()));
+            if !report.weights_verified() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(200, 120, 0),
+                    "Связь отчёта с весами не проверена (отчёт старой версии): он описывает \
+                     модель с такой же конфигурацией, но совпадение весов не подтверждено.",
+                );
+            }
         }
         if let ModelOrigin::Development(stamp) | ModelOrigin::Final(stamp) = &info.origin {
             ui.label(format!(

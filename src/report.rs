@@ -18,7 +18,7 @@
 //! проверки, `final_init_seed` — финального переобучения. Дублировать их
 //! рядом нельзя: две копии одного числа рано или поздно разойдутся.
 
-use crate::fingerprint::DatasetFingerprint;
+use crate::fingerprint::{DatasetFingerprint, ModelFingerprint};
 use crate::interpret::InterpretProfile;
 use crate::interpret::InterpretReport;
 use crate::lifecycle::RunIdentity;
@@ -32,7 +32,14 @@ use std::collections::BTreeSet;
 
 /// Версия отчёта. Секция необязательна, поэтому старый checkpoint даёт `None`,
 /// а не «test точно не открывался»: отсутствие записи означает неизвестность.
-pub const TRAINING_REPORT_VERSION: u32 = 1;
+///
+/// v2 добавила отпечаток модели. Отчёт v1 читается как есть, БЕЗ отпечатка:
+/// повысить его молча значило бы связать модель с утверждением, истинность
+/// которого эта версия не наблюдала.
+pub const TRAINING_REPORT_VERSION: u32 = 2;
+
+/// Первая версия отчёта — без отпечатка модели.
+pub const TRAINING_REPORT_VERSION_V1: u32 = 1;
 
 /// Как была выбрана конфигурация.
 #[derive(Clone, Debug, PartialEq)]
@@ -86,6 +93,9 @@ pub struct FinalRecord {
 pub struct TrainingReport {
     /// Данные, на которых всё происходило.
     pub dataset: DatasetFingerprint,
+    /// Отпечаток самой модели. `None` у отчёта v1: связь с весами там не
+    /// проверялась, и делать вид, что проверялась, нельзя.
+    pub model: Option<ModelFingerprint>,
     /// Схема целиком: имена и единицы в отпечаток не входят, но без них отчёт
     /// нечитаем.
     pub schema: ModelSchema,
@@ -107,10 +117,22 @@ impl TrainingReport {
     /// достоверное происхождение.
     pub fn validate_against(
         &self,
+        model: ModelFingerprint,
         config: &NumericConfig,
         schema: &ModelSchema,
         interpret: Option<&InterpretProfile>,
     ) -> Result<(), String> {
+        // Отчёт v1 отпечатка не несёт: он связан с моделью только конфигурацией
+        // и схемой, и это видно в интерфейсе.
+        if let Some(expected) = self.model {
+            if expected != model {
+                return Err(format!(
+                    "отчёт описывает другую модель: ожидался отпечаток {}, у модели {}",
+                    expected.short(),
+                    model.short()
+                ));
+            }
+        }
         if self.dataset != self.stamp.dataset {
             return Err("отчёт и его личность запуска описывают разные данные".to_string());
         }
@@ -223,6 +245,11 @@ impl TrainingReport {
             )?;
         }
         Ok(())
+    }
+
+    /// Проверена ли связь отчёта с весами модели. У отчётов v1 — нет.
+    pub fn weights_verified(&self) -> bool {
+        self.model.is_some()
     }
 
     /// Открывался ли test для этих данных. Именно этот факт восстанавливает

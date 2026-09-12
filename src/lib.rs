@@ -77,7 +77,7 @@ pub use data::{Normalizer, NumericDataset, OutOfRange};
 pub use encoders::{FeatureSpec, ValueEncoderConfig, ValueEncoderKind};
 // Отпечаток данных: то, что делает «те же данные» проверяемым утверждением, а
 // не совпадением номера в текущей сессии.
-pub use fingerprint::DatasetFingerprint;
+pub use fingerprint::{DatasetFingerprint, ModelFingerprint, MODEL_FINGERPRINT_VERSION};
 pub use schema::{Column, ColumnRole, ColumnType, ModelSchema, TableSchema};
 // Разметка таблицы: профиль -> черновик схемы -> отчёт по ролям. Ядро
 // независимо от интерфейса, поэтому идёт наружу целиком, а не через GUI.
@@ -134,7 +134,10 @@ pub use sweep::{
 pub use training::{SearchCost, SearchObjective};
 
 // Происхождение модели: с чем её обучали и чем измерили.
-pub use report::{CheckRecord, FinalRecord, Selection, TrainingReport, TRAINING_REPORT_VERSION};
+pub use report::{
+    CheckRecord, FinalRecord, Selection, TrainingReport, TRAINING_REPORT_VERSION,
+    TRAINING_REPORT_VERSION_V1,
+};
 
 // Готовая модель: checkpoint, формулы, прогноз по таблице.
 pub use batch_predict::{export_predictions, ExportSummary};

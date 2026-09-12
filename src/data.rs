@@ -29,6 +29,7 @@ pub struct OutOfRange {
 
 /// Нормализатор столбцов. Континуальные колонки — z-score `(x-mean)/std`,
 /// категориальные — identity (коды не трогаем). Подгоняется ТОЛЬКО на train.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Normalizer {
     pub(crate) mean: Vec<f32>,
     pub(crate) std: Vec<f32>,

@@ -18,7 +18,7 @@ use crate::config::ModelConfig;
 use crate::data::TextDataset;
 use crate::data::{Normalizer, NumericDataset, OutOfRange};
 use crate::encoders::FeatureSpec;
-use crate::fingerprint::DatasetFingerprint;
+use crate::fingerprint::{DatasetFingerprint, ModelFingerprint};
 #[cfg(feature = "demo")]
 use crate::generate::generate;
 use crate::init::set_init_seed;
@@ -1429,6 +1429,8 @@ fn train_numeric(
     };
     let report = TrainingReport {
         dataset: stamp.dataset,
+        // Отпечаток считается по той самой модели, которая уедет в файл.
+        model: Some(ModelFingerprint::of(&model, nc, &in_norm, &out_norm)),
         schema: schema.clone(),
         stamp: stamp.clone(),
         selection: selection.clone(),
@@ -1721,6 +1723,7 @@ mod tests {
         };
         let report = TrainingReport {
             dataset: identity.dataset,
+            model: None,
             schema,
             stamp: identity,
             selection: Selection::Manual,

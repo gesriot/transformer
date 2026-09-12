@@ -181,6 +181,12 @@ impl NumericModel {
         }
     }
 
+    /// Обучаемые параметры в ФИКСИРОВАННОМ порядке.
+    ///
+    /// Порядок — часть формата checkpoint: секция `params` пишется и читается
+    /// позиционно, и перестановка обхода сломала бы загрузку старых файлов.
+    /// Он же входит в [`crate::ModelFingerprint`], поэтому изменение обхода
+    /// обязано повышать версию отпечатка — об этом напомнит golden-тест.
     pub(crate) fn parameters(&self) -> Vec<Tensor> {
         match self {
             NumericModel::Transformer(m) => m.parameters(),

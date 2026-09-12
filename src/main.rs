@@ -35,10 +35,10 @@ use transformer::{
     save_numeric, sweep_cost, symbolize, validate_numeric, validate_train, CandidateSpec,
     CheckRecord, Dataset, DatasetFingerprint, Delimiter, EvalSchedule, ExportSummary, FeatureSpec,
     FinalRecord, InterpretOverrides, InterpretProfile, InterpretReport, KanConfig, LrSchedule,
-    Metrics, ModelConfig, ModelKind, ModelSchema, Normalizer, NumericConfig, NumericDataset,
-    NumericModel, Phase, PrepareSpec, RunIdentity, SearchObjective, Selection, SplitPlan,
-    SweepAxes, SweepResult, SweepRow, TrainConfig, TrainedModel, TrainingHistory, TrainingReport,
-    TrainingSetup, ValueEncoderConfig, ValueEncoderKind, DEFAULT_FINAL_INIT_SEED,
+    Metrics, ModelConfig, ModelFingerprint, ModelKind, ModelSchema, Normalizer, NumericConfig,
+    NumericDataset, NumericModel, Phase, PrepareSpec, RunIdentity, SearchObjective, Selection,
+    SplitPlan, SweepAxes, SweepResult, SweepRow, TrainConfig, TrainedModel, TrainingHistory,
+    TrainingReport, TrainingSetup, ValueEncoderConfig, ValueEncoderKind, DEFAULT_FINAL_INIT_SEED,
     DEFAULT_SPLIT_SEED,
 };
 use transformer::{diagnostics, interpret, predict};
@@ -800,6 +800,13 @@ fn run_train_flow(
         let report = TrainingReport {
             dataset: DatasetFingerprint::of(dataset.data(), dataset.schema())
                 .unwrap_or_else(|e| fail(&e)),
+            // Отпечаток той самой модели, которая сейчас уедет в файл.
+            model: Some(ModelFingerprint::of(
+                &final_model.model,
+                &nc,
+                &final_model.in_norm,
+                &final_model.out_norm,
+            )),
             schema: dataset.schema().clone(),
             stamp: RunIdentity {
                 dataset: DatasetFingerprint::of(dataset.data(), dataset.schema())
