@@ -1613,12 +1613,12 @@ fn announce_search(source: &str, axes: &SweepAxes) {
 
 fn print_search_row(row: &SweepRow) {
     println!(
-        "  done [{}]: {} -> worst R²={:.5}, aggregate R²={:.5}±{:.5}",
+        "  done [{}]: {} -> worst R²={:.5}, aggregate R²={:.5} ({})",
         row.source.label(),
         row.label,
         row.worst_output_r2_mean,
         row.r2_mean,
-        row.r2_std
+        search_spread_label(row)
     );
 }
 
@@ -1633,14 +1633,28 @@ fn print_search_ranking(result: &SweepResult) {
     for (i, r) in result.rows.iter().enumerate() {
         let mark = if i == 0 { "*" } else { " " };
         println!(
-            "{mark} worst R²={:.5}  aggregate R²={:.5}±{:.5}  nRMSE={}  | {}",
+            "{mark} worst R²={:.5}  aggregate R²={:.5}  nRMSE={}  [{}]  | {}",
             r.worst_output_r2_mean,
             r.r2_mean,
-            r.r2_std,
             optional(r.nrmse_mean, 5),
+            search_spread_label(r),
             r.label
         );
     }
+}
+
+/// Разбросы результата поиска не складываются в одно `±`: seed, folds и
+/// повторы отвечают на разные вопросы. Отсутствующий уровень не печатается,
+/// измеренный ноль остаётся виден.
+fn search_spread_label(row: &SweepRow) -> String {
+    let mut parts = vec![format!("seed σ={:.5}", row.r2_std)];
+    if row.source.k() > 1 {
+        parts.push(format!("fold σ={:.5}", row.r2_std_folds));
+    }
+    if row.source.repeats() > 1 {
+        parts.push(format!("repeat σ={:.5}", row.r2_std_repeats));
+    }
+    parts.join(", ")
 }
 
 /// Оси сетки из флагов: общие для поиска на своих данных и на чёрном ящике.

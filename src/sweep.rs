@@ -700,6 +700,7 @@ fn search_candidates(axes: &SweepAxes) -> Result<(Vec<SearchCandidate>, Vec<Cand
 /// файла: число обучений на кандидата берётся из него — 1 у holdout, k у
 /// K-fold, k × repeats у повторённого.
 pub fn sweep_cost(axes: &SweepAxes, split: SplitPlan) -> Result<SearchCost, String> {
+    split.validate_parameters()?;
     let (candidates, _) = search_candidates(axes)?;
     Ok(search_cost(
         &candidates,
@@ -845,6 +846,18 @@ mod tests {
         assert_eq!(
             repeated.epochs_upper_bound(),
             five.epochs_upper_bound() * DEFAULT_REPEATS
+        );
+
+        let invalid = SplitPlan::RepeatedKFold {
+            k: 5,
+            folds_seed: 1,
+            repeats: 1,
+            test_frac: 0.15,
+            test_seed: 1,
+        };
+        assert!(
+            sweep_cost(&axes, invalid).is_err(),
+            "стоимость невыполнимого плана не должна выглядеть достоверной"
         );
     }
 

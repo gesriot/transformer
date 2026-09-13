@@ -137,6 +137,7 @@ pub use training::{SearchCost, SearchObjective};
 pub use report::{
     CheckRecord, FinalRecord, Selection, TrainingReport, TRAINING_REPORT_VERSION,
     TRAINING_REPORT_VERSION_V1, TRAINING_REPORT_VERSION_V2, TRAINING_REPORT_VERSION_V3,
+    TRAINING_REPORT_VERSION_V4,
 };
 
 // Готовая модель: checkpoint, формулы, прогноз по таблице.

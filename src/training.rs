@@ -515,8 +515,8 @@ pub(crate) struct SearchResults {
 /// Перебрать кандидатов на подготовленном pool и отранжировать их.
 ///
 /// Test сюда не попадает физически: [`SearchPool`] его не содержит. Каждый
-/// кандидат обучается на всех seed и всех folds, свёртка — через
-/// [`aggregate_runs`] (folds внутри seed, затем seeds).
+/// кандидат обучается на всех seed и всех разбиениях pool, свёртка — через
+/// [`aggregate_runs`] (folds внутри повтора, повторы внутри seed, затем seeds).
 pub(crate) fn search(
     dataset: &Dataset,
     pool: &SearchPool,
@@ -541,8 +541,8 @@ pub(crate) fn search(
     // бы один fold имеет константный выход, все строки получили бы `None` и
     // сортировка по NEG_INFINITY молча выбрала бы первую конфигурацию.
     if matches!(plan.objective, SearchObjective::Nrmse) {
-        for fold in 0..pool.n_splits() {
-            let (train, _) = pool.fold(fold)?;
+        for split_index in 0..pool.n_splits() {
+            let (train, _) = pool.fold(split_index)?;
             let scale = TargetScale::of(&train.outputs);
             if let Some(output) = (0..scale.n_outputs())
                 .find(|&output| scale.sigma(output).is_none_or(|sigma| sigma <= 0.0))
@@ -554,7 +554,7 @@ pub(crate) fn search(
                     .map(|column| column.display_name())
                     .unwrap_or_else(|| format!("y{output}"));
                 return Err(format!(
-                    "цель aggregate nRMSE недоступна: выход '{name}' не имеет масштаба на train fold {fold}"
+                    "цель aggregate nRMSE недоступна: выход '{name}' не имеет масштаба на train-разбиении {split_index}"
                 ));
             }
         }
@@ -569,14 +569,14 @@ pub(crate) fn search(
 
         let mut runs = Vec::new();
         for &seed in &plan.seeds {
-            for fold in 0..pool.n_splits() {
+            for split_index in 0..pool.n_splits() {
                 if cancel.load(Ordering::Relaxed) {
                     return Ok(finish(rows, cost, true));
                 }
                 let trained = train_candidate(
                     dataset,
                     pool,
-                    fold,
+                    split_index,
                     &candidate.setup,
                     seed,
                     cancel,
@@ -586,12 +586,12 @@ pub(crate) fn search(
                 if cancel.load(Ordering::Relaxed) {
                     return Ok(finish(rows, cost, true));
                 }
-                let (_, val) = pool.fold(fold)?;
+                let (_, val) = pool.fold(split_index)?;
                 let (metrics, per_output) = evaluate_on(&trained, &val);
                 runs.push(RunEval {
                     metrics,
                     per_output,
-                    origin: pool.run_origin(fold, seed),
+                    origin: pool.run_origin(split_index, seed),
                 });
             }
         }
@@ -660,15 +660,15 @@ fn finish(mut rows: Vec<SearchRow>, cost: SearchCost, cancelled: bool) -> Search
     }
 }
 
-/// Обучить одного кандидата на fold `fold` и снять историю.
+/// Обучить одного кандидата на разбиении `split_index` и снять историю.
 ///
 /// Единственное место, где создаётся и учится модель: нормализаторы строятся по
-/// train ЭТОГО fold, метрики снимаются на его validation.
+/// train ЭТОГО разбиения, метрики снимаются на его validation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn train_candidate(
     dataset: &Dataset,
     pool: &SearchPool,
-    fold: usize,
+    split_index: usize,
     setup: &TrainingSetup,
     init_seed: u64,
     cancel: &AtomicBool,
@@ -676,10 +676,10 @@ pub(crate) fn train_candidate(
     configure_model: &mut dyn FnMut(&NumericModel),
 ) -> Result<TrainedModel, String> {
     setup.validate()?;
-    let (train, val) = pool.fold(fold)?;
+    let (train, val) = pool.fold(split_index)?;
     let specs = dataset.schema().feature_specs();
     let (in_norm, out_norm) = fit_normalizers(&train, &specs);
-    // Масштаб берётся с train ЭТОГО fold: нормализовать ошибку дисперсией того
+    // Масштаб берётся с train ЭТОГО разбиения: нормализовать ошибку дисперсией того
     // же набора, на котором её меряют, нельзя.
     let scale = TargetScale::of(&train.outputs);
 
@@ -801,31 +801,31 @@ pub fn check_candidate(
     setup.validate()?;
     let prepared = split.prepare(dataset.data())?;
     let pool = prepared.search;
-    let folds = pool.n_splits();
+    let splits = pool.n_splits();
     let init_seed = setup.train.seed;
 
-    let mut runs: Vec<RunEval> = Vec::with_capacity(folds);
-    let mut histories = Vec::with_capacity(folds);
+    let mut runs: Vec<RunEval> = Vec::with_capacity(splits);
+    let mut histories = Vec::with_capacity(splits);
     let mut model = None;
-    for fold in 0..folds {
+    for split_index in 0..splits {
         if cancel.load(Ordering::Relaxed) {
             return Ok(None);
         }
         let mut trained = train_candidate(
             dataset,
             &pool,
-            fold,
+            split_index,
             setup,
             init_seed,
             cancel,
-            &mut |point| on_point(fold, point),
+            &mut |point| on_point(split_index, point),
             configure_model,
         )?;
         if cancel.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        let (train, val) = pool.fold(fold)?;
-        post_train(fold, &mut trained, &train, Some(&val));
+        let (train, val) = pool.fold(split_index)?;
+        post_train(split_index, &mut trained, &train, Some(&val));
         // Конвейер мог быть прерван внутри хука: тогда модель недоучена, и
         // мерить её нельзя — оценка описывала бы полуфабрикат.
         if cancel.load(Ordering::Relaxed) {
@@ -835,11 +835,12 @@ pub fn check_candidate(
         runs.push(RunEval {
             metrics,
             per_output,
-            origin: pool.run_origin(fold, init_seed),
+            origin: pool.run_origin(split_index, init_seed),
         });
         histories.push(trained.history.clone());
-        // Модель отдаём только когда fold один: тогда она и есть оценка.
-        if folds == 1 {
+        // Модель отдаём только когда разбиение одно: тогда она и есть
+        // оценка.
+        if splits == 1 {
             model = Some(trained);
         }
     }
@@ -1568,6 +1569,59 @@ mod tests {
         assert!(results.rows[0].score >= results.rows[1].score);
         // Индекс кандидата переживает ранжирование.
         assert_eq!(results.rows[0].candidate, 1);
+    }
+
+    #[test]
+    fn repeated_search_runs_the_full_seed_repeat_fold_product() {
+        let ds = dataset(96);
+        let never = AtomicBool::new(false);
+        let prepared = SplitPlan::RepeatedKFold {
+            k: 2,
+            folds_seed: 7,
+            repeats: 2,
+            test_frac: 0.2,
+            test_seed: 11,
+        }
+        .prepare(ds.data())
+        .unwrap();
+        let plan = SearchPlan {
+            seeds: vec![3, 5],
+            objective: SearchObjective::default(),
+        };
+
+        let results = search(
+            &ds,
+            &prepared.search,
+            &[candidate("one", 1)],
+            &plan,
+            &never,
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(results.cost.runs, 2 * 2 * 2);
+        assert_eq!(results.rows.len(), 1);
+        let row = &results.rows[0];
+        assert_eq!(row.runs.len(), 2 * 2 * 2);
+        assert_eq!(row.eval.origin.folds, 2);
+        assert_eq!(row.eval.origin.repeats, 2);
+        assert_eq!(row.eval.origin.init_seeds, plan.seeds);
+
+        let origins: BTreeSet<_> = row
+            .runs
+            .iter()
+            .map(|run| (run.origin.init_seed, run.origin.repeat, run.origin.fold))
+            .collect();
+        let expected: BTreeSet<_> = plan
+            .seeds
+            .iter()
+            .flat_map(|&seed| {
+                (0..2).flat_map(move |repeat| {
+                    (0..2).map(move |fold| (seed, Some(repeat), Some(fold)))
+                })
+            })
+            .collect();
+        assert_eq!(origins, expected);
     }
 
     #[test]

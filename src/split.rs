@@ -39,7 +39,9 @@ pub const REPEAT_SEED_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Seed разбиения pool на повторе `repeat`. Правило входит в происхождение:
 /// без него по сохранённому `folds_seed` нельзя восстановить, какие именно
-/// разбиения проверялись.
+/// разбиения проверялись. Для тега [`SplitPlan::RepeatedKFold`] это часть
+/// формата и меняться не должно; новому правилу понадобится новый вариант
+/// плана.
 pub fn repeat_folds_seed(folds_seed: u64, repeat: usize) -> u64 {
     folds_seed.wrapping_add(REPEAT_SEED_STEP.wrapping_mul(repeat as u64))
 }
@@ -147,6 +149,37 @@ impl SplitPlan {
     /// Проверка плана вместе с числом строк: доли могут быть корректны, а
     /// разбиение при этом давать пустую часть после округления.
     pub fn validate(&self, n_rows: usize) -> Result<(), String> {
+        self.validate_parameters()?;
+        match *self {
+            SplitPlan::Holdout {
+                train_frac,
+                val_frac,
+                ..
+            } => {
+                let (n_train, n_val, n_test) = holdout_counts(n_rows, train_frac, val_frac);
+                if n_train == 0 || n_val == 0 || n_test == 0 {
+                    return Err(format!(
+                        "{n_rows} строк при {:.0}/{:.0}/{:.0} дают train {n_train}, validation \
+                         {n_val}, test {n_test}: каждая часть должна быть непустой",
+                        train_frac * 100.0,
+                        val_frac * 100.0,
+                        (1.0 - train_frac - val_frac) * 100.0
+                    ));
+                }
+                Ok(())
+            }
+            SplitPlan::KFold { k, test_frac, .. }
+            | SplitPlan::RepeatedKFold { k, test_frac, .. } => {
+                validate_cv_rows(n_rows, k, test_frac)
+            }
+        }
+    }
+
+    /// Проверка параметров, не зависящих от конкретного числа строк.
+    ///
+    /// Нужна до чтения данных: оценка стоимости и checkpoint не должны
+    /// принимать план, который затем невозможно выполнить.
+    pub(crate) fn validate_parameters(&self) -> Result<(), String> {
         match *self {
             SplitPlan::Holdout {
                 train_frac,
@@ -168,19 +201,9 @@ impl SplitPlan {
                         train_frac + val_frac
                     ));
                 }
-                let (n_train, n_val, n_test) = holdout_counts(n_rows, train_frac, val_frac);
-                if n_train == 0 || n_val == 0 || n_test == 0 {
-                    return Err(format!(
-                        "{n_rows} строк при {:.0}/{:.0}/{:.0} дают train {n_train}, validation \
-                         {n_val}, test {n_test}: каждая часть должна быть непустой",
-                        train_frac * 100.0,
-                        val_frac * 100.0,
-                        (1.0 - train_frac - val_frac) * 100.0
-                    ));
-                }
                 Ok(())
             }
-            SplitPlan::KFold { k, test_frac, .. } => validate_cv(n_rows, k, test_frac),
+            SplitPlan::KFold { k, test_frac, .. } => validate_cv_parameters(k, test_frac),
             SplitPlan::RepeatedKFold {
                 k,
                 repeats,
@@ -192,7 +215,10 @@ impl SplitPlan {
                         "повторов должно быть >= 2: один повтор — это обычный K-fold".to_string(),
                     );
                 }
-                validate_cv(n_rows, k, test_frac)
+                k.checked_mul(repeats).ok_or_else(|| {
+                    format!("число разбиений k × repeats ({k} × {repeats}) не помещается в usize")
+                })?;
+                validate_cv_parameters(k, test_frac)
             }
         }
     }
@@ -291,7 +317,11 @@ impl SplitPlan {
         let pool = data.gather(&idx[n_test..]);
 
         let m = pool.len();
-        let mut splits = Vec::with_capacity(k * repeats.unwrap_or(1));
+        // Переполнение отвергнуто validate_parameters до входа сюда.
+        let mut splits = Vec::with_capacity(
+            k.checked_mul(repeats.unwrap_or(1))
+                .expect("k × repeats проверено"),
+        );
         for repeat in 0..repeats.unwrap_or(1) {
             // Индексы внутри pool: перемешиваем отдельным seed, режем на k
             // частей, отличающихся не больше чем на строку.
@@ -339,7 +369,7 @@ impl SplitPlan {
 
 /// Проверка CV-части плана: она одинакова у обычного и повторённого K-fold,
 /// потому что повторы меняют только разбиение pool.
-fn validate_cv(n_rows: usize, k: usize, test_frac: f32) -> Result<(), String> {
+fn validate_cv_parameters(k: usize, test_frac: f32) -> Result<(), String> {
     if !test_frac.is_finite() {
         return Err("test_frac должен быть конечным".to_string());
     }
@@ -349,6 +379,11 @@ fn validate_cv(n_rows: usize, k: usize, test_frac: f32) -> Result<(), String> {
     if test_frac <= 0.0 || test_frac >= 1.0 {
         return Err("test_frac должен быть в (0, 1)".to_string());
     }
+    Ok(())
+}
+
+/// Проверка размеров CV после того, как параметры уже проверены.
+fn validate_cv_rows(n_rows: usize, k: usize, test_frac: f32) -> Result<(), String> {
     let n_test = (n_rows as f32 * test_frac).round() as usize;
     let n_pool = n_rows.saturating_sub(n_test);
     if n_test == 0 {
@@ -772,6 +807,19 @@ mod tests {
         };
         let err = plan.validate(100).unwrap_err();
         assert!(err.contains("повторов"), "текст ошибки: {err}");
+    }
+
+    #[test]
+    fn an_overflowing_number_of_splits_is_rejected_before_allocation() {
+        let plan = SplitPlan::RepeatedKFold {
+            k: 2,
+            folds_seed: 1,
+            repeats: usize::MAX,
+            test_frac: 0.15,
+            test_seed: 1,
+        };
+        let err = plan.validate(100).unwrap_err();
+        assert!(err.contains("не помещается"), "текст ошибки: {err}");
     }
 
     #[test]

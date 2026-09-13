@@ -355,6 +355,22 @@ fn objective_display_score(objective: SweepObjective, row: &SweepRow) -> Option<
     }
 }
 
+/// Три независимых источника разброса в компактной ячейке поиска. Черта —
+/// уровень отсутствует в протоколе; измеренный ноль остаётся числом.
+fn search_spread_cell(row: &SweepRow) -> String {
+    let fold = if row.source.k() > 1 {
+        format!("{:.4}", row.r2_std_folds)
+    } else {
+        "—".to_string()
+    };
+    let repeat = if row.source.repeats() > 1 {
+        format!("{:.4}", row.r2_std_repeats)
+    } else {
+        "—".to_string()
+    };
+    format!("{:.4}/{fold}/{repeat}", row.r2_std)
+}
+
 impl App {
     pub(super) fn ui_train(&mut self, ui: &mut egui::Ui) {
         ui.heading("Обучение");
@@ -875,7 +891,7 @@ impl App {
             .max_height(300.0)
             .show(ui, |ui| {
                 egui::Grid::new("search_rows")
-                    .num_columns(7)
+                    .num_columns(8)
                     .striped(true)
                     .show(ui, |ui| {
                         ui.label("#");
@@ -884,6 +900,7 @@ impl App {
                         ui.label("worst y");
                         ui.label("mean y");
                         ui.label("aggr nRMSE");
+                        ui.label("σ seed/fold/repeat");
                         ui.label("конфигурация");
                         ui.end_row();
                         for (i, row) in self.search_rows.iter().enumerate() {
@@ -905,6 +922,9 @@ impl App {
                             ui.label(format!("{:.5}", row.worst_output_r2_mean));
                             ui.label(format!("{:.5}", row.mean_output_r2_mean));
                             ui.label(optional(row.nrmse_mean, 5));
+                            ui.label(search_spread_cell(row)).on_hover_text(
+                                "Std R²: между seed / между folds внутри разбиения / между повторами",
+                            );
                             ui.label(&row.label);
                             ui.end_row();
                         }
@@ -1224,7 +1244,12 @@ impl App {
                 Some(&run.eval.per_output),
                 outputs,
             );
-            show_spread(ui, run.eval.r2_std_folds, run.eval.r2_std_repeats);
+            show_spread(
+                ui,
+                run.source(),
+                run.eval.r2_std_folds,
+                run.eval.r2_std_repeats,
+            );
             if !current {
                 ui.colored_label(
                     egui::Color32::from_rgb(200, 120, 0),

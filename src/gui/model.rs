@@ -4,7 +4,7 @@ use super::messages::Command;
 use super::messages::ModelOrigin;
 use super::session::{split_plan_label, App, KAN_CURVE_SAMPLES};
 use crate::interpret::InterpretReport;
-use crate::metrics::Metrics;
+use crate::metrics::{EvalSource, Metrics};
 use crate::numeric_model::ModelKind;
 use crate::report::TrainingReport;
 use crate::schema::ModelSchema;
@@ -27,7 +27,7 @@ fn report_metrics(ui: &mut egui::Ui, report: &TrainingReport, info: &ModelInfo) 
             split_plan_label(report.stamp.split),
             report.stamp.candidate.train.seed
         ));
-        show_spread(ui, check.r2_std_folds, check.r2_std_repeats);
+        show_spread(ui, check.source, check.r2_std_folds, check.r2_std_repeats);
     }
     match &report.final_run {
         Some(final_run) => {
@@ -219,7 +219,12 @@ impl App {
             ));
             // У CV одного среднего мало: одинаковое среднее при разном разбросе
             // между folds означает разную надёжность вывода.
-            show_spread(ui, run.eval.r2_std_folds, run.eval.r2_std_repeats);
+            show_spread(
+                ui,
+                run.source(),
+                run.eval.r2_std_folds,
+                run.eval.r2_std_repeats,
+            );
         }
         if let Some(final_eval) = disclosed.map(|d| &d.eval) {
             show_metrics(
@@ -667,16 +672,25 @@ fn output_label(column: &crate::schema::Column) -> String {
 ///
 /// Два числа, а не одно: разброс между folds означает зависимость от того,
 /// какие строки попали в validation, а разброс между повторами — зависимость
-/// от самой нарезки. Нули не показываются: у holdout и у CV без повторов
-/// показывать нечего.
-pub(super) fn show_spread(ui: &mut egui::Ui, r2_std_folds: f32, r2_std_repeats: f32) {
-    if r2_std_folds > 0.0 {
-        ui.label(format!("Разброс R² между folds: ±{r2_std_folds:.5}"));
-    }
-    if r2_std_repeats > 0.0 {
-        ui.label(format!(
-            "Разброс R² между повторами разбиения: ±{r2_std_repeats:.5}"
-        ));
+/// от самой нарезки. У измеренного нуля тоже есть смысл: он означает
+/// устойчивость, поэтому скрываем только уровни, которых в протоколе не было.
+pub(super) fn show_spread(
+    ui: &mut egui::Ui,
+    source: EvalSource,
+    r2_std_folds: f32,
+    r2_std_repeats: f32,
+) {
+    match source {
+        EvalSource::Validation | EvalSource::Test => {}
+        EvalSource::Cv { .. } => {
+            ui.label(format!("Разброс R² между folds: σ={r2_std_folds:.5}"));
+        }
+        EvalSource::RepeatedCv { .. } => {
+            ui.label(format!("Разброс R² между folds: σ={r2_std_folds:.5}"));
+            ui.label(format!(
+                "Разброс R² между повторами разбиения: σ={r2_std_repeats:.5}"
+            ));
+        }
     }
 }
 

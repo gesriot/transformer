@@ -159,7 +159,8 @@ pub(super) fn split_plan_label(plan: SplitPlan) -> String {
             test_frac,
             test_seed,
         } => format!(
-            "{k}-fold × {repeats} повторов, test {:.0}%, folds seed {folds_seed} (повтор r берёт              seed + r × {REPEAT_SEED_STEP:#x}), test seed {test_seed}",
+            "{k}-fold × {repeats} повторов, test {:.0}%, folds seed {folds_seed} \
+             (seed_r = folds_seed + r × {REPEAT_SEED_STEP:#x}, mod 2^64), test seed {test_seed}",
             test_frac * 100.0
         ),
     }

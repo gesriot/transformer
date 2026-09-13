@@ -24,6 +24,7 @@ use crate::numeric_model::{KanConfig, ModelKind, NumericConfig, NumericModel};
 use crate::report::{
     CheckRecord, FinalRecord, Selection, TrainingReport, TRAINING_REPORT_VERSION,
     TRAINING_REPORT_VERSION_V1, TRAINING_REPORT_VERSION_V2, TRAINING_REPORT_VERSION_V3,
+    TRAINING_REPORT_VERSION_V4,
 };
 use crate::schema::{Column, ColumnRole, ColumnType, ModelSchema};
 use crate::split::{FinalEval, FinalOrigin, SplitPlan};
@@ -1063,6 +1064,26 @@ fn build_report_for_version(report: &TrainingReport, version: u32) -> io::Result
             "training_report: запись неизвестной версии {version}"
         )));
     }
+    // v1-v3 не знали ни нового вида SplitPlan, ни нового EvalSource. Даже при
+    // нулевом repeat std такой отчёт нельзя выдавать за старую версию: старый
+    // reader не сумеет разобрать его теги.
+    let uses_repeated_cv = matches!(report.stamp.split, SplitPlan::RepeatedKFold { .. })
+        || report.check.as_ref().is_some_and(|check| {
+            matches!(check.source, EvalSource::RepeatedCv { .. })
+                || check
+                    .histories
+                    .iter()
+                    .any(|history| matches!(history.source, EvalSource::RepeatedCv { .. }))
+        })
+        || report.final_run.as_ref().is_some_and(|final_run| {
+            matches!(final_run.history.source, EvalSource::RepeatedCv { .. })
+                || matches!(final_run.eval.origin.plan, SplitPlan::RepeatedKFold { .. })
+        });
+    if version < TRAINING_REPORT_VERSION_V4 && uses_repeated_cv {
+        return Err(invalid(format!(
+            "training_report v{version} не умеет хранить повторённую CV"
+        )));
+    }
     let mut p = Vec::new();
     // Один тип представляет обе прочитанные версии, но формат остаётся
     // строгим: v2/v3 всегда связаны с моделью, а неподтверждённый отчёт остаётся
@@ -1344,7 +1365,7 @@ fn build_split(buf: &mut Vec<u8>, split: SplitPlan) {
 }
 
 fn read_split(r: &mut &[u8]) -> io::Result<SplitPlan> {
-    match r_u32(r)? {
+    let split = match r_u32(r)? {
         0 => Ok(SplitPlan::Holdout {
             train_frac: r_f32(r)?,
             val_frac: r_f32(r)?,
@@ -1365,7 +1386,11 @@ fn read_split(r: &mut &[u8]) -> io::Result<SplitPlan> {
             test_seed: r_u64(r)?,
         }),
         other => Err(invalid(format!("split: неизвестный вид разбиения {other}"))),
-    }
+    }?;
+    split
+        .validate_parameters()
+        .map_err(|error| invalid(format!("split: {error}")))?;
+    Ok(split)
 }
 
 fn build_train_config(buf: &mut Vec<u8>, cfg: &TrainConfig) {
@@ -1772,7 +1797,7 @@ fn build_check(check: &CheckRecord, version: u32) -> io::Result<Vec<u8>> {
     build_source(&mut p, check.source);
     build_metrics(&mut p, &check.metrics, version)?;
     p.extend_from_slice(&check.r2_std_folds.to_le_bytes());
-    if version >= TRAINING_REPORT_VERSION {
+    if version >= TRAINING_REPORT_VERSION_V4 {
         p.extend_from_slice(&check.r2_std_repeats.to_le_bytes());
     } else if check.r2_std_repeats != 0.0 {
         // Старая раскладка этого числа не знает, а молча потерять разброс
@@ -1807,7 +1832,7 @@ fn read_check(bytes: &[u8], version: u32) -> io::Result<CheckRecord> {
     let r2_std_folds = r_f32(&mut r)?;
     // До v4 повторов не существовало: ноль здесь — не измерение, а отсутствие
     // самого понятия, и для планов без повторов это одно и то же.
-    let r2_std_repeats = if version >= TRAINING_REPORT_VERSION {
+    let r2_std_repeats = if version >= TRAINING_REPORT_VERSION_V4 {
         r_f32(&mut r)?
     } else {
         0.0
@@ -2373,6 +2398,29 @@ mod tests {
         assert!(build_report_for_version(&report, TRAINING_REPORT_VERSION).is_ok());
     }
 
+    /// Даже нулевой repeat std не превращает повторённый протокол в v3: сама
+    /// v3 не знала тегов RepeatedKFold/RepeatedCv и старым reader-ом такой
+    /// поток разобран быть не может.
+    #[test]
+    fn an_old_report_version_refuses_repeated_cv_even_with_zero_spread() {
+        let nc = numeric_cfg(ModelKind::Mlp);
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let model_fp = ModelFingerprint::from_bytes([7; 32]);
+        let mut report = sample_report(&nc, &schema, Some(model_fp));
+        report.stamp.split = SplitPlan::RepeatedKFold {
+            k: 2,
+            folds_seed: 1,
+            repeats: 2,
+            test_frac: 0.2,
+            test_seed: 1,
+        };
+        report.check.as_mut().unwrap().source = EvalSource::RepeatedCv { k: 2, repeats: 2 };
+        report.check.as_mut().unwrap().r2_std_repeats = 0.0;
+
+        let err = build_report_for_version(&report, TRAINING_REPORT_VERSION_V3).unwrap_err();
+        assert!(err.to_string().contains("повторённую CV"), "{err}");
+    }
+
     /// Противоречивый отчёт не записывается: рядом с моделью он выглядел бы
     /// достоверным происхождением, хотя описывает что-то другое.
     #[test]
@@ -2475,6 +2523,19 @@ mod tests {
             .validate_against(model_fp, &nc, &schema, Some(&profile))
             .unwrap_err()
             .contains("история проверки подписана"));
+
+        // История refit тоже не может приписать себе другой протокол.
+        let mut wrong_final_history = good.clone();
+        wrong_final_history
+            .final_run
+            .as_mut()
+            .unwrap()
+            .history
+            .source = EvalSource::Validation;
+        assert!(wrong_final_history
+            .validate_against(model_fp, &nc, &schema, Some(&profile))
+            .unwrap_err()
+            .contains("история финального переобучения"));
 
         // Refit не мог мерить validation: он на ней учился.
         let mut refit_measured_validation = good.clone();

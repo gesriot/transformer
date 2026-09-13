@@ -37,7 +37,7 @@ use std::collections::BTreeSet;
 /// читаются как есть: повысить их молча значило бы утверждать то, чего та
 /// версия не наблюдала — ни связи с весами, ни масштаба train, по которому
 /// только и считаются nMAE и nRMSE, ни разброса между разбиениями.
-pub const TRAINING_REPORT_VERSION: u32 = 4;
+pub const TRAINING_REPORT_VERSION: u32 = TRAINING_REPORT_VERSION_V4;
 
 /// Первая версия отчёта — без отпечатка модели.
 pub const TRAINING_REPORT_VERSION_V1: u32 = 1;
@@ -47,6 +47,12 @@ pub const TRAINING_REPORT_VERSION_V2: u32 = 2;
 
 /// Третья версия — нормализованные метрики, но без разброса между повторами.
 pub const TRAINING_REPORT_VERSION_V3: u32 = 3;
+
+/// Четвёртая версия — повторённая CV и отдельный разброс между повторами.
+///
+/// Именованная граница нужна reader-у и writer-у: сравнение с подвижной
+/// [`TRAINING_REPORT_VERSION`] сломало бы чтение v4 при появлении v5.
+pub const TRAINING_REPORT_VERSION_V4: u32 = 4;
 
 /// Как была выбрана конфигурация.
 #[derive(Clone, Debug, PartialEq)]
@@ -145,6 +151,10 @@ impl TrainingReport {
         if self.dataset != self.stamp.dataset {
             return Err("отчёт и его личность запуска описывают разные данные".to_string());
         }
+        self.stamp
+            .split
+            .validate_parameters()
+            .map_err(|error| format!("некорректное разбиение отчёта: {error}"))?;
         if self.schema != *schema {
             return Err("схема отчёта не совпадает со схемой checkpoint".to_string());
         }
@@ -234,6 +244,13 @@ impl TrainingReport {
             }
             if final_run.eval.origin.final_init_seed != self.stamp.final_init_seed {
                 return Err("final seed в замере не совпадает с личностью запуска".to_string());
+            }
+            if final_run.history.source != self.stamp.eval_source() {
+                return Err(format!(
+                    "история финального переобучения подписана как {}, а разбиение даёт {}",
+                    final_run.history.source.label(),
+                    self.stamp.eval_source().label()
+                ));
             }
             if final_run.interpret.is_some() != self.stamp.candidate.interpret.is_some() {
                 return Err(
