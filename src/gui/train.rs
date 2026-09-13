@@ -7,7 +7,7 @@ use crate::config::ModelConfig;
 use crate::encoders::{ValueEncoderConfig, ValueEncoderKind};
 use crate::interpret::{self, InterpretOverrides, InterpretProfile};
 use crate::lifecycle::{CandidateSpec, RunIdentity};
-use crate::metrics::EvalSource;
+use crate::metrics::{optional, optional_percent, EvalSource};
 use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
 use crate::report::Selection;
 use crate::split::DEFAULT_FINAL_INIT_SEED;
@@ -348,10 +348,11 @@ fn objective_label(objective: SweepObjective) -> &'static str {
     }
 }
 
-fn objective_display_score(objective: SweepObjective, row: &SweepRow) -> f32 {
+/// Значение цели так, как его показывают: у nRMSE оно может отсутствовать.
+fn objective_display_score(objective: SweepObjective, row: &SweepRow) -> Option<f32> {
     match objective {
         SweepObjective::Nrmse => row.nrmse_mean,
-        _ => sweep::row_score(objective, row),
+        _ => Some(sweep::row_score(objective, row)),
     }
 }
 
@@ -901,12 +902,12 @@ impl App {
                             {
                                 selected = Some(i);
                             }
-                            ui.label(format!("{:.5}", objective_display_score(objective, row)));
+                            ui.label(optional(objective_display_score(objective, row), 5));
                             ui.label(format!("{:.5}", row.r2_mean));
                             ui.label(format!("{:.5}", row.worst_output_r2_mean));
                             ui.label(format!("{:.5}", row.mean_output_r2_mean));
-                            ui.label(format!("{:.5}", row.nrmse_mean));
-                            ui.label(format!("{:.1}%", row.rel_mean * 100.0));
+                            ui.label(optional(row.nrmse_mean, 5));
+                            ui.label(optional_percent(row.rel_mean, 1));
                             ui.label(&row.label);
                             ui.end_row();
                         }
@@ -1220,7 +1221,7 @@ impl App {
                 "{source}: RMSE={:.5}   MAE={:.5}   rel.error={:.2}%   R²={:.5}",
                 m.rmse,
                 m.mae,
-                m.rel_error * 100.0,
+                optional_percent(m.rel_error, 2),
                 m.r2
             ));
             if run.eval.r2_std_folds > 0.0 {
@@ -1281,11 +1282,11 @@ impl App {
             };
             ui.label(format!(
                 "{prefix} ({} строк, единственный замер): RMSE={:.5}   MAE={:.5}   \
-                 rel.error={:.2}%   R²={:.5}",
+                 nMAE={}   R²={:.5}",
                 f.origin.test_rows,
                 f.metrics.rmse,
                 f.metrics.mae,
-                f.metrics.rel_error * 100.0,
+                optional(f.metrics.nmae, 5),
                 f.metrics.r2
             ));
             match (same_dataset, current) {

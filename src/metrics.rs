@@ -1,20 +1,96 @@
 //! Метрики регрессии. Считаются в денормализованных единицах.
-//! Относительная ошибка — основная для расчётов; MSE недостаточно.
+//!
+//! Нормализованные метрики (`nmae`, `nrmse`) делятся на масштаб ОБУЧАЮЩИХ
+//! таргетов, а не того набора, на котором меряют. Иначе одна и та же модель на
+//! узком validation выглядела бы хуже, чем на широком, хотя ошибка та же.
+//!
+//! Относительная ошибка необязательна: возле нуля она не имеет смысла, и
+//! честнее сказать «неприменимо», чем показать сотни миллионов процентов.
 
 use ndarray::{Array2, Axis};
 use std::collections::BTreeSet;
 
-#[derive(Debug, Clone)]
+/// Насколько target должен быть меньше масштаба, чтобы относительная ошибка
+/// потеряла смысл.
+const NEAR_ZERO_FRACTION: f32 = 1e-3;
+
+/// Масштаб каждого выхода по обучающим таргетам.
+///
+/// `None` у выхода означает, что на train он константен: делить на такой
+/// «масштаб» нельзя, и нормализованных метрик у него не существует.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TargetScale {
+    per_output: Vec<Option<f32>>,
+}
+
+impl TargetScale {
+    /// Посчитать масштаб по обучающим таргетам — σ каждого выхода.
+    pub fn of(train_targets: &Array2<f32>) -> Self {
+        let n = train_targets.nrows() as f32;
+        let per_output = train_targets
+            .axis_iter(Axis(1))
+            .map(|col| {
+                if n < 2.0 {
+                    return None;
+                }
+                let mean = col.sum() / n;
+                let var = col.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
+                let sigma = var.sqrt();
+                // Константный выход: масштаба нет, а не «почти ноль».
+                (sigma.is_finite() && sigma > 0.0).then_some(sigma)
+            })
+            .collect();
+        Self { per_output }
+    }
+
+    /// Масштаб, заданный напрямую (чтение сохранённых отчётов, тесты).
+    pub fn from_sigmas(per_output: Vec<Option<f32>>) -> Self {
+        Self { per_output }
+    }
+
+    /// Масштаб неизвестен: нормализованные метрики и относительная ошибка
+    /// просто не определены. Для мест, где нужен только R².
+    pub fn unknown(n_outputs: usize) -> Self {
+        Self {
+            per_output: vec![None; n_outputs],
+        }
+    }
+
+    pub fn n_outputs(&self) -> usize {
+        self.per_output.len()
+    }
+
+    pub fn sigma(&self, output: usize) -> Option<f32> {
+        self.per_output.get(output).copied().flatten()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Metrics {
     pub rmse: f32,
     pub mae: f32,
-    /// Средняя относительная ошибка `|pred - target| / (|target| + eps)`.
-    pub rel_error: f32,
+    /// Средняя относительная ошибка `|pred - target| / |target|`.
+    ///
+    /// `None`, если хотя бы один target проходит около нуля: там она не
+    /// описывает качество, а описывает близость знаменателя к нулю.
+    pub rel_error: Option<f32>,
     /// Коэффициент детерминации R² (доля объяснённой дисперсии).
     pub r2: f32,
+    /// `MAE / σ_train`. `None`, если масштаба нет.
+    pub nmae: Option<f32>,
+    /// `RMSE / σ_train`. `None`, если масштаба нет.
+    ///
+    /// Нормализуется тем же знаменателем, что и `nmae`: две нормализованные
+    /// метрики с разными знаменателями рядом несравнимы.
+    pub nrmse: Option<f32>,
 }
 
-pub fn evaluate(pred: &Array2<f32>, target: &Array2<f32>) -> Metrics {
+/// Метрики по всем выходам сразу.
+///
+/// Нормализованные величины — среднее по выходам от их собственных
+/// нормализованных значений: у выходов разный масштаб, и общий знаменатель
+/// означал бы, что ошибку крупного выхода меряют мелким.
+pub fn evaluate(pred: &Array2<f32>, target: &Array2<f32>, scale: &TargetScale) -> Metrics {
     assert_eq!(
         pred.dim(),
         target.dim(),
@@ -23,21 +99,19 @@ pub fn evaluate(pred: &Array2<f32>, target: &Array2<f32>) -> Metrics {
     let n = pred.len() as f32;
     assert!(n > 0.0, "пустые данные для метрик");
 
+    let per_output = evaluate_per_output(pred, target, scale);
     let mut se = 0.0;
     let mut ae = 0.0;
-    let mut rel = 0.0;
     for (p, t) in pred.iter().zip(target.iter()) {
         let d = p - t;
         se += d * d;
         ae += d.abs();
-        rel += d.abs() / (t.abs() + 1e-8);
     }
 
     let mean = target.iter().sum::<f32>() / n;
     let ss_tot: f32 = target.iter().map(|t| (t - mean) * (t - mean)).sum();
-    let ss_res = se;
     let r2 = if ss_tot > 1e-12 {
-        1.0 - ss_res / ss_tot
+        1.0 - se / ss_tot
     } else {
         0.0
     };
@@ -45,8 +119,41 @@ pub fn evaluate(pred: &Array2<f32>, target: &Array2<f32>) -> Metrics {
     Metrics {
         rmse: (se / n).sqrt(),
         mae: ae / n,
-        rel_error: rel / n,
+        rel_error: mean_of_all(per_output.iter().map(|m| m.rel_error)),
         r2,
+        nmae: mean_of_all(per_output.iter().map(|m| m.nmae)),
+        nrmse: mean_of_all(per_output.iter().map(|m| m.nrmse)),
+    }
+}
+
+/// Среднее, определённое только когда определены ВСЕ слагаемые: иначе «среднее
+/// по части выходов» выдавалось бы за метрику всей модели.
+fn mean_of_all(values: impl Iterator<Item = Option<f32>>) -> Option<f32> {
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for value in values {
+        sum += value?;
+        count += 1;
+    }
+    (count > 0).then(|| sum / count as f32)
+}
+
+/// Необязательная величина в тексте: «N/A» вместо выдуманного числа.
+///
+/// Ноль на месте «неизвестно» читался бы как отличный результат, поэтому
+/// подставлять его нельзя.
+pub fn optional(value: Option<f32>, digits: usize) -> String {
+    match value {
+        Some(v) => format!("{v:.digits$}"),
+        None => "N/A".to_string(),
+    }
+}
+
+/// Необязательная величина в процентах.
+pub fn optional_percent(value: Option<f32>, digits: usize) -> String {
+    match value {
+        Some(v) => format!("{:.digits$}%", v * 100.0),
+        None => "N/A".to_string(),
     }
 }
 
@@ -111,13 +218,19 @@ pub(crate) struct ConfigEval {
     pub origin: ConfigOrigin,
 }
 
+/// Среднее по прогонам.
+///
+/// Нормализованные метрики усредняются как готовые значения: выводить их из
+/// усреднённых MAE или R² нельзя — у каждого fold свой масштаб train.
 fn mean_metrics(items: &[Metrics]) -> Metrics {
     let n = items.len() as f32;
     Metrics {
         rmse: items.iter().map(|m| m.rmse).sum::<f32>() / n,
         mae: items.iter().map(|m| m.mae).sum::<f32>() / n,
-        rel_error: items.iter().map(|m| m.rel_error).sum::<f32>() / n,
+        rel_error: mean_of_all(items.iter().map(|m| m.rel_error)),
         r2: items.iter().map(|m| m.r2).sum::<f32>() / n,
+        nmae: mean_of_all(items.iter().map(|m| m.nmae)),
+        nrmse: mean_of_all(items.iter().map(|m| m.nrmse)),
     }
 }
 
@@ -258,7 +371,15 @@ pub(crate) fn aggregate_runs(
 /// Метрики отдельно для каждого выхода (столбца). Агрегатный `evaluate`
 /// считает R² по всем выходам сразу, что у мультимасштабных целей скрывает
 /// слабый выход — per-output это вскрывает.
-pub(crate) fn evaluate_per_output(pred: &Array2<f32>, target: &Array2<f32>) -> Vec<Metrics> {
+/// Метрики каждого выхода отдельно.
+///
+/// Здесь и считается вся «поштучная» арифметика: нормализация масштабом своего
+/// выхода и решение, определена ли относительная ошибка.
+pub(crate) fn evaluate_per_output(
+    pred: &Array2<f32>,
+    target: &Array2<f32>,
+    scale: &TargetScale,
+) -> Vec<Metrics> {
     assert_eq!(
         pred.dim(),
         target.dim(),
@@ -266,9 +387,43 @@ pub(crate) fn evaluate_per_output(pred: &Array2<f32>, target: &Array2<f32>) -> V
     );
     (0..pred.ncols())
         .map(|j| {
-            let p = pred.column(j).to_owned().insert_axis(Axis(1));
-            let t = target.column(j).to_owned().insert_axis(Axis(1));
-            evaluate(&p, &t)
+            let p = pred.column(j);
+            let t = target.column(j);
+            let n = p.len() as f32;
+            let mut se = 0.0;
+            let mut ae = 0.0;
+            let mut rel = 0.0;
+            for (p, t) in p.iter().zip(t.iter()) {
+                let d = p - t;
+                se += d * d;
+                ae += d.abs();
+                rel += d.abs() / t.abs();
+            }
+            let mean = t.sum() / n;
+            let ss_tot: f32 = t.iter().map(|v| (v - mean) * (v - mean)).sum();
+            let r2 = if ss_tot > 1e-12 {
+                1.0 - se / ss_tot
+            } else {
+                0.0
+            };
+            let rmse = (se / n).sqrt();
+            let mae = ae / n;
+            let sigma = scale.sigma(j);
+            // Возле нуля относительная ошибка описывает знаменатель, а не
+            // качество: тогда её нет вовсе. «Около нуля» — относительно
+            // масштаба обучения, а не абсолютной константы.
+            let rel_error = sigma.and_then(|sigma| {
+                let near_zero = t.iter().any(|v| v.abs() <= NEAR_ZERO_FRACTION * sigma);
+                (!near_zero && rel.is_finite()).then(|| rel / n)
+            });
+            Metrics {
+                rmse,
+                mae,
+                rel_error,
+                r2,
+                nmae: sigma.map(|sigma| mae / sigma),
+                nrmse: sigma.map(|sigma| rmse / sigma),
+            }
         })
         .collect()
 }
@@ -278,12 +433,91 @@ mod tests {
     use super::*;
     use ndarray::array;
 
+    /// Масштаб берётся у ОБУЧАЮЩИХ таргетов, поэтому nMAE не зависит от того,
+    /// на каком наборе меряют: узкий validation не должен портить метрику.
+    #[test]
+    fn normalized_error_uses_the_train_scale_not_the_evaluation_one() {
+        let train = array![[0.0], [10.0], [20.0], [30.0]];
+        let scale = TargetScale::of(&train);
+
+        // Ошибка одна и та же, наборы разного разброса.
+        let wide_target = array![[0.0], [30.0]];
+        let wide_pred = array![[1.0], [31.0]];
+        let narrow_target = array![[14.0], [16.0]];
+        let narrow_pred = array![[15.0], [17.0]];
+
+        let wide = evaluate(&wide_pred, &wide_target, &scale);
+        let narrow = evaluate(&narrow_pred, &narrow_target, &scale);
+        assert!((wide.nmae.unwrap() - narrow.nmae.unwrap()).abs() < 1e-6);
+        // R² при этом честно разный: он как раз нормирован своим набором.
+        assert!(wide.r2 > narrow.r2);
+    }
+
+    /// Константный обучающий выход не имеет масштаба: нормализованных метрик у
+    /// него нет, а не «деление на зажатый эпсилон».
+    #[test]
+    fn a_constant_train_output_has_no_scale() {
+        let train = array![[5.0], [5.0], [5.0]];
+        let scale = TargetScale::of(&train);
+        assert_eq!(scale.sigma(0), None);
+
+        let m = evaluate(&array![[5.0], [6.0]], &array![[5.0], [5.0]], &scale);
+        assert!(m.nmae.is_none());
+        assert!(m.nrmse.is_none());
+        assert!(m.rel_error.is_none());
+        // Ненормализованные метрики при этом считаются как обычно.
+        assert!(m.mae > 0.0);
+    }
+
+    /// Возле нуля относительная ошибка описывает знаменатель, а не качество:
+    /// тогда её нет. Молча выбрасывать такие строки нельзя — это меняло бы
+    /// смысл усреднения.
+    #[test]
+    fn relative_error_is_undefined_near_zero() {
+        let train = array![[-10.0], [0.0], [10.0]];
+        let scale = TargetScale::of(&train);
+
+        let ok = evaluate(&array![[9.0], [11.0]], &array![[10.0], [10.0]], &scale);
+        assert!(ok.rel_error.is_some());
+
+        // Один target у нуля — относительной ошибки нет у всего выхода.
+        let near_zero = evaluate(&array![[0.1], [11.0]], &array![[0.0], [10.0]], &scale);
+        assert!(near_zero.rel_error.is_none());
+        // Остальные метрики от этого не исчезают.
+        assert!(near_zero.nmae.is_some());
+    }
+
+    /// Агрегат по выходам определён, только если определены все слагаемые:
+    /// «среднее по части выходов» выдавалось бы за метрику всей модели.
+    #[test]
+    fn aggregate_needs_every_output() {
+        let train = array![[1.0, 5.0], [3.0, 5.0]];
+        let scale = TargetScale::of(&train);
+        assert!(scale.sigma(0).is_some());
+        assert!(scale.sigma(1).is_none(), "второй выход константен");
+
+        let m = evaluate(
+            &array![[1.0, 5.0], [3.0, 6.0]],
+            &array![[1.0, 5.0], [3.0, 5.0]],
+            &scale,
+        );
+        assert!(m.nmae.is_none(), "у одного из выходов масштаба нет");
+        let per = evaluate_per_output(
+            &array![[1.0, 5.0], [3.0, 6.0]],
+            &array![[1.0, 5.0], [3.0, 5.0]],
+            &scale,
+        );
+        assert!(per[0].nmae.is_some(), "у первого выхода метрика есть");
+        assert!(per[1].nmae.is_none());
+    }
+
     #[test]
     fn per_output_separates_columns() {
         // Выход 0 предсказан идеально, выход 1 — с ошибкой.
         let pred = array![[1.0, 2.0], [2.0, 2.0], [3.0, 2.0]];
         let target = array![[1.0, 1.0], [2.0, 3.0], [3.0, 2.0]];
-        let per = evaluate_per_output(&pred, &target);
+        let scale = TargetScale::of(&target);
+        let per = evaluate_per_output(&pred, &target, &scale);
         assert_eq!(per.len(), 2);
         assert!(per[0].rmse < 1e-6); // выход 0 идеален
         assert!(per[1].rmse > 0.1); // выход 1 хуже
@@ -292,18 +526,21 @@ mod tests {
     #[test]
     fn perfect_prediction() {
         let y = array![[1.0], [2.0], [3.0]];
-        let m = evaluate(&y, &y);
+        let m = evaluate(&y, &y, &TargetScale::of(&y));
         assert!(m.rmse < 1e-6);
-        assert!(m.rel_error < 1e-6);
+        assert!(m.rel_error.unwrap() < 1e-6);
         assert!((m.r2 - 1.0).abs() < 1e-6);
+        assert!(m.nmae.unwrap() < 1e-6);
     }
 
     fn run(fold: Option<usize>, init_seed: u64, r2: f32) -> RunEval {
         let m = Metrics {
             rmse: 1.0 - r2,
             mae: 1.0 - r2,
-            rel_error: 1.0 - r2,
+            rel_error: Some(1.0 - r2),
             r2,
+            nmae: Some(1.0 - r2),
+            nrmse: Some(1.0 - r2),
         };
         RunEval {
             per_output: vec![m.clone()],
@@ -381,7 +618,7 @@ mod tests {
     fn known_error() {
         let pred = array![[2.0], [2.0]];
         let target = array![[1.0], [3.0]];
-        let m = evaluate(&pred, &target);
+        let m = evaluate(&pred, &target, &TargetScale::of(&target));
         assert!((m.rmse - 1.0).abs() < 1e-6); // обе ошибки по 1
         assert!((m.mae - 1.0).abs() < 1e-6);
     }

@@ -13,6 +13,7 @@ use crate::data::{Normalizer, NumericDataset};
 use crate::init::set_init_seed;
 use crate::metrics::{
     aggregate_runs, evaluate, evaluate_per_output, ConfigEval, EvalSource, Metrics, RunEval,
+    TargetScale,
 };
 use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
 use crate::schema::ModelSchema;
@@ -272,6 +273,12 @@ pub struct TrainedModel {
     pub in_norm: Normalizer,
     pub out_norm: Normalizer,
     pub history: TrainingHistory,
+    /// Масштаб выходов по ОБУЧАЮЩИМ данным этой модели.
+    ///
+    /// Едет вместе с моделью, чтобы нормализованные метрики нельзя было
+    /// посчитать чужим знаменателем: у каждого fold и у финального refit он
+    /// свой.
+    pub scale: TargetScale,
 }
 
 /// Результат полного сценария.
@@ -626,6 +633,9 @@ pub(crate) fn train_candidate(
     let (train, val) = pool.fold(fold)?;
     let specs = dataset.schema().feature_specs();
     let (in_norm, out_norm) = fit_normalizers(&train, &specs);
+    // Масштаб берётся с train ЭТОГО fold: нормализовать ошибку дисперсией того
+    // же набора, на котором её меряют, нельзя.
+    let scale = TargetScale::of(&train.outputs);
 
     set_init_seed(init_seed);
     let model = setup.config.build(&specs, dataset.schema().n_outputs());
@@ -647,7 +657,7 @@ pub(crate) fn train_candidate(
             let epoch = epoch + 1; // 1-based: «после первой эпохи»
             let val_metrics = setup.eval.wants(epoch).then(|| {
                 let pred = predict_dataset(&model, &val, &in_norm, &out_norm);
-                evaluate(&pred, &val.outputs)
+                evaluate(&pred, &val.outputs, &scale)
             });
             if let Some(m) = &val_metrics {
                 if best_observed.is_none_or(|(_, r2)| m.r2 > r2) {
@@ -681,6 +691,7 @@ pub(crate) fn train_candidate(
         model,
         in_norm,
         out_norm,
+        scale,
         history: TrainingHistory {
             source: pool.source(),
             best_epoch: best_observed.map(|(e, _)| e),
@@ -978,6 +989,8 @@ fn refit_prepared(
         model,
         in_norm,
         out_norm,
+        // Refit учился на всём pool — им же задан масштаб его метрик.
+        scale: TargetScale::of(&pool.outputs),
         history: TrainingHistory {
             points,
             source: prepared.search.source(),
@@ -1008,6 +1021,9 @@ fn refit_prepared(
             )
         },
         final_init_seed,
+        // Масштаб — от train + validation, на которых шёл refit: значения test
+        // в знаменатель попадать не должны.
+        &final_model.scale,
     )?;
 
     Ok(RefitOutcome {
@@ -1017,11 +1033,13 @@ fn refit_prepared(
 }
 
 /// Метрики модели на произвольном наборе — для отчётов вызывающего.
+/// Масштаб берётся у самой модели: он относится к её обучающим данным, и
+/// подменить его набором, на котором меряют, уже нельзя.
 pub fn evaluate_on(model: &TrainedModel, data: &NumericDataset) -> (Metrics, Vec<Metrics>) {
     let pred = predict_dataset(&model.model, data, &model.in_norm, &model.out_norm);
     (
-        evaluate(&pred, &data.outputs),
-        evaluate_per_output(&pred, &data.outputs),
+        evaluate(&pred, &data.outputs, &model.scale),
+        evaluate_per_output(&pred, &data.outputs, &model.scale),
     )
 }
 
@@ -1180,6 +1198,60 @@ mod tests {
         );
     }
 
+    /// У каждого fold свой масштаб train, а финальный замер нормируется
+    /// масштабом train + validation, на которых шёл refit: значения test в
+    /// знаменатель не попадают.
+    #[test]
+    fn normalized_metrics_use_the_training_scale_of_their_own_phase() {
+        let data = dataset(96);
+        let s = setup(2);
+        let never = AtomicBool::new(false);
+        let kfold = SplitPlan::KFold {
+            k: 3,
+            folds_seed: 1,
+            test_frac: 0.2,
+            test_seed: 1,
+        };
+
+        let outcome = check_candidate(
+            &data,
+            kfold,
+            &s,
+            &never,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |_, _, _, _| {},
+        )
+        .unwrap()
+        .expect("проверка не отменялась");
+        assert!(outcome.metrics.nmae.is_some(), "у CV nMAE определён");
+
+        let refit_outcome = refit(
+            &data,
+            SplitPlan::default(),
+            &s,
+            0,
+            &never,
+            &mut |_, _| {},
+            &mut |_, _| {},
+            &mut |_, _, _, _| {},
+        )
+        .unwrap();
+        let model = refit_outcome.model.expect("финальная модель");
+        let pool = SplitPlan::default()
+            .prepare(data.data())
+            .unwrap()
+            .search
+            .all();
+        assert_eq!(
+            model.scale,
+            TargetScale::of(&pool.outputs),
+            "масштаб финальной модели — train + validation"
+        );
+        let eval = refit_outcome.eval.expect("замер на test");
+        assert!(eval.metrics.nmae.is_some());
+    }
+
     /// Отмена не даёт оценки: подставленные нули выглядели бы как результат.
     #[test]
     fn cancelled_check_reports_no_usable_evaluation() {
@@ -1281,8 +1353,10 @@ mod tests {
         let good = Metrics {
             rmse: 0.0,
             mae: 0.0,
-            rel_error: 0.0,
+            rel_error: Some(0.0),
             r2: 1.0,
+            nmae: None,
+            nrmse: None,
         };
         let bad = Metrics {
             r2: -1.0,

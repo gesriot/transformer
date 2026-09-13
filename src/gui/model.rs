@@ -4,7 +4,7 @@ use super::messages::Command;
 use super::messages::ModelOrigin;
 use super::session::{split_plan_label, App, KAN_CURVE_SAMPLES};
 use crate::interpret::InterpretReport;
-use crate::metrics::{EvalSource, Metrics};
+use crate::metrics::{optional, optional_percent, EvalSource, Metrics};
 use crate::numeric_model::ModelKind;
 use crate::report::TrainingReport;
 use crate::schema::ModelSchema;
@@ -456,9 +456,9 @@ impl App {
                         ui.end_row();
                         ui.label("Ошибка формул");
                         ui.label(format!(
-                            "RMSE {:.5}, rel. {:.2}%",
+                            "RMSE {:.5}, rel. {}",
                             metrics.rmse,
-                            metrics.rel_error * 100.0
+                            optional_percent(metrics.rel_error, 2)
                         ));
                         ui.end_row();
                         if label == "train+validation" {
@@ -629,11 +629,12 @@ fn show_metrics(
     outputs: &[crate::schema::Column],
 ) {
     ui.label(format!(
-        "{label}: RMSE={:.5}   MAE={:.5}   rel.error={:.2}%   R²={:.5}",
+        "{label}: RMSE={:.5}   MAE={:.5}   nMAE={}   R²={:.5}   rel.error={}",
         aggregate.rmse,
         aggregate.mae,
-        aggregate.rel_error * 100.0,
-        aggregate.r2
+        optional(aggregate.nmae, 5),
+        aggregate.r2,
+        optional_percent(aggregate.rel_error, 2)
     ));
     let Some(per_output) = per_output else {
         return;
@@ -645,15 +646,17 @@ fn show_metrics(
             ui.label("выход");
             ui.label("RMSE");
             ui.label("MAE");
-            ui.label("rel.error");
+            ui.label("nMAE");
             ui.label("R²");
+            ui.label("rel.error");
             ui.end_row();
             for (column, metrics) in outputs.iter().zip(per_output) {
                 ui.label(column.display_name());
                 ui.label(format!("{:.5}", metrics.rmse));
                 ui.label(format!("{:.5}", metrics.mae));
-                ui.label(format!("{:.2}%", metrics.rel_error * 100.0));
+                ui.label(optional(metrics.nmae, 5));
                 ui.label(format!("{:.5}", metrics.r2));
+                ui.label(optional_percent(metrics.rel_error, 2));
                 ui.end_row();
             }
         });

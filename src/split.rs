@@ -9,7 +9,7 @@
 //! поэтому отдельный модуль задаёт границу API.
 
 use crate::data::NumericDataset;
-use crate::metrics::{evaluate, evaluate_per_output, EvalSource, Metrics, RunOrigin};
+use crate::metrics::{evaluate, evaluate_per_output, EvalSource, Metrics, RunOrigin, TargetScale};
 use ndarray::Array2;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -311,7 +311,15 @@ impl HoldoutTest {
     /// входы и возвращает предсказания в исходных единицах, наружу уходит
     /// [`FinalEval`]. Сам набор тип не покидает. Метод потребляет test, поэтому
     /// один подготовленный split нельзя оценить повторно с другой моделью.
-    pub fn evaluate<F>(self, predict: F, final_init_seed: u64) -> Result<FinalEval, String>
+    /// Масштаб для нормализованных метрик приходит снаружи — от того набора,
+    /// на котором модель училась (train + validation при финальном refit).
+    /// Значения test в знаменатель попадать не должны.
+    pub fn evaluate<F>(
+        self,
+        predict: F,
+        final_init_seed: u64,
+        scale: &TargetScale,
+    ) -> Result<FinalEval, String>
     where
         F: FnOnce(&Array2<f32>) -> Array2<f32>,
     {
@@ -324,8 +332,8 @@ impl HoldoutTest {
             ));
         }
         Ok(FinalEval {
-            metrics: evaluate(&pred, &self.data.outputs),
-            per_output: evaluate_per_output(&pred, &self.data.outputs),
+            metrics: evaluate(&pred, &self.data.outputs, scale),
+            per_output: evaluate_per_output(&pred, &self.data.outputs, scale),
             origin: FinalOrigin {
                 final_init_seed,
                 plan: self.plan,
@@ -529,6 +537,7 @@ mod tests {
                         Array2::zeros((inputs.nrows(), 1))
                     },
                     DEFAULT_FINAL_INIT_SEED,
+                    &TargetScale::unknown(1),
                 )
                 .unwrap();
 
@@ -557,6 +566,7 @@ mod tests {
                     })
                 },
                 7,
+                &TargetScale::unknown(1),
             )
             .unwrap();
         assert!((f.metrics.r2 - 1.0).abs() < 1e-6);
@@ -584,6 +594,7 @@ mod tests {
                     })
                 },
                 DEFAULT_FINAL_INIT_SEED,
+                &TargetScale::unknown(1),
             )
             .unwrap();
         assert!((baseline.metrics.r2 - 1.0).abs() < 1e-6);
@@ -605,6 +616,7 @@ mod tests {
                     })
                 },
                 DEFAULT_FINAL_INIT_SEED,
+                &TargetScale::unknown(1),
             )
             .unwrap();
 
@@ -619,7 +631,11 @@ mod tests {
         let s = SplitPlan::default().prepare(&labeled(100)).unwrap();
         let err = s
             .test
-            .evaluate(|inputs| Array2::zeros((inputs.nrows(), 2)), 0)
+            .evaluate(
+                |inputs| Array2::zeros((inputs.nrows(), 2)),
+                0,
+                &TargetScale::unknown(1),
+            )
             .unwrap_err();
         assert!(err.contains("модель вернула форму"), "текст ошибки: {err}");
     }

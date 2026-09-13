@@ -14,6 +14,7 @@
 
 use crate::data::{Normalizer, NumericDataset};
 use crate::kan::CompactReport;
+use crate::metrics::TargetScale;
 use crate::numeric_model::NumericModel;
 use crate::train::{evaluate_surrogate, train_surrogate_cb, TrainConfig};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -220,8 +221,14 @@ pub fn run_pipeline(
     if model.as_kan().is_none() {
         return Err("конвейер интерпретации применим только к KAN".to_string());
     }
-    let measure =
-        |model: &NumericModel| eval.map(|d| evaluate_surrogate(model, d, in_norm, out_norm).r2);
+    // Конвейеру нужен только R²: он безразмерный, и масштаб train для него не
+    // требуется — поэтому здесь честное «масштаб неизвестен».
+    let measure = |model: &NumericModel| {
+        eval.map(|d| {
+            let scale = TargetScale::unknown(d.outputs.ncols());
+            evaluate_surrogate(model, d, in_norm, out_norm, &scale).r2
+        })
+    };
 
     let r2_before = measure(model);
     let mut per_layer = Vec::new();

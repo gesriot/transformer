@@ -23,7 +23,7 @@ use crate::metrics::{EvalSource, Metrics};
 use crate::numeric_model::{KanConfig, ModelKind, NumericConfig, NumericModel};
 use crate::report::{
     CheckRecord, FinalRecord, Selection, TrainingReport, TRAINING_REPORT_VERSION,
-    TRAINING_REPORT_VERSION_V1,
+    TRAINING_REPORT_VERSION_V1, TRAINING_REPORT_VERSION_V2,
 };
 use crate::schema::{Column, ColumnRole, ColumnType, ModelSchema};
 use crate::split::{FinalEval, FinalOrigin, SplitPlan};
@@ -879,7 +879,7 @@ pub fn save_numeric(
                 interpret,
             )
             .map_err(|e| invalid(format!("training_report: {e}")))?;
-        sections.push(("training_report", build_report(report)));
+        sections.push(("training_report", build_report(report)?));
     }
     if let Some(masks) = model.kan_masks() {
         sections.push(("kan_masks", build_params(&masks)?));
@@ -1039,14 +1039,20 @@ pub fn load_numeric_full(path: &str) -> io::Result<NumericCheckpoint> {
 /// Необязательная и со своей версией: старый checkpoint читается как раньше и
 /// даёт `None` — «неизвестно», а не «test не открывался». Незнакомую версию
 /// тоже читаем как отсутствие отчёта: терять из-за неё саму модель нельзя.
-fn build_report(report: &TrainingReport) -> Vec<u8> {
+fn build_report(report: &TrainingReport) -> io::Result<Vec<u8>> {
     let mut p = Vec::new();
+    // Версия одна на весь отчёт: метрики внутри пишутся в её раскладке.
+    let version = if report.model.is_some() {
+        TRAINING_REPORT_VERSION
+    } else {
+        TRAINING_REPORT_VERSION_V1
+    };
     // Один тип представляет обе прочитанные версии, но формат остаётся
     // строгим: v2 всегда связан с моделью, а неподтверждённый отчёт остаётся
     // v1 и при повторном сохранении не получает ложного повышения гарантии.
     match &report.model {
         Some(model) => {
-            p.extend_from_slice(&TRAINING_REPORT_VERSION.to_le_bytes());
+            p.extend_from_slice(&version.to_le_bytes());
             p.extend_from_slice(report.dataset.as_bytes());
             // Маркер сохранён как часть уже выпущенного кодирования v2, но
             // единственное допустимое значение теперь 1.
@@ -1054,16 +1060,30 @@ fn build_report(report: &TrainingReport) -> Vec<u8> {
             p.extend_from_slice(model.as_bytes());
         }
         None => {
-            p.extend_from_slice(&TRAINING_REPORT_VERSION_V1.to_le_bytes());
+            p.extend_from_slice(&version.to_le_bytes());
             p.extend_from_slice(report.dataset.as_bytes());
         }
     }
     w_blob(&mut p, &build_schema(&report.schema));
     w_blob(&mut p, &build_stamp(&report.stamp));
     build_selection(&mut p, &report.selection);
-    w_opt_blob(&mut p, report.check.as_ref().map(build_check));
-    w_opt_blob(&mut p, report.final_run.as_ref().map(build_final));
-    p
+    w_opt_blob(
+        &mut p,
+        report
+            .check
+            .as_ref()
+            .map(|check| build_check(check, version))
+            .transpose()?,
+    );
+    w_opt_blob(
+        &mut p,
+        report
+            .final_run
+            .as_ref()
+            .map(|final_run| build_final(final_run, version))
+            .transpose()?,
+    );
+    Ok(p)
 }
 
 fn read_report(bytes: &[u8]) -> io::Result<Option<TrainingReport>> {
@@ -1071,7 +1091,10 @@ fn read_report(bytes: &[u8]) -> io::Result<Option<TrainingReport>> {
     let version = r_u32(&mut r)?;
     // Две версии читаются, остальные игнорируются: незнакомая версия не должна
     // стоить самой модели.
-    if version != TRAINING_REPORT_VERSION && version != TRAINING_REPORT_VERSION_V1 {
+    if !matches!(
+        version,
+        TRAINING_REPORT_VERSION | TRAINING_REPORT_VERSION_V2 | TRAINING_REPORT_VERSION_V1
+    ) {
         return Ok(None);
     }
     let mut fingerprint = [0u8; 32];
@@ -1103,10 +1126,10 @@ fn read_report(bytes: &[u8]) -> io::Result<Option<TrainingReport>> {
     )?;
     let selection = read_selection(&mut r)?;
     let check = r_opt_blob(&mut r, "training_report: проверка")?
-        .map(|bytes| read_check(&bytes))
+        .map(|bytes| read_check(&bytes, version))
         .transpose()?;
     let final_run = r_opt_blob(&mut r, "training_report: финал")?
-        .map(|bytes| read_final(&bytes))
+        .map(|bytes| read_final(&bytes, version))
         .transpose()?;
     if !r.is_empty() {
         return Err(invalid("training_report: лишние байты"));
@@ -1393,22 +1416,80 @@ fn read_objective(code: u32) -> io::Result<SearchObjective> {
     }
 }
 
-fn build_metrics(buf: &mut Vec<u8>, m: &Metrics) {
+/// Метрики в раскладке своей версии.
+///
+/// До v3 относительная ошибка была обязательной, а нормализованных метрик не
+/// существовало. Такой отчёт перезаписывается как есть — «повысить» его
+/// нельзя, — поэтому величины, которые старый формат выразить не может,
+/// становятся ошибкой, а не молча теряются.
+fn build_metrics(buf: &mut Vec<u8>, m: &Metrics, version: u32) -> io::Result<()> {
     buf.extend_from_slice(&m.rmse.to_le_bytes());
     buf.extend_from_slice(&m.mae.to_le_bytes());
-    buf.extend_from_slice(&m.rel_error.to_le_bytes());
+    if version < TRAINING_REPORT_VERSION {
+        let rel_error = m.rel_error.ok_or_else(|| {
+            invalid("метрики: относительная ошибка отсутствует, а формат отчёта её требует")
+        })?;
+        if m.nmae.is_some() || m.nrmse.is_some() {
+            return Err(invalid(
+                "метрики: нормализованные величины не помещаются в старый формат отчёта",
+            ));
+        }
+        buf.extend_from_slice(&rel_error.to_le_bytes());
+        buf.extend_from_slice(&m.r2.to_le_bytes());
+        return Ok(());
+    }
+    w_opt_f32(buf, m.rel_error);
     buf.extend_from_slice(&m.r2.to_le_bytes());
+    w_opt_f32(buf, m.nmae);
+    w_opt_f32(buf, m.nrmse);
+    Ok(())
 }
 
-/// Самая короткая запись метрик — четыре `f32`.
+/// Необязательное число: флаг наличия и значение. «Нет величины» и «величина
+/// равна нулю» — разные утверждения.
+fn w_opt_f32(buf: &mut Vec<u8>, value: Option<f32>) {
+    buf.extend_from_slice(&u32::from(value.is_some()).to_le_bytes());
+    buf.extend_from_slice(&value.unwrap_or(0.0).to_le_bytes());
+}
+
+fn r_opt_f32(r: &mut &[u8], what: &str) -> io::Result<Option<f32>> {
+    let has = r_u32(r)?;
+    if has > 1 {
+        return Err(invalid(format!("{what}: флаг наличия {has} не 0 и не 1")));
+    }
+    let value = r_f32(r)?;
+    Ok((has == 1).then_some(value))
+}
+
+/// Самая короткая запись метрик: четыре `f32` версии v1/v2.
 const METRICS_BYTES: usize = 16;
 
-fn read_metrics(r: &mut &[u8]) -> io::Result<Metrics> {
+/// Метрики отчёта. С версии v3 относительная ошибка необязательна, а рядом
+/// лежат нормализованные величины.
+///
+/// В v1/v2 их не было, и пересчитать их нельзя: масштаб train в тех файлах не
+/// сохранялся. Поэтому они читаются как отсутствующие, а не как нули.
+fn read_metrics(r: &mut &[u8], version: u32) -> io::Result<Metrics> {
+    let rmse = r_f32(r)?;
+    let mae = r_f32(r)?;
+    if version < TRAINING_REPORT_VERSION {
+        let rel_error = r_f32(r)?;
+        return Ok(Metrics {
+            rmse,
+            mae,
+            rel_error: Some(rel_error),
+            r2: r_f32(r)?,
+            nmae: None,
+            nrmse: None,
+        });
+    }
     Ok(Metrics {
-        rmse: r_f32(r)?,
-        mae: r_f32(r)?,
-        rel_error: r_f32(r)?,
+        rmse,
+        mae,
+        rel_error: r_opt_f32(r, "метрики: относительная ошибка")?,
         r2: r_f32(r)?,
+        nmae: r_opt_f32(r, "метрики: nMAE")?,
+        nrmse: r_opt_f32(r, "метрики: nRMSE")?,
     })
 }
 
@@ -1445,7 +1526,7 @@ fn read_source(r: &mut &[u8]) -> io::Result<EvalSource> {
 /// Точка истории: эпоха, train loss и — только там, где был замер — метрики.
 const POINT_MIN_BYTES: usize = 8 + 4 + 4;
 
-fn build_history(buf: &mut Vec<u8>, history: &TrainingHistory) {
+fn build_history(buf: &mut Vec<u8>, history: &TrainingHistory, version: u32) -> io::Result<()> {
     build_source(buf, history.source);
     match history.best_epoch {
         Some(epoch) => {
@@ -1465,14 +1546,15 @@ fn build_history(buf: &mut Vec<u8>, history: &TrainingHistory) {
         match &point.val {
             Some(m) => {
                 buf.extend_from_slice(&1u32.to_le_bytes());
-                build_metrics(buf, m);
+                build_metrics(buf, m, version)?;
             }
             None => buf.extend_from_slice(&0u32.to_le_bytes()),
         }
     }
+    Ok(())
 }
 
-fn read_history(r: &mut &[u8]) -> io::Result<TrainingHistory> {
+fn read_history(r: &mut &[u8], version: u32) -> io::Result<TrainingHistory> {
     let source = read_source(r)?;
     let has_best = r_u32(r)?;
     if has_best > 1 {
@@ -1497,7 +1579,7 @@ fn read_history(r: &mut &[u8]) -> io::Result<TrainingHistory> {
         let train_loss = r_f32(r)?;
         let val = match r_u32(r)? {
             0 => None,
-            1 => Some(read_metrics(r)?),
+            1 => Some(read_metrics(r, version)?),
             other => {
                 return Err(invalid(format!(
                     "history: флаг наличия метрик {other} не 0 и не 1"
@@ -1615,19 +1697,19 @@ fn r_usize(r: &mut &[u8], what: &str) -> io::Result<usize> {
     usize::try_from(r_u64(r)?).map_err(|_| invalid(format!("{what}: не помещается в usize")))
 }
 
-fn build_check(check: &CheckRecord) -> Vec<u8> {
+fn build_check(check: &CheckRecord, version: u32) -> io::Result<Vec<u8>> {
     let mut p = Vec::new();
     build_source(&mut p, check.source);
-    build_metrics(&mut p, &check.metrics);
+    build_metrics(&mut p, &check.metrics, version)?;
     p.extend_from_slice(&check.r2_std_folds.to_le_bytes());
     w_count(&mut p, check.per_output.len());
     for m in &check.per_output {
-        build_metrics(&mut p, m);
+        build_metrics(&mut p, m, version)?;
     }
     w_count(&mut p, check.histories.len());
     for history in &check.histories {
         let mut block = Vec::new();
-        build_history(&mut block, history);
+        build_history(&mut block, history, version)?;
         w_blob(&mut p, &block);
     }
     w_count(&mut p, check.interpret.len());
@@ -1636,24 +1718,28 @@ fn build_check(check: &CheckRecord) -> Vec<u8> {
         build_interpret_report(&mut block, report);
         w_blob(&mut p, &block);
     }
-    p
+    Ok(p)
 }
 
-fn read_check(bytes: &[u8]) -> io::Result<CheckRecord> {
+fn read_check(bytes: &[u8], version: u32) -> io::Result<CheckRecord> {
     let mut r = bytes;
     let source = read_source(&mut r)?;
-    let metrics = read_metrics(&mut r)?;
+    let metrics = read_metrics(&mut r, version)?;
     let r2_std_folds = r_f32(&mut r)?;
     let n = r_count(&mut r, METRICS_BYTES, "проверка: метрики выходов")?;
     let mut per_output = Vec::with_capacity(n);
     for _ in 0..n {
-        per_output.push(read_metrics(&mut r)?);
+        per_output.push(read_metrics(&mut r, version)?);
     }
     let n = r_count(&mut r, 8, "проверка: истории folds")?;
     let mut histories = Vec::with_capacity(n);
     for _ in 0..n {
         let block = r_blob(&mut r, "проверка: история fold")?;
-        histories.push(parse_exact(&block, "проверка: история fold", read_history)?);
+        histories.push(parse_exact(
+            &block,
+            "проверка: история fold",
+            |r| read_history(r, version),
+        )?);
     }
     let n = r_count(&mut r, 8, "проверка: отчёты конвейера")?;
     let mut interpret = Vec::with_capacity(n);
@@ -1678,13 +1764,13 @@ fn read_check(bytes: &[u8]) -> io::Result<CheckRecord> {
     })
 }
 
-fn build_final(record: &FinalRecord) -> Vec<u8> {
+fn build_final(record: &FinalRecord, version: u32) -> io::Result<Vec<u8>> {
     let mut p = Vec::new();
-    build_history(&mut p, &record.history);
-    build_metrics(&mut p, &record.eval.metrics);
+    build_history(&mut p, &record.history, version)?;
+    build_metrics(&mut p, &record.eval.metrics, version)?;
     w_count(&mut p, record.eval.per_output.len());
     for m in &record.eval.per_output {
-        build_metrics(&mut p, m);
+        build_metrics(&mut p, m, version)?;
     }
     p.extend_from_slice(&(record.eval.origin.test_rows as u64).to_le_bytes());
     p.extend_from_slice(&record.eval.origin.final_init_seed.to_le_bytes());
@@ -1696,17 +1782,17 @@ fn build_final(record: &FinalRecord) -> Vec<u8> {
         interpret = Some(block);
     }
     w_opt_blob(&mut p, interpret);
-    p
+    Ok(p)
 }
 
-fn read_final(bytes: &[u8]) -> io::Result<FinalRecord> {
+fn read_final(bytes: &[u8], version: u32) -> io::Result<FinalRecord> {
     let mut r = bytes;
-    let history = read_history(&mut r)?;
-    let metrics = read_metrics(&mut r)?;
+    let history = read_history(&mut r, version)?;
+    let metrics = read_metrics(&mut r, version)?;
     let n = r_count(&mut r, METRICS_BYTES, "финал: метрики выходов")?;
     let mut per_output = Vec::with_capacity(n);
     for _ in 0..n {
-        per_output.push(read_metrics(&mut r)?);
+        per_output.push(read_metrics(&mut r, version)?);
     }
     let test_rows = r_usize(&mut r, "финал: строк в test")?;
     let final_init_seed = r_u64(&mut r)?;
@@ -1926,8 +2012,10 @@ mod tests {
                     val: Some(Metrics {
                         rmse: 1.0,
                         mae: 0.5,
-                        rel_error: 0.1,
+                        rel_error: Some(0.1),
                         r2: 0.9,
+                        nmae: None,
+                        nrmse: None,
                     }),
                 },
             ],
@@ -1948,8 +2036,10 @@ mod tests {
         let metrics = Metrics {
             rmse: 1.0,
             mae: 0.5,
-            rel_error: 0.1,
+            rel_error: Some(0.1),
             r2: 0.9,
+            nmae: None,
+            nrmse: None,
         };
         let split = SplitPlan::KFold {
             k: 2,
@@ -2022,8 +2112,10 @@ mod tests {
                     per_output: vec![Metrics {
                         rmse: 2.0,
                         mae: 1.0,
-                        rel_error: 0.2,
+                        rel_error: Some(0.2),
                         r2: 0.8,
+                        nmae: None,
+                        nrmse: None,
                     }],
                     origin: FinalOrigin {
                         test_rows: 18,
@@ -2208,8 +2300,10 @@ mod tests {
             .val = Some(Metrics {
             rmse: 1.0,
             mae: 0.5,
-            rel_error: 0.1,
+            rel_error: Some(0.1),
             r2: 0.9,
+            nmae: None,
+            nrmse: None,
         });
         assert!(refit_measured_validation
             .validate_against(model_fp, &nc, &schema, Some(&profile))
@@ -2280,7 +2374,7 @@ mod tests {
 
         // Неподтверждённый отчёт и при повторной записи остаётся v1: добавлять
         // связь с весами writer не имеет права.
-        let v1 = build_report(&report);
+        let v1 = build_report(&report).unwrap();
         assert_eq!(
             u32::from_le_bytes(v1[..4].try_into().unwrap()),
             TRAINING_REPORT_VERSION_V1
@@ -2320,7 +2414,7 @@ mod tests {
         let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
         let model_fp = ModelFingerprint::of(&model, &nc, &in_norm, &out_norm);
 
-        let mut v2 = build_report(&sample_report(&nc, &schema, Some(model_fp)));
+        let mut v2 = build_report(&sample_report(&nc, &schema, Some(model_fp))).unwrap();
         assert_eq!(
             u32::from_le_bytes(v2[..4].try_into().unwrap()),
             TRAINING_REPORT_VERSION
@@ -2329,6 +2423,45 @@ mod tests {
         v2[36..40].copy_from_slice(&0u32.to_le_bytes());
         let err = read_report(&v2).unwrap_err();
         assert!(err.to_string().contains("обязательный флаг"), "{err}");
+    }
+
+    /// Отчёты v1 и v2 читаются со старыми метриками: относительная ошибка
+    /// была обязательной, а нормализованных величин не существовало —
+    /// пересчитать их без масштаба train нельзя.
+    #[test]
+    fn old_reports_have_no_normalized_metrics() {
+        let nc = numeric_cfg(ModelKind::Mlp);
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        // v1 собирается самим кодировщиком: отчёт без отпечатка пишется им.
+        let v1_bytes = build_report(&sample_report(&nc, &schema, None)).unwrap();
+        let v1 = read_report(&v1_bytes).unwrap().expect("v1 читается");
+        let check = v1.check.expect("проверка");
+        assert!(check.metrics.rel_error.is_some(), "в v1 она обязательна");
+        assert!(check.metrics.nmae.is_none(), "в v1 её не было");
+        assert!(check.metrics.nrmse.is_none());
+        assert!(check.histories[0].points[1]
+            .val
+            .as_ref()
+            .unwrap()
+            .nmae
+            .is_none());
+    }
+
+    /// Старый формат не может выразить новые величины: молча терять их при
+    /// перезаписи нельзя.
+    #[test]
+    fn an_old_format_refuses_metrics_it_cannot_express() {
+        let nc = numeric_cfg(ModelKind::Mlp);
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let mut report = sample_report(&nc, &schema, None);
+        report.check.as_mut().unwrap().metrics.nmae = Some(0.25);
+        let err = build_report(&report).unwrap_err();
+        assert!(err.to_string().contains("не помещаются"), "{err}");
+
+        let mut missing_rel = sample_report(&nc, &schema, None);
+        missing_rel.check.as_mut().unwrap().metrics.rel_error = None;
+        let err = build_report(&missing_rel).unwrap_err();
+        assert!(err.to_string().contains("относительная ошибка"), "{err}");
     }
 
     /// Отчёт, посчитанный по другой модели, не проходит проверку: раньше его
@@ -2367,7 +2500,8 @@ mod tests {
     #[test]
     fn an_unknown_report_version_is_ignored() {
         let schema = ModelSchema::synthetic(2, 1).unwrap();
-        let mut bytes = build_report(&sample_report(&numeric_cfg(ModelKind::Mlp), &schema, None));
+        let mut bytes =
+            build_report(&sample_report(&numeric_cfg(ModelKind::Mlp), &schema, None)).unwrap();
         bytes[..4].copy_from_slice(&(TRAINING_REPORT_VERSION + 1).to_le_bytes());
         assert!(read_report(&bytes).unwrap().is_none());
     }
@@ -2377,7 +2511,8 @@ mod tests {
     #[test]
     fn a_truncated_report_is_rejected() {
         let schema = ModelSchema::synthetic(2, 1).unwrap();
-        let bytes = build_report(&sample_report(&numeric_cfg(ModelKind::Mlp), &schema, None));
+        let bytes =
+            build_report(&sample_report(&numeric_cfg(ModelKind::Mlp), &schema, None)).unwrap();
         for cut in [8, bytes.len() / 3, bytes.len() / 2, bytes.len() - 1] {
             assert!(
                 read_report(&bytes[..cut]).is_err(),

@@ -27,7 +27,7 @@ use crate::lifecycle::{
     CheckEval, CheckedRun, FinalizeRefusal, Lifecycle, RunIdentity, TestDisclosure,
 };
 use crate::markup::TableProfile;
-use crate::metrics::evaluate;
+use crate::metrics::{evaluate, TargetScale};
 use crate::numeric_model::{validate_numeric, NumericConfig, NumericModel};
 use crate::predict::predict_rows;
 use crate::report::{CheckRecord, FinalRecord, Selection, TrainingReport};
@@ -707,12 +707,22 @@ fn extract_kan_symbolic(loaded: &Loaded) -> Result<KanSymbolicInfo, String> {
     // этой вспомогательной проверки не открывается.
     let (formula_metrics, kan_r2, evaluation_label) = match &loaded.diag {
         Some(diag) => (
+            // Масштаб — по данным обучения этой модели; у загруженного
+            // checkpoint-а их нет, и нормализованные метрики не считаются.
             Some(evaluate(
                 &symbolic.predict(&diag.eval.inputs),
                 &diag.eval.outputs,
+                &TargetScale::of(&diag.train.outputs),
             )),
             Some(
-                evaluate_surrogate(&loaded.model, &diag.eval, &loaded.in_norm, &loaded.out_norm).r2,
+                evaluate_surrogate(
+                    &loaded.model,
+                    &diag.eval,
+                    &loaded.in_norm,
+                    &loaded.out_norm,
+                    &TargetScale::of(&diag.train.outputs),
+                )
+                .r2,
             ),
             Some(diag.eval_label.to_string()),
         ),
@@ -1692,8 +1702,10 @@ mod tests {
         let metrics = Metrics {
             rmse: 1.0,
             mae: 0.5,
-            rel_error: 0.1,
+            rel_error: Some(0.1),
             r2: 0.9,
+            nmae: None,
+            nrmse: None,
         };
         let identity = stamp(
             DatasetFingerprint::from_bytes([3; 32]),
@@ -1784,8 +1796,10 @@ mod tests {
             metrics: Metrics {
                 rmse: 1.0,
                 mae: 0.5,
-                rel_error: 0.1,
+                rel_error: Some(0.1),
                 r2: 0.9,
+                nmae: None,
+                nrmse: None,
             },
             per_output: Vec::new(),
             r2_std_folds: 0.0,

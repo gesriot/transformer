@@ -30,16 +30,16 @@ use transformer::{
 };
 use transformer::{
     calibration_sample, evaluate, evaluate_on, evaluate_surrogate, export_predictions,
-    infer_prepare_spec_from_path, load_numeric_full, parse_categorical, predict_dataset,
-    prepare_tnum_file, read_numeric_source, recommended_epoch, run_sweep, run_training,
-    save_numeric, sweep_cost, symbolize, validate_numeric, validate_train, CandidateSpec,
-    CheckRecord, Dataset, DatasetFingerprint, Delimiter, EvalSchedule, ExportSummary, FeatureSpec,
-    FinalRecord, InterpretOverrides, InterpretProfile, InterpretReport, KanConfig, LrSchedule,
-    Metrics, ModelConfig, ModelFingerprint, ModelKind, ModelSchema, Normalizer, NumericConfig,
-    NumericDataset, NumericModel, Phase, PrepareSpec, RunIdentity, SearchObjective, Selection,
-    SplitPlan, SweepAxes, SweepResult, SweepRow, TrainConfig, TrainedModel, TrainingHistory,
-    TrainingReport, TrainingSetup, ValueEncoderConfig, ValueEncoderKind, DEFAULT_FINAL_INIT_SEED,
-    DEFAULT_SPLIT_SEED,
+    infer_prepare_spec_from_path, load_numeric_full, optional, optional_percent, parse_categorical,
+    predict_dataset, prepare_tnum_file, read_numeric_source, recommended_epoch, run_sweep,
+    run_training, save_numeric, sweep_cost, symbolize, validate_numeric, validate_train,
+    CandidateSpec, CheckRecord, Dataset, DatasetFingerprint, Delimiter, EvalSchedule,
+    ExportSummary, FeatureSpec, FinalRecord, InterpretOverrides, InterpretProfile, InterpretReport,
+    KanConfig, LrSchedule, Metrics, ModelConfig, ModelFingerprint, ModelKind, ModelSchema,
+    Normalizer, NumericConfig, NumericDataset, NumericModel, Phase, PrepareSpec, RunIdentity,
+    SearchObjective, Selection, SplitPlan, SweepAxes, SweepResult, SweepRow, TargetScale,
+    TrainConfig, TrainedModel, TrainingHistory, TrainingReport, TrainingSetup, ValueEncoderConfig,
+    ValueEncoderKind, DEFAULT_FINAL_INIT_SEED, DEFAULT_SPLIT_SEED,
 };
 use transformer::{diagnostics, interpret, predict};
 
@@ -403,13 +403,14 @@ fn run_kan_symbolic(
     }
 
     let pred = sym.predict(&eval.inputs);
-    let m = evaluate(&pred, &eval.outputs);
-    let kan_m = evaluate_surrogate(model, eval, in_norm, out_norm);
+    // Сравнение формул с самой KAN идёт по R²: он безразмерный, и масштаб
+    // train для него не нужен.
+    let scale = TargetScale::unknown(eval.outputs.ncols());
+    let m = evaluate(&pred, &eval.outputs, &scale);
+    let kan_m = evaluate_surrogate(model, eval, in_norm, out_norm, &scale);
     println!(
-        "Формулы как модель на train+validation: R² = {:.5} (KAN там же: {:.5}), rel = {:.2}%",
-        m.r2,
-        kan_m.r2,
-        m.rel_error * 100.0
+        "Формулы как модель на train+validation: R² = {:.5} (KAN там же: {:.5})",
+        m.r2, kan_m.r2
     );
     println!("  (обучающие данные — это верность формул модели, а не обобщение)");
 }
@@ -602,8 +603,11 @@ fn print_metrics(title: &str, m: &Metrics, per: &[Metrics], schema: &ModelSchema
     println!("\n{title} (в исходных единицах):");
     println!("  RMSE        = {:.5}", m.rmse);
     println!("  MAE         = {:.5}", m.mae);
-    println!("  rel. error  = {:.2}%", m.rel_error * 100.0);
+    // nMAE нормирован масштабом обучающих таргетов: «ошибка в долях того, как
+    // сильно выход вообще меняется».
+    println!("  nMAE        = {}", optional(m.nmae, 5));
     println!("  R²          = {:.5}", m.r2);
+    println!("  rel. error  = {}", optional_percent(m.rel_error, 2));
 
     if per.len() > 1 {
         let names: Vec<String> = schema.outputs().iter().map(|c| c.display_name()).collect();
@@ -615,7 +619,7 @@ fn print_metrics(title: &str, m: &Metrics, per: &[Metrics], schema: &ModelSchema
             .max(4);
         println!("\nПо выходам:");
         println!(
-            "  {:<width$}  RMSE        MAE       rel.err     R²",
+            "  {:<width$}  RMSE        MAE       nMAE        R²",
             "выход"
         );
         for (j, pm) in per.iter().enumerate() {
@@ -623,11 +627,11 @@ fn print_metrics(title: &str, m: &Metrics, per: &[Metrics], schema: &ModelSchema
             // Ширина считается в символах: у кириллицы и °C байт больше.
             let pad = width.saturating_sub(name.chars().count());
             println!(
-                "  {name}{:pad$}  {:>9.5}  {:>9.5}  {:>7.2}%  {:>8.5}",
+                "  {name}{:pad$}  {:>9.5}  {:>9.5}  {:>9}  {:>8.5}",
                 "",
                 pm.rmse,
                 pm.mae,
-                pm.rel_error * 100.0,
+                optional(pm.nmae, 5),
                 pm.r2
             );
         }
@@ -1282,10 +1286,10 @@ fn print_val_curve(history: &TrainingHistory) {
     println!("epochs  train_loss     RMSE       MAE      rel.err        R²");
     for (epoch, loss, m) in &measured {
         println!(
-            "{epoch:>6}  {loss:>10.5}  {:>9.5}  {:>9.5}  {:>7.2}%  {:>8.5}",
+            "{epoch:>6}  {loss:>10.5}  {:>9.5}  {:>9.5}  {:>9}  {:>8.5}",
             m.rmse,
             m.mae,
-            m.rel_error * 100.0,
+            optional(m.nmae, 5),
             m.r2
         );
     }
@@ -1536,16 +1540,15 @@ fn print_search_ranking(result: &SweepResult) {
         .first()
         .map(|row| row.source.label())
         .unwrap_or_else(|| "validation".to_string());
-    println!("\n=== РАНЖИРОВАНИЕ ({source}; по worst-output R²; rel — справочно) ===");
+    println!("\n=== РАНЖИРОВАНИЕ ({source}; по worst-output R²) ===");
     for (i, r) in result.rows.iter().enumerate() {
         let mark = if i == 0 { "*" } else { " " };
         println!(
-            "{mark} worst R²={:.5}  aggregate R²={:.5}±{:.5}  nRMSE={:.5}  rel={:.1}%  | {}",
+            "{mark} worst R²={:.5}  aggregate R²={:.5}±{:.5}  nRMSE={}  | {}",
             r.worst_output_r2_mean,
             r.r2_mean,
             r.r2_std,
-            r.nrmse_mean,
-            r.rel_mean * 100.0,
+            optional(r.nrmse_mean, 5),
             r.label
         );
     }

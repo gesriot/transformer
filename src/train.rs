@@ -7,7 +7,7 @@
 use crate::data::TextDataset;
 use crate::data::{Normalizer, NumericDataset};
 use crate::encoders::FeatureSpec;
-use crate::metrics::{evaluate, Metrics};
+use crate::metrics::{evaluate, Metrics, TargetScale};
 use crate::numeric_model::NumericModel;
 use crate::optim::Adam;
 use crate::tensor::Tensor;
@@ -209,9 +209,10 @@ pub fn evaluate_surrogate(
     data: &NumericDataset,
     in_norm: &Normalizer,
     out_norm: &Normalizer,
+    scale: &TargetScale,
 ) -> Metrics {
     let pred = predict_dataset(model, data, in_norm, out_norm);
-    evaluate(&pred, &data.outputs)
+    evaluate(&pred, &data.outputs, scale)
 }
 
 #[derive(Clone)]

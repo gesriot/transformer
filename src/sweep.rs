@@ -194,8 +194,12 @@ pub struct SweepRow {
     pub r2_std_folds: f32,
     pub worst_output_r2_mean: f32,
     pub mean_output_r2_mean: f32,
-    pub nrmse_mean: f32,
-    pub rel_mean: f32,
+    /// Средний nRMSE по прогонам; `None`, если масштаба train не существует
+    /// хотя бы у одного выхода.
+    pub nrmse_mean: Option<f32>,
+    /// Средняя относительная ошибка; `None`, если она неприменима хотя бы у
+    /// одного прогона.
+    pub rel_mean: Option<f32>,
     /// Откуда метрики: validation или CV. Ранжирование по test невозможно —
     /// поиск его не видит.
     pub source: EvalSource,
@@ -249,7 +253,9 @@ pub fn row_score(objective: SweepObjective, row: &SweepRow) -> f32 {
         SweepObjective::AggregateR2 => row.r2_mean,
         SweepObjective::WorstOutputR2 => row.worst_output_r2_mean,
         SweepObjective::MeanOutputR2 => row.mean_output_r2_mean,
-        SweepObjective::Nrmse => -row.nrmse_mean,
+        // Строка без nRMSE не может участвовать в ранжировании по нему:
+        // «неизвестно» — это не «бесконечно плохо», но и выбрать её нельзя.
+        SweepObjective::Nrmse => row.nrmse_mean.map_or(f32::NEG_INFINITY, |v| -v),
     }
 }
 
@@ -638,13 +644,14 @@ fn row_from_config_eval(
     runs: &[RunEval],
 ) -> SweepRow {
     let per_output_r2: Vec<f32> = agg.per_output_mean.iter().map(|m| m.r2).collect();
-    // nRMSE — нелинейное преобразование R², поэтому его нужно считать для
-    // каждого seed × fold до усреднения, а не из уже среднего R².
+    // nRMSE берётся у самих прогонов: он нормализован масштабом train каждого
+    // fold, и выводить его из усреднённого R² нельзя. `None` хотя бы у одного
+    // прогона означает, что средней величины не существует.
     let nrmse_mean = runs
         .iter()
-        .map(|run| (1.0 - run.metrics.r2).max(0.0).sqrt())
-        .sum::<f32>()
-        / runs.len().max(1) as f32;
+        .map(|run| run.metrics.nrmse)
+        .try_fold(0.0f32, |sum, value| value.map(|v| sum + v))
+        .map(|sum| sum / runs.len().max(1) as f32);
     SweepRow {
         label,
         choice,
@@ -998,6 +1005,7 @@ mod tests {
                     Array2::zeros((inputs.nrows(), data.outputs.ncols()))
                 },
                 0,
+                &crate::metrics::TargetScale::unknown(data.outputs.ncols()),
             )
             .unwrap();
 
@@ -1077,8 +1085,8 @@ mod tests {
             r2_std_folds: 0.0,
             worst_output_r2_mean: 0.0,
             mean_output_r2_mean: 0.0,
-            nrmse_mean: 0.0,
-            rel_mean: 0.0,
+            nrmse_mean: None,
+            rel_mean: None,
             source: EvalSource::Validation,
         };
         let mut ranked = vec![row("negative", -1.0, &val), row("positive", 2.0, &val)];
@@ -1097,24 +1105,28 @@ mod tests {
 
     #[test]
     fn nrmse_is_averaged_per_run_not_derived_from_mean_r2() {
-        let metric = |r2| crate::metrics::Metrics {
+        // nRMSE прогона задан явно: он нормализован масштабом train своего
+        // fold, и из среднего R² его получить нельзя.
+        let metric = |r2: f32, nrmse: f32| crate::metrics::Metrics {
             rmse: 0.0,
             mae: 0.0,
-            rel_error: 0.0,
+            rel_error: None,
             r2,
+            nmae: Some(nrmse),
+            nrmse: Some(nrmse),
         };
         let runs = vec![
             RunEval {
-                metrics: metric(0.0),
-                per_output: vec![metric(0.0)],
+                metrics: metric(0.0, 1.0),
+                per_output: vec![metric(0.0, 1.0)],
                 origin: RunOrigin {
                     fold: None,
                     init_seed: 0,
                 },
             },
             RunEval {
-                metrics: metric(1.0),
-                per_output: vec![metric(1.0)],
+                metrics: metric(1.0, 0.0),
+                per_output: vec![metric(1.0, 0.0)],
                 origin: RunOrigin {
                     fold: None,
                     init_seed: 1,
@@ -1125,8 +1137,12 @@ mod tests {
         let choice = build_candidates(&tiny_axes()).unwrap().remove(0).choice;
         let row = row_from_config_eval("synthetic".to_string(), choice, &agg, &runs);
 
-        assert!((row.nrmse_mean - 0.5).abs() < 1e-6);
-        assert!((row.nrmse_mean - (1.0_f32 - agg.mean.r2).sqrt()).abs() > 0.1);
+        let nrmse = row.nrmse_mean.expect("оба прогона дали nRMSE");
+        assert!((nrmse - 0.5).abs() < 1e-6);
+        assert!(
+            (nrmse - (1.0_f32 - agg.mean.r2).sqrt()).abs() > 0.1,
+            "nRMSE не выводится из усреднённого R²"
+        );
     }
 
     /// Нормализаторы каждого fold строятся ТОЛЬКО по его train: статистики

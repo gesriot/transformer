@@ -261,8 +261,10 @@ mod tests {
         Metrics {
             rmse: 1.0,
             mae: 0.5,
-            rel_error: 0.1,
+            rel_error: Some(0.1),
             r2: 0.9,
+            nmae: None,
+            nrmse: None,
         }
     }
 
