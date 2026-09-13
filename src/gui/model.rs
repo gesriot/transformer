@@ -640,7 +640,7 @@ fn show_metrics(
         return;
     };
     egui::Grid::new(format!("{label}_per_output_metrics"))
-        .num_columns(5)
+        .num_columns(6)
         .striped(true)
         .show(ui, |ui| {
             ui.label("выход");

@@ -16,8 +16,9 @@ const NEAR_ZERO_FRACTION: f32 = 1e-3;
 
 /// Масштаб каждого выхода по обучающим таргетам.
 ///
-/// `None` у выхода означает, что на train он константен: делить на такой
-/// «масштаб» нельзя, и нормализованных метрик у него не существует.
+/// `Some(0)` означает известный константный train-выход: нормализованных метрик
+/// у него нет, но относительная ошибка всё ещё определена, если сам target не
+/// равен нулю. `None` означает, что масштаб неизвестен вовсе.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TargetScale {
     per_output: Vec<Option<f32>>,
@@ -26,26 +27,45 @@ pub struct TargetScale {
 impl TargetScale {
     /// Посчитать масштаб по обучающим таргетам — σ каждого выхода.
     pub fn of(train_targets: &Array2<f32>) -> Self {
-        let n = train_targets.nrows() as f32;
+        let n = train_targets.nrows();
         let per_output = train_targets
             .axis_iter(Axis(1))
             .map(|col| {
-                if n < 2.0 {
+                if n == 0 {
                     return None;
                 }
-                let mean = col.sum() / n;
-                let var = col.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
-                let sigma = var.sqrt();
-                // Константный выход: масштаба нет, а не «почти ноль».
-                (sigma.is_finite() && sigma > 0.0).then_some(sigma)
+                // f64 нужен не для дополнительной точности результата, а чтобы
+                // сумма большого train-набора не переполнилась раньше среднего.
+                let mean = col.iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64;
+                let var = col
+                    .iter()
+                    .map(|&v| {
+                        let d = f64::from(v) - mean;
+                        d * d
+                    })
+                    .sum::<f64>()
+                    / n as f64;
+                let sigma = var.sqrt() as f32;
+                sigma.is_finite().then_some(sigma)
             })
             .collect();
         Self { per_output }
     }
 
-    /// Масштаб, заданный напрямую (чтение сохранённых отчётов, тесты).
-    pub fn from_sigmas(per_output: Vec<Option<f32>>) -> Self {
-        Self { per_output }
+    /// Масштаб, заданный напрямую. Ноль допустим и означает известный
+    /// константный выход; отрицательное или неконечное σ физического смысла не
+    /// имеет.
+    pub fn from_sigmas(per_output: Vec<Option<f32>>) -> Result<Self, String> {
+        if let Some((output, sigma)) = per_output
+            .iter()
+            .enumerate()
+            .find_map(|(i, value)| value.filter(|v| !v.is_finite() || *v < 0.0).map(|v| (i, v)))
+        {
+            return Err(format!(
+                "масштаб выхода {output} должен быть конечным и неотрицательным, получено {sigma}"
+            ));
+        }
+        Ok(Self { per_output })
     }
 
     /// Масштаб неизвестен: нормализованные метрики и относительная ошибка
@@ -98,6 +118,11 @@ pub fn evaluate(pred: &Array2<f32>, target: &Array2<f32>, scale: &TargetScale) -
     );
     let n = pred.len() as f32;
     assert!(n > 0.0, "пустые данные для метрик");
+    assert_eq!(
+        scale.n_outputs(),
+        target.ncols(),
+        "масштаб должен покрывать все выходы"
+    );
 
     let per_output = evaluate_per_output(pred, target, scale);
     let mut se = 0.0;
@@ -385,6 +410,11 @@ pub(crate) fn evaluate_per_output(
         target.dim(),
         "формы pred и target должны совпадать"
     );
+    assert_eq!(
+        scale.n_outputs(),
+        target.ncols(),
+        "масштаб должен покрывать все выходы"
+    );
     (0..pred.ncols())
         .map(|j| {
             let p = pred.column(j);
@@ -408,11 +438,12 @@ pub(crate) fn evaluate_per_output(
             };
             let rmse = (se / n).sqrt();
             let mae = ae / n;
-            let sigma = scale.sigma(j);
+            let known_sigma = scale.sigma(j);
+            let normalization_sigma = known_sigma.filter(|&sigma| sigma > 0.0);
             // Возле нуля относительная ошибка описывает знаменатель, а не
             // качество: тогда её нет вовсе. «Около нуля» — относительно
             // масштаба обучения, а не абсолютной константы.
-            let rel_error = sigma.and_then(|sigma| {
+            let rel_error = known_sigma.and_then(|sigma| {
                 let near_zero = t.iter().any(|v| v.abs() <= NEAR_ZERO_FRACTION * sigma);
                 (!near_zero && rel.is_finite()).then(|| rel / n)
             });
@@ -421,8 +452,8 @@ pub(crate) fn evaluate_per_output(
                 mae,
                 rel_error,
                 r2,
-                nmae: sigma.map(|sigma| mae / sigma),
-                nrmse: sigma.map(|sigma| rmse / sigma),
+                nmae: normalization_sigma.map(|sigma| mae / sigma),
+                nrmse: normalization_sigma.map(|sigma| rmse / sigma),
             }
         })
         .collect()
@@ -459,14 +490,23 @@ mod tests {
     fn a_constant_train_output_has_no_scale() {
         let train = array![[5.0], [5.0], [5.0]];
         let scale = TargetScale::of(&train);
-        assert_eq!(scale.sigma(0), None);
+        assert_eq!(scale.sigma(0), Some(0.0));
 
         let m = evaluate(&array![[5.0], [6.0]], &array![[5.0], [5.0]], &scale);
         assert!(m.nmae.is_none());
         assert!(m.nrmse.is_none());
-        assert!(m.rel_error.is_none());
+        assert!(
+            m.rel_error.is_some(),
+            "для ненулевой константы MAPE определена"
+        );
         // Ненормализованные метрики при этом считаются как обычно.
         assert!(m.mae > 0.0);
+
+        let zero = evaluate(&array![[1.0], [0.0]], &array![[0.0], [0.0]], &scale);
+        assert!(
+            zero.rel_error.is_none(),
+            "при нулевом target MAPE не определена"
+        );
     }
 
     /// Возле нуля относительная ошибка описывает знаменатель, а не качество:
@@ -487,6 +527,17 @@ mod tests {
         assert!(near_zero.nmae.is_some());
     }
 
+    #[test]
+    fn explicit_scale_rejects_impossible_sigmas_and_must_match_outputs() {
+        assert!(TargetScale::from_sigmas(vec![Some(-1.0)]).is_err());
+        assert!(TargetScale::from_sigmas(vec![Some(f32::NAN)]).is_err());
+        let wrong = TargetScale::unknown(2);
+        let result = std::panic::catch_unwind(|| {
+            evaluate(&array![[1.0]], &array![[1.0]], &wrong);
+        });
+        assert!(result.is_err(), "чужой размер масштаба принят");
+    }
+
     /// Агрегат по выходам определён, только если определены все слагаемые:
     /// «среднее по части выходов» выдавалось бы за метрику всей модели.
     #[test]
@@ -494,7 +545,7 @@ mod tests {
         let train = array![[1.0, 5.0], [3.0, 5.0]];
         let scale = TargetScale::of(&train);
         assert!(scale.sigma(0).is_some());
-        assert!(scale.sigma(1).is_none(), "второй выход константен");
+        assert_eq!(scale.sigma(1), Some(0.0), "второй выход константен");
 
         let m = evaluate(
             &array![[1.0, 5.0], [3.0, 6.0]],

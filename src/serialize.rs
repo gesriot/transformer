@@ -1040,29 +1040,54 @@ pub fn load_numeric_full(path: &str) -> io::Result<NumericCheckpoint> {
 /// даёт `None` — «неизвестно», а не «test не открывался». Незнакомую версию
 /// тоже читаем как отсутствие отчёта: терять из-за неё саму модель нельзя.
 fn build_report(report: &TrainingReport) -> io::Result<Vec<u8>> {
-    let mut p = Vec::new();
     // Версия одна на весь отчёт: метрики внутри пишутся в её раскладке.
     let version = if report.model.is_some() {
         TRAINING_REPORT_VERSION
     } else {
         TRAINING_REPORT_VERSION_V1
     };
+    build_report_for_version(report, version)
+}
+
+/// Кодировщик конкретной поддерживаемой версии. В production версия выводится
+/// из гарантий самого отчёта; явный параметр нужен тестам обратного чтения.
+fn build_report_for_version(report: &TrainingReport, version: u32) -> io::Result<Vec<u8>> {
+    if !matches!(
+        version,
+        TRAINING_REPORT_VERSION | TRAINING_REPORT_VERSION_V2 | TRAINING_REPORT_VERSION_V1
+    ) {
+        return Err(invalid(format!(
+            "training_report: запись неизвестной версии {version}"
+        )));
+    }
+    let mut p = Vec::new();
     // Один тип представляет обе прочитанные версии, но формат остаётся
-    // строгим: v2 всегда связан с моделью, а неподтверждённый отчёт остаётся
+    // строгим: v2/v3 всегда связаны с моделью, а неподтверждённый отчёт остаётся
     // v1 и при повторном сохранении не получает ложного повышения гарантии.
-    match &report.model {
-        Some(model) => {
+    match (version, &report.model) {
+        (TRAINING_REPORT_VERSION_V1, None) => {
             p.extend_from_slice(&version.to_le_bytes());
             p.extend_from_slice(report.dataset.as_bytes());
-            // Маркер сохранён как часть уже выпущенного кодирования v2, но
-            // единственное допустимое значение теперь 1.
+        }
+        (TRAINING_REPORT_VERSION_V2 | TRAINING_REPORT_VERSION, Some(model)) => {
+            p.extend_from_slice(&version.to_le_bytes());
+            p.extend_from_slice(report.dataset.as_bytes());
+            // Маркер сохранён как часть уже выпущенного кодирования v2;
+            // единственное допустимое значение у связанных версий — 1.
             p.extend_from_slice(&1u32.to_le_bytes());
             p.extend_from_slice(model.as_bytes());
         }
-        None => {
-            p.extend_from_slice(&version.to_le_bytes());
-            p.extend_from_slice(report.dataset.as_bytes());
+        (TRAINING_REPORT_VERSION_V1, Some(_)) => {
+            return Err(invalid(
+                "training_report v1 не умеет хранить отпечаток модели",
+            ));
         }
+        (_, None) => {
+            return Err(invalid(format!(
+                "training_report v{version} требует отпечаток модели"
+            )));
+        }
+        _ => unreachable!("неизвестная версия отвергнута выше"),
     }
     w_blob(&mut p, &build_schema(&report.schema));
     w_blob(&mut p, &build_stamp(&report.stamp));
@@ -1089,7 +1114,7 @@ fn build_report(report: &TrainingReport) -> io::Result<Vec<u8>> {
 fn read_report(bytes: &[u8]) -> io::Result<Option<TrainingReport>> {
     let mut r = bytes;
     let version = r_u32(&mut r)?;
-    // Две версии читаются, остальные игнорируются: незнакомая версия не должна
+    // Три версии читаются, остальные игнорируются: незнакомая версия не должна
     // стоить самой модели.
     if !matches!(
         version,
@@ -1099,10 +1124,10 @@ fn read_report(bytes: &[u8]) -> io::Result<Option<TrainingReport>> {
     }
     let mut fingerprint = [0u8; 32];
     r.read_exact(&mut fingerprint)?;
-    // У v1 отпечатка модели не было; у v2 он обязателен. Маркер наличия
+    // У v1 отпечатка модели не было; у v2/v3 он обязателен. Маркер наличия
     // оставлен ради совместимости с первоначальным кодированием v2, но ноль
-    // означал бы противоречащий версии «непроверенный v2».
-    let model = if version == TRAINING_REPORT_VERSION {
+    // означал бы противоречащий версии неподтверждённый отчёт.
+    let model = if version != TRAINING_REPORT_VERSION_V1 {
         match r_u32(&mut r)? {
             1 => {
                 let mut bytes = [0u8; 32];
@@ -1111,8 +1136,8 @@ fn read_report(bytes: &[u8]) -> io::Result<Option<TrainingReport>> {
             }
             other => {
                 return Err(invalid(format!(
-                    "training_report v2: обязательный флаг отпечатка модели {other} не равен 1"
-                )))
+                "training_report v{version}: обязательный флаг отпечатка модели {other} не равен 1"
+            )))
             }
         }
     } else {
@@ -2143,7 +2168,13 @@ mod tests {
         let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
         let profile = InterpretProfile::v1();
         let model_fp = ModelFingerprint::of(&model, &nc, &in_norm, &out_norm);
-        let report = sample_report(&nc, &schema, Some(model_fp));
+        let mut report = sample_report(&nc, &schema, Some(model_fp));
+        // Текущая версия обязана различать отсутствующую MAPE и обе новые
+        // нормализованные метрики, а не только round-trip старой раскладки.
+        let check_metrics = &mut report.check.as_mut().unwrap().metrics;
+        check_metrics.rel_error = None;
+        check_metrics.nmae = Some(0.25);
+        check_metrics.nrmse = Some(0.5);
 
         let path = tmp_path("training_report.bin");
         save_numeric(
@@ -2172,6 +2203,9 @@ mod tests {
         assert_eq!(loaded.selection, report.selection);
 
         assert!(loaded.test_disclosed());
+        assert_eq!(loaded.check.as_ref().unwrap().metrics.rel_error, None);
+        assert_eq!(loaded.check.as_ref().unwrap().metrics.nmae, Some(0.25));
+        assert_eq!(loaded.check.as_ref().unwrap().metrics.nrmse, Some(0.5));
         let check = loaded.check.expect("запись о проверке");
         assert_eq!(check.source, EvalSource::Cv { k: 2 });
         assert_eq!(check.histories.len(), 2, "по истории на каждый fold");
@@ -2414,10 +2448,14 @@ mod tests {
         let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
         let model_fp = ModelFingerprint::of(&model, &nc, &in_norm, &out_norm);
 
-        let mut v2 = build_report(&sample_report(&nc, &schema, Some(model_fp))).unwrap();
+        let mut v2 = build_report_for_version(
+            &sample_report(&nc, &schema, Some(model_fp)),
+            TRAINING_REPORT_VERSION_V2,
+        )
+        .unwrap();
         assert_eq!(
             u32::from_le_bytes(v2[..4].try_into().unwrap()),
-            TRAINING_REPORT_VERSION
+            TRAINING_REPORT_VERSION_V2
         );
         // После версии и 32 байт dataset fingerprint лежит обязательный маркер.
         v2[36..40].copy_from_slice(&0u32.to_le_bytes());
@@ -2432,7 +2470,8 @@ mod tests {
     fn old_reports_have_no_normalized_metrics() {
         let nc = numeric_cfg(ModelKind::Mlp);
         let schema = ModelSchema::synthetic(2, 1).unwrap();
-        // v1 собирается самим кодировщиком: отчёт без отпечатка пишется им.
+        // v1 собирается самим production-кодировщиком: отчёт без отпечатка
+        // остаётся старой версии.
         let v1_bytes = build_report(&sample_report(&nc, &schema, None)).unwrap();
         let v1 = read_report(&v1_bytes).unwrap().expect("v1 читается");
         let check = v1.check.expect("проверка");
@@ -2445,6 +2484,21 @@ mod tests {
             .unwrap()
             .nmae
             .is_none());
+
+        // v2 несёт fingerprint, но использует ту же старую раскладку метрик.
+        let model_fp = ModelFingerprint::from_bytes([9; 32]);
+        let v2_bytes = build_report_for_version(
+            &sample_report(&nc, &schema, Some(model_fp)),
+            TRAINING_REPORT_VERSION_V2,
+        )
+        .unwrap();
+        let v2 = read_report(&v2_bytes).unwrap().expect("v2 читается");
+        assert_eq!(v2.model, Some(model_fp));
+        assert!(v2.weights_verified());
+        let check = v2.check.expect("проверка");
+        assert!(check.metrics.rel_error.is_some(), "в v2 она обязательна");
+        assert!(check.metrics.nmae.is_none(), "в v2 её не было");
+        assert!(check.metrics.nrmse.is_none());
     }
 
     /// Старый формат не может выразить новые величины: молча терять их при

@@ -1283,7 +1283,7 @@ fn print_val_curve(history: &TrainingHistory) {
         "\nКривая development по эпохам ({}; до post-train конвейера):",
         history.source.label()
     );
-    println!("epochs  train_loss     RMSE       MAE      rel.err        R²");
+    println!("epochs  train_loss     RMSE       MAE        nMAE        R²");
     for (epoch, loss, m) in &measured {
         println!(
             "{epoch:>6}  {loss:>10.5}  {:>9.5}  {:>9.5}  {:>9}  {:>8.5}",

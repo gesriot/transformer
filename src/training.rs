@@ -339,15 +339,12 @@ impl SearchObjective {
                 let values: Vec<f32> = per_output_r2().collect();
                 values.iter().sum::<f32>() / values.len().max(1) as f32
             }
-            // nRMSE — нелинейное преобразование R², поэтому считается по каждому
-            // прогону до усреднения, а не из уже среднего R².
-            SearchObjective::Nrmse => {
-                -runs
-                    .iter()
-                    .map(|run| (1.0 - run.metrics.r2).max(0.0).sqrt())
-                    .sum::<f32>()
-                    / runs.len().max(1) as f32
-            }
+            // nRMSE уже посчитан масштабом train своего fold. Выводить его из
+            // R² нельзя: у R² знаменатель принадлежит validation.
+            SearchObjective::Nrmse => runs
+                .iter()
+                .try_fold(0.0f32, |sum, run| run.metrics.nrmse.map(|v| sum + v))
+                .map_or(f32::NEG_INFINITY, |sum| -sum / runs.len().max(1) as f32),
         }
     }
 }
@@ -517,6 +514,28 @@ pub(crate) fn search(
             .setup
             .validate()
             .map_err(|error| format!("кандидат {index} ('{}'): {error}", candidate.label))?;
+    }
+    // Доступность nRMSE определяется данными train, а не кандидатом. Если хотя
+    // бы один fold имеет константный выход, все строки получили бы `None` и
+    // сортировка по NEG_INFINITY молча выбрала бы первую конфигурацию.
+    if matches!(plan.objective, SearchObjective::Nrmse) {
+        for fold in 0..pool.n_folds() {
+            let (train, _) = pool.fold(fold)?;
+            let scale = TargetScale::of(&train.outputs);
+            if let Some(output) = (0..scale.n_outputs())
+                .find(|&output| scale.sigma(output).is_none_or(|sigma| sigma <= 0.0))
+            {
+                let name = dataset
+                    .schema()
+                    .outputs()
+                    .get(output)
+                    .map(|column| column.display_name())
+                    .unwrap_or_else(|| format!("y{output}"));
+                return Err(format!(
+                    "цель aggregate nRMSE недоступна: выход '{name}' не имеет масштаба на train fold {fold}"
+                ));
+            }
+        }
     }
     let cost = search_cost(candidates, plan, pool.n_folds());
 
@@ -1387,6 +1406,50 @@ mod tests {
     }
 
     #[test]
+    fn nrmse_objective_uses_the_training_scaled_metric_not_r2() {
+        let metric = |r2, nrmse| Metrics {
+            rmse: 1.0,
+            mae: 1.0,
+            rel_error: None,
+            r2,
+            nmae: Some(nrmse),
+            nrmse: Some(nrmse),
+        };
+        // Одинаковый R² не должен скрывать разные ошибки в масштабе train.
+        let runs = vec![
+            RunEval {
+                metrics: metric(0.5, 0.25),
+                per_output: vec![metric(0.5, 0.25)],
+                origin: RunOrigin {
+                    fold: Some(0),
+                    init_seed: 0,
+                },
+            },
+            RunEval {
+                metrics: metric(0.5, 0.75),
+                per_output: vec![metric(0.5, 0.75)],
+                origin: RunOrigin {
+                    fold: Some(1),
+                    init_seed: 0,
+                },
+            },
+        ];
+        let eval = ConfigEval {
+            mean: metric(0.5, 0.5),
+            per_output_mean: vec![metric(0.5, 0.5)],
+            r2_std_seeds: 0.0,
+            r2_std_folds: 0.0,
+            origin: ConfigOrigin {
+                init_seeds: vec![0],
+                folds: 2,
+                source: EvalSource::Cv { k: 2 },
+            },
+        };
+
+        assert_eq!(SearchObjective::Nrmse.score(&eval, &runs), -0.5);
+    }
+
+    #[test]
     fn search_ranks_candidates_and_reports_cost() {
         let ds = dataset(120);
         let never = AtomicBool::new(false);
@@ -1466,6 +1529,34 @@ mod tests {
 
         assert_eq!(completed, 0, "ни один кандидат не должен обучаться");
         assert!(error.contains("сломанный"), "{error}");
+    }
+
+    #[test]
+    fn nrmse_search_refuses_a_constant_training_output_before_training() {
+        let mut raw = blackbox::sum().generate(120, 0);
+        raw.outputs.fill(5.0);
+        let schema = ModelSchema::synthetic(raw.inputs.ncols(), raw.outputs.ncols()).unwrap();
+        let ds = Dataset::new(raw, schema).unwrap();
+        let prepared = SplitPlan::default().prepare(ds.data()).unwrap();
+        let plan = SearchPlan {
+            seeds: vec![0],
+            objective: SearchObjective::Nrmse,
+        };
+        let mut completed = 0;
+        let error = search(
+            &ds,
+            &prepared.search,
+            &[candidate("не должен стартовать", 2)],
+            &plan,
+            &AtomicBool::new(false),
+            &mut |_| completed += 1,
+        )
+        .err()
+        .expect("nRMSE без масштаба должна быть отвергнута");
+
+        assert_eq!(completed, 0);
+        assert!(error.contains("nRMSE недоступна"), "{error}");
+        assert!(error.contains("y0"), "{error}");
     }
 
     #[test]
