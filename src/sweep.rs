@@ -14,7 +14,6 @@ use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig
 #[cfg(any(feature = "demo", test))]
 use crate::schema::ModelSchema;
 use crate::split::SearchPool;
-#[cfg(any(feature = "demo", test))]
 use crate::split::SplitPlan;
 #[cfg(feature = "demo")]
 use crate::split::DEFAULT_DATA_SEED;
@@ -190,8 +189,10 @@ pub struct SweepRow {
     pub r2_mean: f32,
     /// Разброс R² по init_seed (folds уже свёрнуты внутри seed).
     pub r2_std: f32,
-    /// Средний по seed разброс R² между folds (0 у holdout).
+    /// Средний по seed и повторам разброс R² между folds (0 у holdout).
     pub r2_std_folds: f32,
+    /// Средний по seed разброс R² между повторами разбиения (0 без повторов).
+    pub r2_std_repeats: f32,
     pub worst_output_r2_mean: f32,
     pub mean_output_r2_mean: f32,
     /// Средний nRMSE по прогонам; `None`, если масштаба train не существует
@@ -617,7 +618,7 @@ fn build_candidates(axes: &SweepAxes) -> Result<Vec<Candidate>, String> {
 
 /// Совместимость: пара (конфигураций, прогонов) для старых адаптеров.
 pub fn sweep_size(axes: &SweepAxes) -> Result<(usize, usize), String> {
-    let cost = sweep_cost(axes, 1)?;
+    let cost = sweep_cost(axes, SplitPlan::default())?;
     Ok((cost.configs, cost.runs))
 }
 
@@ -655,6 +656,7 @@ fn row_from_config_eval(
         r2_mean: agg.mean.r2,
         r2_std: agg.r2_std_seeds,
         r2_std_folds: agg.r2_std_folds,
+        r2_std_repeats: agg.r2_std_repeats,
         worst_output_r2_mean: per_output_r2.iter().copied().fold(f32::INFINITY, f32::min),
         mean_output_r2_mean: mean(&per_output_r2),
         nrmse_mean,
@@ -666,9 +668,10 @@ fn row_from_config_eval(
 /// [`SearchPool`] его не содержит, поэтому отбор конфигурации не может
 /// подсмотреть отложенные данные.
 ///
-/// Для каждого кандидата: все init_seed × все folds; нормализаторы строятся по
-/// train КАЖДОГО fold, метрики снимаются на его validation. Свёртка — через
-/// [`aggregate_runs`] (folds внутри seed, затем seeds).
+/// Для каждого кандидата: все init_seed × все разбиения; нормализаторы строятся
+/// по train КАЖДОГО разбиения, метрики снимаются на его validation. Свёртка —
+/// через [`aggregate_runs`] (folds внутри повтора, повторы внутри seed, затем
+/// seeds).
 /// Кандидаты сетки как список для ядра поиска.
 fn search_candidates(axes: &SweepAxes) -> Result<(Vec<SearchCandidate>, Vec<Candidate>), String> {
     let configs = build_candidates(axes)?;
@@ -693,14 +696,15 @@ fn search_candidates(axes: &SweepAxes) -> Result<(Vec<SearchCandidate>, Vec<Cand
 
 /// Стоимость поиска до запуска: сколько конфигураций, прогонов и эпох.
 ///
-/// Число folds передаётся отдельно, потому что оценку показывают ДО чтения
-/// файла и разбиения: у holdout это 1, у K-fold — k.
-pub fn sweep_cost(axes: &SweepAxes, folds: usize) -> Result<SearchCost, String> {
+/// План разбиения передаётся отдельно, потому что оценку показывают ДО чтения
+/// файла: число обучений на кандидата берётся из него — 1 у holdout, k у
+/// K-fold, k × repeats у повторённого.
+pub fn sweep_cost(axes: &SweepAxes, split: SplitPlan) -> Result<SearchCost, String> {
     let (candidates, _) = search_candidates(axes)?;
     Ok(search_cost(
         &candidates,
         &plan_from(axes, SweepObjective::default()),
-        folds,
+        split.eval_source(),
     ))
 }
 
@@ -799,6 +803,7 @@ mod tests {
     use crate::data::NumericDataset;
     use crate::encoders::FeatureSpec;
     use crate::metrics::{aggregate_runs, RunOrigin};
+    use crate::split::DEFAULT_REPEATS;
     use crate::train::fit_normalizers;
     use ndarray::Array2;
     use std::sync::atomic::AtomicBool;
@@ -806,18 +811,22 @@ mod tests {
     #[test]
     fn budgets_grow_and_cost_is_known_before_launch() {
         let kinds = vec![ModelKind::Mlp, ModelKind::Kan];
+        let holdout = SplitPlan::default();
         let quick = sweep_cost(
             &SweepAxes::for_budget(SearchBudget::Quick, kinds.clone()),
-            1,
+            holdout,
         )
         .unwrap();
         let balanced = sweep_cost(
             &SweepAxes::for_budget(SearchBudget::Balanced, kinds.clone()),
-            1,
+            holdout,
         )
         .unwrap();
-        let thorough =
-            sweep_cost(&SweepAxes::for_budget(SearchBudget::Thorough, kinds), 1).unwrap();
+        let thorough = sweep_cost(
+            &SweepAxes::for_budget(SearchBudget::Thorough, kinds),
+            holdout,
+        )
+        .unwrap();
 
         assert!(quick.configs < balanced.configs);
         assert!(balanced.configs < thorough.configs);
@@ -826,18 +835,17 @@ mod tests {
         assert_eq!(thorough.runs, thorough.configs * 2);
         assert!(quick.epochs_upper_bound() < thorough.epochs_upper_bound());
 
-        // K-fold умножает стоимость на число folds.
-        let five = sweep_cost(
-            &SweepAxes::for_budget(SearchBudget::Quick, vec![ModelKind::Mlp]),
-            5,
-        )
-        .unwrap();
-        let one = sweep_cost(
-            &SweepAxes::for_budget(SearchBudget::Quick, vec![ModelKind::Mlp]),
-            1,
-        )
-        .unwrap();
+        // K-fold умножает стоимость на число folds, а повторы — ещё и на себя.
+        let axes = SweepAxes::for_budget(SearchBudget::Quick, vec![ModelKind::Mlp]);
+        let five = sweep_cost(&axes, SplitPlan::kfold_default()).unwrap();
+        let one = sweep_cost(&axes, holdout).unwrap();
         assert_eq!(five.runs, one.runs * 5);
+        let repeated = sweep_cost(&axes, SplitPlan::repeated_kfold_default()).unwrap();
+        assert_eq!(repeated.runs, five.runs * DEFAULT_REPEATS);
+        assert_eq!(
+            repeated.epochs_upper_bound(),
+            five.epochs_upper_bound() * DEFAULT_REPEATS
+        );
     }
 
     #[test]
@@ -1079,6 +1087,7 @@ mod tests {
             r2_mean: score(k, validation),
             r2_std: 0.0,
             r2_std_folds: 0.0,
+            r2_std_repeats: 0.0,
             worst_output_r2_mean: 0.0,
             mean_output_r2_mean: 0.0,
             nrmse_mean: None,
@@ -1116,6 +1125,7 @@ mod tests {
                 per_output: vec![metric(0.0, 1.0)],
                 origin: RunOrigin {
                     fold: None,
+                    repeat: None,
                     init_seed: 0,
                 },
             },
@@ -1124,6 +1134,7 @@ mod tests {
                 per_output: vec![metric(1.0, 0.0)],
                 origin: RunOrigin {
                     fold: None,
+                    repeat: None,
                     init_seed: 1,
                 },
             },
@@ -1159,7 +1170,7 @@ mod tests {
         let pool = prepared.search.all();
         let (pool_norm, _) = fit_normalizers(&pool, &specs);
         let mut differ = 0;
-        for i in 0..prepared.search.n_folds() {
+        for i in 0..prepared.search.n_splits() {
             let (train, val) = prepared.search.fold(i).unwrap();
             let (fold_norm, _) = fit_normalizers(&train, &specs);
             // Статистики fold считаются по его train, а не по pool.

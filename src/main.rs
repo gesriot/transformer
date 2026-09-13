@@ -904,8 +904,10 @@ fn run_train_flow(
                 source: outcome.development.history.source,
                 metrics: metrics.clone(),
                 per_output: per_output.clone(),
-                // Полный сценарий CLI — holdout: разброса по folds нет.
+                // Полный сценарий CLI — holdout: ни folds, ни повторов, а
+                // значит и разброса между ними.
                 r2_std_folds: 0.0,
+                r2_std_repeats: 0.0,
                 histories: vec![outcome.development.history.clone()],
                 interpret: phase_report(Phase::Development).into_iter().collect(),
             }),
@@ -1605,7 +1607,7 @@ fn run_demo_search(rest: &[String]) {
 
 /// Цена операции — до запуска: она понятнее, чем название набора осей.
 fn announce_search(source: &str, axes: &SweepAxes) {
-    let cost = sweep_cost(axes, 1).unwrap_or_else(|e| fail(&e));
+    let cost = sweep_cost(axes, SplitPlan::default()).unwrap_or_else(|e| fail(&e));
     println!("Поиск {source}: {}\n", cost.describe());
 }
 

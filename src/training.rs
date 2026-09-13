@@ -389,7 +389,10 @@ impl SearchPlan {
 pub struct SearchCost {
     pub configs: usize,
     pub seeds: usize,
+    /// Folds в ОДНОМ повторе разбиения.
     pub folds: usize,
+    /// Повторов разбиения; 1 везде, кроме повторённой CV.
+    pub repeats: usize,
     pub runs: usize,
     /// Верхняя граница эпох на прогон: ранняя остановка может её сократить.
     pub max_epochs: usize,
@@ -399,12 +402,22 @@ pub struct SearchCost {
 }
 
 impl SearchCost {
-    pub fn new(configs: usize, seeds: usize, folds: usize, max_epochs: usize) -> Self {
-        let runs = configs.saturating_mul(seeds).saturating_mul(folds);
+    pub fn new(
+        configs: usize,
+        seeds: usize,
+        folds: usize,
+        repeats: usize,
+        max_epochs: usize,
+    ) -> Self {
+        let runs = configs
+            .saturating_mul(seeds)
+            .saturating_mul(folds)
+            .saturating_mul(repeats);
         Self {
             configs,
             seeds,
             folds,
+            repeats,
             runs,
             max_epochs,
             epochs_upper_bound: runs.saturating_mul(max_epochs),
@@ -415,10 +428,11 @@ impl SearchCost {
         configs: usize,
         seeds: usize,
         folds: usize,
+        repeats: usize,
         max_epochs: usize,
         epochs_upper_bound: usize,
     ) -> Self {
-        let mut cost = Self::new(configs, seeds, folds, max_epochs);
+        let mut cost = Self::new(configs, seeds, folds, repeats, max_epochs);
         cost.epochs_upper_bound = epochs_upper_bound;
         cost
     }
@@ -433,6 +447,14 @@ impl SearchCost {
             format!(" × {} folds", self.folds)
         } else {
             String::new()
+        };
+        let folds = if self.repeats > 1 {
+            format!(
+                "{folds} × {}",
+                russian_count(self.repeats, "повтор", "повтора", "повторов")
+            )
+        } else {
+            folds
         };
         let configs = russian_count(self.configs, "конфигурация", "конфигурации", "конфигураций");
         let runs = russian_count(self.runs, "прогон", "прогона", "прогонов");
@@ -519,7 +541,7 @@ pub(crate) fn search(
     // бы один fold имеет константный выход, все строки получили бы `None` и
     // сортировка по NEG_INFINITY молча выбрала бы первую конфигурацию.
     if matches!(plan.objective, SearchObjective::Nrmse) {
-        for fold in 0..pool.n_folds() {
+        for fold in 0..pool.n_splits() {
             let (train, _) = pool.fold(fold)?;
             let scale = TargetScale::of(&train.outputs);
             if let Some(output) = (0..scale.n_outputs())
@@ -537,7 +559,7 @@ pub(crate) fn search(
             }
         }
     }
-    let cost = search_cost(candidates, plan, pool.n_folds());
+    let cost = search_cost(candidates, plan, pool.source());
 
     let mut rows: Vec<SearchRow> = Vec::new();
     for (index, candidate) in candidates.iter().enumerate() {
@@ -547,7 +569,7 @@ pub(crate) fn search(
 
         let mut runs = Vec::new();
         for &seed in &plan.seeds {
-            for fold in 0..pool.n_folds() {
+            for fold in 0..pool.n_splits() {
                 if cancel.load(Ordering::Relaxed) {
                     return Ok(finish(rows, cost, true));
                 }
@@ -589,19 +611,24 @@ pub(crate) fn search(
     Ok(finish(rows, cost, false))
 }
 
-/// Стоимость поиска по кандидатам и плану.
+/// Стоимость поиска по кандидатам, плану поиска и протоколу оценки.
+///
+/// Folds и повторы берутся из [`EvalSource`], а не задаются отдельным числом:
+/// иначе показанная цена могла бы разойтись с тем, что будет выполнено.
 pub(crate) fn search_cost(
     candidates: &[SearchCandidate],
     plan: &SearchPlan,
-    folds: usize,
+    source: EvalSource,
 ) -> SearchCost {
+    let splits = source.k().saturating_mul(source.repeats());
     let epochs_per_seed_fold = candidates.iter().fold(0usize, |total, candidate| {
         total.saturating_add(candidate.setup.train.epochs)
     });
     SearchCost::with_epochs_upper_bound(
         candidates.len(),
         plan.seeds.len(),
-        folds,
+        source.k(),
+        source.repeats(),
         candidates
             .iter()
             .map(|c| c.setup.train.epochs)
@@ -609,7 +636,7 @@ pub(crate) fn search_cost(
             .unwrap_or(0),
         epochs_per_seed_fold
             .saturating_mul(plan.seeds.len())
-            .saturating_mul(folds),
+            .saturating_mul(splits),
     )
 }
 
@@ -727,30 +754,37 @@ pub(crate) fn train_candidate(
 /// решения.
 #[non_exhaustive]
 pub struct CompletedCheck {
-    /// Средние метрики по всем folds (у holdout — просто validation).
+    /// Средние метрики по всем разбиениям (у holdout — просто validation).
     pub metrics: Metrics,
     pub per_output: Vec<Metrics>,
-    /// Разброс R² между folds; 0 у holdout, где fold один.
+    /// Разброс R² между folds внутри одного повтора; 0 у holdout.
     pub r2_std_folds: f32,
-    /// Чем является оценка: validation у holdout, CV у K-fold.
+    /// Разброс R² между повторами; 0 везде, кроме повторённой CV.
+    pub r2_std_repeats: f32,
+    /// Чем является оценка: validation у holdout, CV у K-fold, повторённая CV
+    /// у повторов.
     pub source: EvalSource,
-    /// История обучения КАЖДОГО fold, по порядку.
+    /// История обучения КАЖДОГО разбиения, по порядку повторов и folds внутри
+    /// них.
     ///
     /// Отдельными кривыми, а не одной склейкой: у K-fold номера эпох
     /// повторяются, и объединённая ломаная не описывает ни один прогон.
     pub histories: Vec<TrainingHistory>,
-    /// Модель фазы разработки. У K-fold её нет: моделей столько же, сколько
-    /// folds, и выдавать одну из них за общую оценку нельзя.
+    /// Модель фазы разработки. У CV её нет: моделей столько же, сколько
+    /// разбиений, и выдавать одну из них за общую оценку нельзя.
     pub model: Option<TrainedModel>,
 }
 
-/// Проверить кандидата: обучить его на каждом fold и снять оценку, не трогая
-/// test. `None` — проверка отменена.
+/// Проверить кандидата: обучить его на каждом разбиении и снять оценку, не
+/// трогая test. `None` — проверка отменена.
 ///
 /// Единственный путь «проверки» для всех режимов интерфейса. У holdout это одно
 /// обучение на train с метриками на validation; у K-fold — обучение на каждом
 /// fold и свёртка, поэтому «Проверить» при K-fold означает CV-оценку, а не
-/// произвольную модель одного fold.
+/// произвольную модель одного fold. У повторённого K-fold обучений `k ×
+/// repeats`: проверяются ВСЕ разбиения, и выбрать из них лучшее нельзя — его
+/// «лучшесть» была бы выбрана по тем же данным, по которым потом принимают
+/// решение.
 ///
 /// `post_train` вызывается ДО оценки каждого fold: конвейер интерпретации
 /// меняет саму модель, и мерить нужно ту модель, которая получится в итоге.
@@ -767,7 +801,7 @@ pub fn check_candidate(
     setup.validate()?;
     let prepared = split.prepare(dataset.data())?;
     let pool = prepared.search;
-    let folds = pool.n_folds();
+    let folds = pool.n_splits();
     let init_seed = setup.train.seed;
 
     let mut runs: Vec<RunEval> = Vec::with_capacity(folds);
@@ -815,6 +849,7 @@ pub fn check_candidate(
         metrics: eval.mean,
         per_output: eval.per_output_mean,
         r2_std_folds: eval.r2_std_folds,
+        r2_std_repeats: eval.r2_std_repeats,
         source: eval.origin.source,
         histories,
         model,
@@ -850,7 +885,7 @@ pub fn run_training(
 ) -> Result<TrainingOutcome, String> {
     setup.validate()?;
     let prepared = split.prepare(dataset.data())?;
-    if prepared.search.n_folds() != 1 {
+    if prepared.search.n_splits() != 1 {
         return Err(
             "run_training пока принимает только holdout; K-fold выполняется через search"
                 .to_string(),
@@ -1170,6 +1205,46 @@ mod tests {
         assert_eq!(kfold.histories.len(), 3);
     }
 
+    /// Повторы — это полная проверка на каждом разбиении: обучений `k ×
+    /// repeats`, а не `k`, и разброс между повторами показывается отдельно от
+    /// разброса между folds.
+    #[test]
+    fn check_runs_every_repeat_of_a_repeated_plan() {
+        let data = dataset(96);
+        let s = setup(2);
+        let never = AtomicBool::new(false);
+
+        let mut splits_seen = Vec::new();
+        let repeated = check_candidate(
+            &data,
+            SplitPlan::RepeatedKFold {
+                k: 3,
+                folds_seed: 1,
+                repeats: 2,
+                test_frac: 0.2,
+                test_seed: 1,
+            },
+            &s,
+            &never,
+            &mut |_, _| {},
+            &mut |_| {},
+            &mut |split, _, _, _| splits_seen.push(split),
+        )
+        .unwrap()
+        .expect("проверка не отменялась");
+
+        assert_eq!(splits_seen, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(repeated.source, EvalSource::RepeatedCv { k: 3, repeats: 2 });
+        assert_eq!(repeated.histories.len(), 6);
+        assert!(
+            repeated.model.is_none(),
+            "ни одно разбиение не представляет CV"
+        );
+        assert!(repeated.r2_std_folds.is_finite());
+        assert!(repeated.r2_std_repeats.is_finite());
+        assert!(repeated.metrics.r2.is_finite());
+    }
+
     /// Конвейер интерпретации меняет саму модель, поэтому метрики снимаются
     /// ПОСЛЕ него: иначе проверка описывала бы не ту модель, которая поедет
     /// дальше.
@@ -1306,18 +1381,26 @@ mod tests {
 
     #[test]
     fn cost_counts_runs_and_epochs_before_launch() {
-        let cost = SearchCost::new(6, 2, 5, 40);
+        let cost = SearchCost::new(6, 2, 5, 1, 40);
         assert_eq!(cost.runs, 60);
         assert_eq!(cost.epochs_upper_bound(), 2400);
         let text = cost.describe();
         assert!(text.contains("6 конфигураций"), "{text}");
         assert!(text.contains("× 5 folds"), "{text}");
         assert!(text.contains("60 прогонов"), "{text}");
+        assert!(!text.contains("повтор"), "{text}");
+
+        // Повторы умножают и прогоны, и показанную цену.
+        let repeated = SearchCost::new(6, 2, 5, 3, 40);
+        assert_eq!(repeated.runs, 180);
+        assert_eq!(repeated.epochs_upper_bound(), 7200);
+        let text = repeated.describe();
+        assert!(text.contains("× 5 folds × 3 повтора"), "{text}");
 
         // У holdout про folds не пишем — это шум.
-        let holdout = SearchCost::new(3, 1, 1, 10).describe();
+        let holdout = SearchCost::new(3, 1, 1, 1, 10).describe();
         assert!(!holdout.contains("folds"));
-        assert!(SearchCost::new(1, 1, 1, 1)
+        assert!(SearchCost::new(1, 1, 1, 1, 1)
             .describe()
             .contains("до 1 эпохи на прогон"));
     }
@@ -1329,10 +1412,11 @@ mod tests {
             seeds: vec![0, 1, 2],
             objective: SearchObjective::default(),
         };
-        let cost = search_cost(&candidates, &plan, 4);
+        let cost = search_cost(&candidates, &plan, EvalSource::Cv { k: 4 });
         assert_eq!(cost.configs, 2);
         assert_eq!(cost.seeds, 3);
         assert_eq!(cost.folds, 4);
+        assert_eq!(cost.repeats, 1);
         assert_eq!(cost.runs, 24);
         // Верхняя граница — по самому длинному кандидату.
         assert_eq!(cost.max_epochs, 25);
@@ -1386,9 +1470,11 @@ mod tests {
             per_output_mean: vec![good.clone(), bad],
             r2_std_seeds: 0.0,
             r2_std_folds: 0.0,
+            r2_std_repeats: 0.0,
             origin: ConfigOrigin {
                 init_seeds: vec![0],
                 folds: 1,
+                repeats: 1,
                 source: EvalSource::Validation,
             },
         };
@@ -1397,6 +1483,7 @@ mod tests {
             per_output: vec![good],
             origin: RunOrigin {
                 fold: None,
+                repeat: None,
                 init_seed: 0,
             },
         }];
@@ -1422,6 +1509,7 @@ mod tests {
                 per_output: vec![metric(0.5, 0.25)],
                 origin: RunOrigin {
                     fold: Some(0),
+                    repeat: None,
                     init_seed: 0,
                 },
             },
@@ -1430,6 +1518,7 @@ mod tests {
                 per_output: vec![metric(0.5, 0.75)],
                 origin: RunOrigin {
                     fold: Some(1),
+                    repeat: None,
                     init_seed: 0,
                 },
             },
@@ -1439,9 +1528,11 @@ mod tests {
             per_output_mean: vec![metric(0.5, 0.5)],
             r2_std_seeds: 0.0,
             r2_std_folds: 0.0,
+            r2_std_repeats: 0.0,
             origin: ConfigOrigin {
                 init_seeds: vec![0],
                 folds: 2,
+                repeats: 1,
                 source: EvalSource::Cv { k: 2 },
             },
         };
@@ -1941,6 +2032,40 @@ mod tests {
         let eval = outcome.eval.expect("test открывается после refit");
         assert_eq!(eval.origin.plan, plan);
         assert_eq!(eval.origin.final_init_seed, DEFAULT_FINAL_INIT_SEED);
+    }
+
+    /// Повторы удорожают проверку, но не финал: refit по-прежнему один, на том
+    /// же pool и с тем же единственным замером на test.
+    #[test]
+    fn repeats_do_not_multiply_the_final_refit() {
+        let ds = dataset(120);
+        let never = AtomicBool::new(false);
+        let plan = SplitPlan::repeated_kfold_default();
+        let outcome = refit(
+            &ds,
+            plan,
+            &setup(1),
+            DEFAULT_FINAL_INIT_SEED,
+            &never,
+            &mut |_, _| {},
+            &mut |_, _| {},
+            &mut |_, _, _, _| {},
+        )
+        .expect("повторённый K-fold refit обучается на всём pool");
+
+        // История одна — refit единственный: у него нет ни folds, ни повторов.
+        let model = outcome.model.expect("финальная модель");
+        assert_eq!(
+            model.history.source,
+            EvalSource::RepeatedCv { k: 5, repeats: 3 }
+        );
+        assert_eq!(model.history.points.len(), 1, "один прогон на одну эпоху");
+        let eval = outcome.eval.expect("test открывается после refit");
+        assert_eq!(eval.origin.plan, plan);
+        // Pool и test у обычного и повторённого плана одни и те же, поэтому и
+        // число строк финального замера совпадает.
+        let plain = SplitPlan::kfold_default().prepare(ds.data()).unwrap();
+        assert_eq!(eval.origin.test_rows, plain.test.len());
     }
 
     #[test]

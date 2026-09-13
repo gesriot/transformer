@@ -63,10 +63,7 @@ impl RunIdentity {
     /// Чем является development-метрика этого запуска. Источник выводится из
     /// разбиения, а не хранится вторым полем, которое могло бы с ним разойтись.
     pub fn eval_source(&self) -> EvalSource {
-        match self.split {
-            SplitPlan::Holdout { .. } => EvalSource::Validation,
-            SplitPlan::KFold { k, .. } => EvalSource::Cv { k },
-        }
+        self.split.eval_source()
     }
 }
 
@@ -81,8 +78,12 @@ impl RunIdentity {
 pub struct CheckEval {
     pub metrics: Metrics,
     pub per_output: Vec<Metrics>,
-    /// Разброс R² между folds; 0 у holdout, где fold один.
+    /// Разброс R² между folds внутри одного повтора; 0 у holdout.
     pub r2_std_folds: f32,
+    /// Разброс R² между повторами; 0 везде, кроме повторённой CV. Разброс
+    /// между разбиениями и разброс внутри разбиения означают разное, поэтому
+    /// они не складываются в одно число.
+    pub r2_std_repeats: f32,
 }
 
 /// Проверенный кандидат: отпечаток, оценка и отчёты конвейера.
@@ -90,9 +91,9 @@ pub struct CheckEval {
 pub struct CheckedRun {
     pub stamp: RunIdentity,
     pub eval: CheckEval,
-    /// Отчёт конвейера по каждому fold, по порядку; пусто, если конвейера не
-    /// просили. Отчёт одного fold не описывает CV-проверку, поэтому их
-    /// столько же, сколько folds, а не один.
+    /// Отчёт конвейера по каждому разбиению, по порядку; пусто, если конвейера
+    /// не просили. Отчёт одного fold не описывает CV-проверку, поэтому их
+    /// столько же, сколько разбиений, а не один.
     pub interpret: Vec<InterpretReport>,
 }
 
@@ -319,6 +320,7 @@ mod tests {
                 metrics: metrics(),
                 per_output: vec![metrics()],
                 r2_std_folds: 0.0,
+                r2_std_repeats: 0.0,
             },
             interpret: Vec::new(),
         }
@@ -403,6 +405,43 @@ mod tests {
 
         // Исходный кандидат по-прежнему проверен.
         assert!(life.can_finalize(&base).is_ok());
+    }
+
+    /// Число повторов — часть разбиения: с ним проверка относится к другому
+    /// протоколу и устаревает. Уже раскрытый test при этом не возвращается:
+    /// данные-то те же.
+    #[test]
+    fn changing_the_number_of_repeats_makes_the_check_stale_but_not_the_test() {
+        let mut base = stamp(candidate(16));
+        base.split = SplitPlan::KFold {
+            k: 5,
+            folds_seed: 1,
+            test_frac: 0.15,
+            test_seed: 1,
+        };
+        let mut life = Lifecycle::default();
+        life.record_check(checked(base.clone()));
+
+        let mut repeated = base.clone();
+        repeated.split = SplitPlan::RepeatedKFold {
+            k: 5,
+            folds_seed: 1,
+            repeats: 3,
+            test_frac: 0.15,
+            test_seed: 1,
+        };
+        assert_eq!(life.can_finalize(&repeated), Err(FinalizeRefusal::Stale));
+        assert!(life.check_is_stale(&repeated));
+        assert!(life.checked_for(&repeated).is_none());
+
+        // Test уже открыт на этих данных — другое число повторов его не
+        // возвращает.
+        life.record_disclosure(disclosure(base.clone()));
+        assert_eq!(
+            life.can_finalize(&repeated),
+            Err(FinalizeRefusal::TestDisclosed)
+        );
+        assert!(life.disclosure_on(repeated.dataset).is_some());
     }
 
     #[test]

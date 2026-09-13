@@ -4,7 +4,7 @@ use super::messages::Command;
 use super::messages::ModelOrigin;
 use super::session::{split_plan_label, App, KAN_CURVE_SAMPLES};
 use crate::interpret::InterpretReport;
-use crate::metrics::{EvalSource, Metrics};
+use crate::metrics::Metrics;
 use crate::numeric_model::ModelKind;
 use crate::report::TrainingReport;
 use crate::schema::ModelSchema;
@@ -27,12 +27,7 @@ fn report_metrics(ui: &mut egui::Ui, report: &TrainingReport, info: &ModelInfo) 
             split_plan_label(report.stamp.split),
             report.stamp.candidate.train.seed
         ));
-        if check.r2_std_folds > 0.0 {
-            ui.label(format!(
-                "Разброс R² между folds: ±{:.5}",
-                check.r2_std_folds
-            ));
-        }
+        show_spread(ui, check.r2_std_folds, check.r2_std_repeats);
     }
     match &report.final_run {
         Some(final_run) => {
@@ -209,10 +204,7 @@ impl App {
         // происхождении: раньше здесь стояло «checkpoint их не хранит».
         let from_report = info.report.as_ref().filter(|_| checked.is_none());
         if let Some(run) = checked {
-            let source = match run.stamp.eval_source() {
-                EvalSource::Cv { k } => format!("cv-{k}"),
-                _ => "validation".to_string(),
-            };
+            let source = run.stamp.eval_source().label();
             show_metrics(
                 ui,
                 &source,
@@ -227,12 +219,7 @@ impl App {
             ));
             // У CV одного среднего мало: одинаковое среднее при разном разбросе
             // между folds означает разную надёжность вывода.
-            if run.eval.r2_std_folds > 0.0 {
-                ui.label(format!(
-                    "Разброс R² между folds: ±{:.5}",
-                    run.eval.r2_std_folds
-                ));
-            }
+            show_spread(ui, run.eval.r2_std_folds, run.eval.r2_std_repeats);
         }
         if let Some(final_eval) = disclosed.map(|d| &d.eval) {
             show_metrics(
@@ -673,6 +660,23 @@ fn output_label(column: &crate::schema::Column) -> String {
     match column.unit() {
         Some(unit) => format!("{}, {unit}", column.display_name()),
         None => column.display_name(),
+    }
+}
+
+/// Разброс R² вокруг среднего CV.
+///
+/// Два числа, а не одно: разброс между folds означает зависимость от того,
+/// какие строки попали в validation, а разброс между повторами — зависимость
+/// от самой нарезки. Нули не показываются: у holdout и у CV без повторов
+/// показывать нечего.
+pub(super) fn show_spread(ui: &mut egui::Ui, r2_std_folds: f32, r2_std_repeats: f32) {
+    if r2_std_folds > 0.0 {
+        ui.label(format!("Разброс R² между folds: ±{r2_std_folds:.5}"));
+    }
+    if r2_std_repeats > 0.0 {
+        ui.label(format!(
+            "Разброс R² между повторами разбиения: ±{r2_std_repeats:.5}"
+        ));
     }
 }
 

@@ -25,9 +25,27 @@ pub const DEFAULT_DATA_SEED: u64 = 0;
 pub const DEFAULT_FINAL_INIT_SEED: u64 = 0;
 pub const DEFAULT_K: usize = 5;
 pub const DEFAULT_TEST_FRAC: f32 = 0.15;
+pub const DEFAULT_REPEATS: usize = 3;
 
-/// План разбиения. Ровно два варианта: «ручная настройка» в интерфейсе — это
-/// другие числа в `Holdout`, а не отдельный доменный случай.
+/// Шаг между seed соседних повторов.
+///
+/// Повтор 0 берёт сам `folds_seed`, поэтому первый проход repeated K-fold
+/// совпадает с обычным K-fold на тех же seed — это и делает два плана
+/// сравнимыми. Дальше seed сдвигается на «золотое» смещение 64-битного
+/// диапазона: при шаге 1 план с `folds_seed` 7 и тремя повторами повторял бы
+/// разбиения плана с `folds_seed` 8, и два разных плана давали бы одни и те же
+/// числа.
+pub const REPEAT_SEED_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// Seed разбиения pool на повторе `repeat`. Правило входит в происхождение:
+/// без него по сохранённому `folds_seed` нельзя восстановить, какие именно
+/// разбиения проверялись.
+pub fn repeat_folds_seed(folds_seed: u64, repeat: usize) -> u64 {
+    folds_seed.wrapping_add(REPEAT_SEED_STEP.wrapping_mul(repeat as u64))
+}
+
+/// План разбиения. «Ручная настройка» в интерфейсе — это другие числа в
+/// `Holdout`, а не отдельный доменный случай.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum SplitPlan {
@@ -41,6 +59,25 @@ pub enum SplitPlan {
     KFold {
         k: usize,
         folds_seed: u64,
+        test_frac: f32,
+        test_seed: u64,
+    },
+    /// K-fold, повторённый несколько раз с разными разбиениями pool.
+    ///
+    /// Отдельный вариант, а не поле в [`SplitPlan::KFold`]: у уже записанных
+    /// планов повторов нет, и дописывать им «repeats: 1» значило бы менять
+    /// смысл прочитанного файла.
+    ///
+    /// Test отделяется теми же seed и в том же месте, поэтому он не зависит от
+    /// числа повторов: меняются только разбиения pool.
+    RepeatedKFold {
+        k: usize,
+        /// Seed первого повтора; остальные получаются по
+        /// [`repeat_folds_seed`].
+        folds_seed: u64,
+        /// Сколько раз pool переразбивается на `k` folds. Минимум 2: один
+        /// повтор — это и есть [`SplitPlan::KFold`].
+        repeats: usize,
         test_frac: f32,
         test_seed: u64,
     },
@@ -64,6 +101,46 @@ impl SplitPlan {
             folds_seed: DEFAULT_SPLIT_SEED,
             test_frac: DEFAULT_TEST_FRAC,
             test_seed: DEFAULT_SPLIT_SEED,
+        }
+    }
+
+    /// Повторённый K-fold с умолчаниями.
+    pub fn repeated_kfold_default() -> Self {
+        SplitPlan::RepeatedKFold {
+            k: DEFAULT_K,
+            folds_seed: DEFAULT_SPLIT_SEED,
+            repeats: DEFAULT_REPEATS,
+            test_frac: DEFAULT_TEST_FRAC,
+            test_seed: DEFAULT_SPLIT_SEED,
+        }
+    }
+
+    /// Сколько повторов делает план: 1 у всех, кроме
+    /// [`SplitPlan::RepeatedKFold`].
+    pub fn repeats(&self) -> usize {
+        match *self {
+            SplitPlan::RepeatedKFold { repeats, .. } => repeats,
+            _ => 1,
+        }
+    }
+
+    /// Сколько обучений требует одна проверка кандидата: `k × repeats` у CV,
+    /// одно у holdout. Именно на это число умножается стоимость поиска.
+    pub fn n_splits(&self) -> usize {
+        match *self {
+            SplitPlan::Holdout { .. } => 1,
+            SplitPlan::KFold { k, .. } => k,
+            SplitPlan::RepeatedKFold { k, repeats, .. } => k.saturating_mul(repeats),
+        }
+    }
+
+    /// Чем будет метрика фазы разработки при этом плане. Выводится из плана, а
+    /// не хранится рядом: два поля могли бы разойтись.
+    pub fn eval_source(&self) -> EvalSource {
+        match *self {
+            SplitPlan::Holdout { .. } => EvalSource::Validation,
+            SplitPlan::KFold { k, .. } => EvalSource::Cv { k },
+            SplitPlan::RepeatedKFold { k, repeats, .. } => EvalSource::RepeatedCv { k, repeats },
         }
     }
 
@@ -103,29 +180,19 @@ impl SplitPlan {
                 }
                 Ok(())
             }
-            SplitPlan::KFold { k, test_frac, .. } => {
-                if !test_frac.is_finite() {
-                    return Err("test_frac должен быть конечным".to_string());
+            SplitPlan::KFold { k, test_frac, .. } => validate_cv(n_rows, k, test_frac),
+            SplitPlan::RepeatedKFold {
+                k,
+                repeats,
+                test_frac,
+                ..
+            } => {
+                if repeats < 2 {
+                    return Err(
+                        "повторов должно быть >= 2: один повтор — это обычный K-fold".to_string(),
+                    );
                 }
-                if k < 2 {
-                    return Err("k должно быть >= 2".to_string());
-                }
-                if test_frac <= 0.0 || test_frac >= 1.0 {
-                    return Err("test_frac должен быть в (0, 1)".to_string());
-                }
-                let n_test = (n_rows as f32 * test_frac).round() as usize;
-                let n_pool = n_rows.saturating_sub(n_test);
-                if n_test == 0 {
-                    return Err(format!(
-                        "{n_rows} строк при test_frac {test_frac} дают пустой test"
-                    ));
-                }
-                if n_pool < k {
-                    return Err(format!(
-                        "в pool остаётся {n_pool} строк — меньше, чем folds ({k})"
-                    ));
-                }
-                Ok(())
+                validate_cv(n_rows, k, test_frac)
             }
         }
     }
@@ -149,9 +216,11 @@ impl SplitPlan {
                 Ok(PreparedSplit {
                     search: SearchPool {
                         pool: data.gather(pool_rows),
-                        folds: vec![FoldIndices {
+                        splits: vec![SplitIndices {
                             train: (0..n_train).collect(),
                             val: (n_train..n_train + n_val).collect(),
+                            fold: None,
+                            repeat: None,
                         }],
                         source: EvalSource::Validation,
                     },
@@ -166,47 +235,133 @@ impl SplitPlan {
                 folds_seed,
                 test_frac,
                 test_seed,
-            } => {
-                idx.shuffle(&mut StdRng::seed_from_u64(test_seed));
-                let n_test = (n as f32 * test_frac).round() as usize;
-                let test = data.gather(&idx[..n_test]);
-                let pool = data.gather(&idx[n_test..]);
-
-                // Индексы внутри pool: перемешиваем отдельным seed, режем на k
-                // частей, отличающихся не больше чем на строку.
-                let m = pool.len();
-                let mut pool_idx: Vec<usize> = (0..m).collect();
-                pool_idx.shuffle(&mut StdRng::seed_from_u64(folds_seed));
-                let base = m / k;
-                let rem = m % k;
-                let mut folds = Vec::with_capacity(k);
-                let mut start = 0;
-                for f in 0..k {
-                    let size = base + usize::from(f < rem);
-                    let val: Vec<usize> = pool_idx[start..start + size].to_vec();
-                    let train: Vec<usize> = pool_idx[..start]
-                        .iter()
-                        .chain(pool_idx[start + size..].iter())
-                        .copied()
-                        .collect();
-                    folds.push(FoldIndices { train, val });
-                    start += size;
-                }
-
-                Ok(PreparedSplit {
-                    search: SearchPool {
-                        pool,
-                        folds,
-                        source: EvalSource::Cv { k },
-                    },
-                    test: HoldoutTest {
-                        data: test,
-                        plan: *self,
-                    },
-                })
-            }
+            } => Ok(self.prepare_cv(
+                data,
+                &mut idx,
+                CvLayout {
+                    k,
+                    folds_seed,
+                    repeats: None,
+                    test_frac,
+                    test_seed,
+                },
+            )),
+            SplitPlan::RepeatedKFold {
+                k,
+                folds_seed,
+                repeats,
+                test_frac,
+                test_seed,
+            } => Ok(self.prepare_cv(
+                data,
+                &mut idx,
+                CvLayout {
+                    k,
+                    folds_seed,
+                    repeats: Some(repeats),
+                    test_frac,
+                    test_seed,
+                },
+            )),
         }
     }
+
+    /// Общая часть обоих CV-планов.
+    ///
+    /// Test отделяется до и независимо от повторов — тем же `test_seed` и в том
+    /// же месте, поэтому обычный и повторённый K-fold с одинаковыми seed видят
+    /// один и тот же отложенный набор. Повтор 0 использует сам `folds_seed`, и
+    /// первый его проход совпадает с обычным K-fold.
+    fn prepare_cv(
+        &self,
+        data: &NumericDataset,
+        idx: &mut [usize],
+        layout: CvLayout,
+    ) -> PreparedSplit {
+        let CvLayout {
+            k,
+            folds_seed,
+            repeats,
+            test_frac,
+            test_seed,
+        } = layout;
+        idx.shuffle(&mut StdRng::seed_from_u64(test_seed));
+        let n_test = (data.len() as f32 * test_frac).round() as usize;
+        let test = data.gather(&idx[..n_test]);
+        let pool = data.gather(&idx[n_test..]);
+
+        let m = pool.len();
+        let mut splits = Vec::with_capacity(k * repeats.unwrap_or(1));
+        for repeat in 0..repeats.unwrap_or(1) {
+            // Индексы внутри pool: перемешиваем отдельным seed, режем на k
+            // частей, отличающихся не больше чем на строку.
+            let mut pool_idx: Vec<usize> = (0..m).collect();
+            pool_idx.shuffle(&mut StdRng::seed_from_u64(repeat_folds_seed(
+                folds_seed, repeat,
+            )));
+            let base = m / k;
+            let rem = m % k;
+            let mut start = 0;
+            for f in 0..k {
+                let size = base + usize::from(f < rem);
+                let val: Vec<usize> = pool_idx[start..start + size].to_vec();
+                let train: Vec<usize> = pool_idx[..start]
+                    .iter()
+                    .chain(pool_idx[start + size..].iter())
+                    .copied()
+                    .collect();
+                splits.push(SplitIndices {
+                    train,
+                    val,
+                    fold: Some(f),
+                    repeat: repeats.map(|_| repeat),
+                });
+                start += size;
+            }
+        }
+
+        PreparedSplit {
+            search: SearchPool {
+                pool,
+                splits,
+                source: match repeats {
+                    None => EvalSource::Cv { k },
+                    Some(repeats) => EvalSource::RepeatedCv { k, repeats },
+                },
+            },
+            test: HoldoutTest {
+                data: test,
+                plan: *self,
+            },
+        }
+    }
+}
+
+/// Проверка CV-части плана: она одинакова у обычного и повторённого K-fold,
+/// потому что повторы меняют только разбиение pool.
+fn validate_cv(n_rows: usize, k: usize, test_frac: f32) -> Result<(), String> {
+    if !test_frac.is_finite() {
+        return Err("test_frac должен быть конечным".to_string());
+    }
+    if k < 2 {
+        return Err("k должно быть >= 2".to_string());
+    }
+    if test_frac <= 0.0 || test_frac >= 1.0 {
+        return Err("test_frac должен быть в (0, 1)".to_string());
+    }
+    let n_test = (n_rows as f32 * test_frac).round() as usize;
+    let n_pool = n_rows.saturating_sub(n_test);
+    if n_test == 0 {
+        return Err(format!(
+            "{n_rows} строк при test_frac {test_frac} дают пустой test"
+        ));
+    }
+    if n_pool < k {
+        return Err(format!(
+            "в pool остаётся {n_pool} строк — меньше, чем folds ({k})"
+        ));
+    }
+    Ok(())
 }
 
 /// Округление долей holdout в строки. Test получает остаток, поэтому сумма
@@ -227,24 +382,41 @@ pub struct PreparedSplit {
     pub test: HoldoutTest,
 }
 
-struct FoldIndices {
-    train: Vec<usize>,
-    val: Vec<usize>,
+/// Параметры CV-разбиения, общие у обычного и повторённого K-fold.
+/// `repeats: None` означает обычный K-fold — у его прогонов нет номера повтора.
+struct CvLayout {
+    k: usize,
+    folds_seed: u64,
+    repeats: Option<usize>,
+    test_frac: f32,
+    test_seed: u64,
 }
 
-/// Данные, доступные поиску: holdout train/validation либо K-fold pool. Наружу
-/// — единый интерфейс folds, чтобы поиск не различал эти случаи.
+/// Одно разбиение pool на train и validation вместе со своим местом в плане.
+struct SplitIndices {
+    train: Vec<usize>,
+    val: Vec<usize>,
+    /// Номер fold; `None` у holdout.
+    fold: Option<usize>,
+    /// Номер повтора; `None` у holdout и у обычного K-fold.
+    repeat: Option<usize>,
+}
+
+/// Данные, доступные поиску: holdout train/validation либо CV-pool. Наружу —
+/// единый список разбиений, чтобы поиск не различал эти случаи.
 ///
 /// Поля закрыты: достать отсюда test невозможно, потому что его здесь нет.
 pub struct SearchPool {
     pool: NumericDataset,
-    folds: Vec<FoldIndices>,
+    splits: Vec<SplitIndices>,
     source: EvalSource,
 }
 
 impl SearchPool {
-    pub fn n_folds(&self) -> usize {
-        self.folds.len()
+    /// Сколько обучений требует один кандидат: 1 у holdout, `k` у K-fold,
+    /// `k × repeats` у повторённого.
+    pub fn n_splits(&self) -> usize {
+        self.splits.len()
     }
 
     /// Строк в pool (train + validation).
@@ -261,13 +433,13 @@ impl SearchPool {
         self.source
     }
 
-    /// Train и validation части fold. Материализуются по требованию: хранить k
-    /// копий данных незачем.
+    /// Train и validation части разбиения `i`. Материализуются по требованию:
+    /// хранить k × repeats копий данных незачем.
     pub fn fold(&self, i: usize) -> Result<(NumericDataset, NumericDataset), String> {
         let f = self
-            .folds
+            .splits
             .get(i)
-            .ok_or_else(|| format!("fold {i} вне диапазона 0..{}", self.folds.len()))?;
+            .ok_or_else(|| format!("fold {i} вне диапазона 0..{}", self.splits.len()))?;
         Ok((self.pool.gather(&f.train), self.pool.gather(&f.val)))
     }
 
@@ -277,15 +449,21 @@ impl SearchPool {
         self.pool.gather(&(0..self.pool.len()).collect::<Vec<_>>())
     }
 
-    /// Происхождение прогона на fold `i`. Номер fold проставляет pool, а не
-    /// потребитель: у holdout он обязан быть `None`, у CV — `Some(i)`, и
-    /// `aggregate_runs` это проверяет.
-    pub(crate) fn run_origin(&self, fold: usize, init_seed: u64) -> RunOrigin {
+    /// Происхождение прогона на разбиении `i`. Номера fold и повтора
+    /// проставляет pool, а не потребитель: у holdout оба обязаны быть `None`,
+    /// у CV задан fold, у повторённого CV — оба, и `aggregate_runs` это
+    /// проверяет.
+    ///
+    /// Индекс вне диапазона означает ошибку в программе: разбиения перебирает
+    /// тот же `n_splits`.
+    pub(crate) fn run_origin(&self, split: usize, init_seed: u64) -> RunOrigin {
+        let split = self
+            .splits
+            .get(split)
+            .expect("номер разбиения приходит из n_splits");
         RunOrigin {
-            fold: match self.source {
-                EvalSource::Validation => None,
-                _ => Some(fold),
-            },
+            fold: split.fold,
+            repeat: split.repeat,
             init_seed,
         }
     }
@@ -388,6 +566,24 @@ mod tests {
         d.outputs.iter().map(|&v| v as i64).collect()
     }
 
+    /// Метки отложенного набора. Иначе их не увидеть: наружу test отдаёт
+    /// только метрики, а входы показывает единственный раз — замыканию.
+    fn test_labels(test: HoldoutTest) -> BTreeSet<i64> {
+        let mut seen = BTreeSet::new();
+        test.evaluate(
+            |inputs| {
+                for row in inputs.rows() {
+                    seen.insert((row[0] / 10.0).round() as i64);
+                }
+                Array2::zeros((inputs.nrows(), 1))
+            },
+            DEFAULT_FINAL_INIT_SEED,
+            &TargetScale::unknown(1),
+        )
+        .unwrap();
+        seen
+    }
+
     #[test]
     fn default_plan_is_70_15_15_with_seed_1() {
         assert_eq!(
@@ -470,12 +666,12 @@ mod tests {
     fn kfold_covers_each_pool_row_exactly_once() {
         let data = labeled(100);
         let s = SplitPlan::kfold_default().prepare(&data).unwrap();
-        assert_eq!(s.search.n_folds(), 5);
+        assert_eq!(s.search.n_splits(), 5);
         assert_eq!(s.test.len(), 15);
         assert_eq!(s.search.len(), 85);
 
         let mut seen: Vec<i64> = Vec::new();
-        for i in 0..s.search.n_folds() {
+        for i in 0..s.search.n_splits() {
             let (train, val) = s.search.fold(i).unwrap();
             // Внутри fold train и validation не пересекаются...
             assert!(labels(&train).is_disjoint(&labels(&val)));
@@ -491,11 +687,114 @@ mod tests {
         assert_eq!(unique, labels(&s.search.all()));
     }
 
+    /// Главный инвариант повторов: меняются только разбиения pool. Test
+    /// отделяется теми же seed и остаётся тем же набором строк — иначе
+    /// обычный и повторённый K-fold измеряли бы разное.
+    #[test]
+    fn repeats_do_not_move_the_outer_test() {
+        let data = labeled(100);
+        let plain = SplitPlan::kfold_default().prepare(&data).unwrap();
+        let repeated = SplitPlan::repeated_kfold_default().prepare(&data).unwrap();
+
+        assert_eq!(plain.test.len(), repeated.test.len());
+        assert_eq!(test_labels(plain.test), test_labels(repeated.test));
+        assert_eq!(labels(&plain.search.all()), labels(&repeated.search.all()));
+    }
+
+    /// Первый повтор берёт сам `folds_seed`, поэтому повторённый K-fold
+    /// начинается ровно с того разбиения, которое дал бы обычный.
+    #[test]
+    fn the_first_repeat_reproduces_plain_kfold() {
+        let data = labeled(100);
+        let plain = SplitPlan::kfold_default().prepare(&data).unwrap();
+        let repeated = SplitPlan::repeated_kfold_default().prepare(&data).unwrap();
+
+        assert_eq!(plain.search.n_splits(), DEFAULT_K);
+        assert_eq!(repeated.search.n_splits(), DEFAULT_K * DEFAULT_REPEATS);
+        for i in 0..DEFAULT_K {
+            let (train, val) = plain.search.fold(i).unwrap();
+            let (r_train, r_val) = repeated.search.fold(i).unwrap();
+            assert_eq!(labels(&train), labels(&r_train), "train разбиения {i}");
+            assert_eq!(labels(&val), labels(&r_val), "validation разбиения {i}");
+        }
+    }
+
+    #[test]
+    fn each_repeat_covers_the_pool_once_and_differs_from_the_others() {
+        let data = labeled(100);
+        let s = SplitPlan::repeated_kfold_default().prepare(&data).unwrap();
+        let pool = labels(&s.search.all());
+
+        let mut partitions = Vec::new();
+        for repeat in 0..DEFAULT_REPEATS {
+            let mut seen: Vec<i64> = Vec::new();
+            let mut partition = Vec::new();
+            for fold in 0..DEFAULT_K {
+                let (_, val) = s.search.fold(repeat * DEFAULT_K + fold).unwrap();
+                let val = labels(&val);
+                seen.extend(val.iter().copied());
+                partition.push(val);
+            }
+            let unique: BTreeSet<i64> = seen.iter().copied().collect();
+            assert_eq!(
+                seen.len(),
+                pool.len(),
+                "повтор {repeat} покрыл не весь pool"
+            );
+            assert_eq!(
+                unique, pool,
+                "повтор {repeat} покрыл строки не по одному разу"
+            );
+            partitions.push(partition);
+        }
+        // Повтор, совпадающий с предыдущим, ничего бы не измерял.
+        assert_ne!(partitions[0], partitions[1]);
+        assert_ne!(partitions[1], partitions[2]);
+    }
+
+    #[test]
+    fn repeat_seeds_start_at_the_folds_seed_and_never_collide() {
+        assert_eq!(repeat_folds_seed(7, 0), 7);
+        let seeds: BTreeSet<u64> = (0..8).map(|r| repeat_folds_seed(7, r)).collect();
+        assert_eq!(seeds.len(), 8);
+        // Соседние folds_seed не должны давать одну и ту же последовательность.
+        assert_ne!(repeat_folds_seed(7, 1), repeat_folds_seed(8, 0));
+    }
+
+    #[test]
+    fn a_single_repeat_is_not_a_repeated_plan() {
+        let plan = SplitPlan::RepeatedKFold {
+            k: 5,
+            folds_seed: 1,
+            repeats: 1,
+            test_frac: 0.15,
+            test_seed: 1,
+        };
+        let err = plan.validate(100).unwrap_err();
+        assert!(err.contains("повторов"), "текст ошибки: {err}");
+    }
+
+    #[test]
+    fn repeated_plan_reports_its_cost_and_source() {
+        let plan = SplitPlan::repeated_kfold_default();
+        assert_eq!(plan.repeats(), DEFAULT_REPEATS);
+        assert_eq!(plan.n_splits(), DEFAULT_K * DEFAULT_REPEATS);
+        assert_eq!(
+            plan.eval_source(),
+            EvalSource::RepeatedCv {
+                k: DEFAULT_K,
+                repeats: DEFAULT_REPEATS
+            }
+        );
+        assert_eq!(SplitPlan::kfold_default().n_splits(), DEFAULT_K);
+        assert_eq!(SplitPlan::default().n_splits(), 1);
+    }
+
     #[test]
     fn kfold_balances_fold_sizes() {
         // 85 строк на 5 folds: 17 в каждом; 83 на 5 — 17,17,17,16,16.
         let s = SplitPlan::kfold_default().prepare(&labeled(98)).unwrap();
-        let mut sizes: Vec<usize> = (0..s.search.n_folds())
+        let mut sizes: Vec<usize> = (0..s.search.n_splits())
             .map(|i| s.search.fold(i).unwrap().1.len())
             .collect();
         sizes.sort_unstable();
@@ -543,7 +842,7 @@ mod tests {
 
             assert_eq!(test_labels.len(), test_len);
             assert!(test_labels.is_disjoint(&labels(&s.search.all())));
-            for i in 0..s.search.n_folds() {
+            for i in 0..s.search.n_splits() {
                 let (train, val) = s.search.fold(i).unwrap();
                 assert!(test_labels.is_disjoint(&labels(&train)));
                 assert!(test_labels.is_disjoint(&labels(&val)));

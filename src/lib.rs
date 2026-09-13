@@ -105,9 +105,9 @@ pub use surrogate::SurrogateModel;
 // Обучение: активный набор, один сценарий и его протокол оценки.
 pub use metrics::{evaluate, EvalSource, Metrics, TargetScale};
 pub use split::{
-    FinalEval, FinalOrigin, HoldoutTest, PreparedSplit, SearchPool, SplitPlan, DEFAULT_DATA_SEED,
-    DEFAULT_FINAL_INIT_SEED, DEFAULT_K, DEFAULT_SPLIT_SEED, DEFAULT_TEST_FRAC, DEFAULT_TRAIN_FRAC,
-    DEFAULT_VAL_FRAC,
+    repeat_folds_seed, FinalEval, FinalOrigin, HoldoutTest, PreparedSplit, SearchPool, SplitPlan,
+    DEFAULT_DATA_SEED, DEFAULT_FINAL_INIT_SEED, DEFAULT_K, DEFAULT_REPEATS, DEFAULT_SPLIT_SEED,
+    DEFAULT_TEST_FRAC, DEFAULT_TRAIN_FRAC, DEFAULT_VAL_FRAC, REPEAT_SEED_STEP,
 };
 pub use train::{evaluate_surrogate, predict_dataset, validate_train, LrSchedule, TrainConfig};
 pub use training::CompletedCheck;
@@ -136,7 +136,7 @@ pub use training::{SearchCost, SearchObjective};
 // Происхождение модели: с чем её обучали и чем измерили.
 pub use report::{
     CheckRecord, FinalRecord, Selection, TrainingReport, TRAINING_REPORT_VERSION,
-    TRAINING_REPORT_VERSION_V1, TRAINING_REPORT_VERSION_V2,
+    TRAINING_REPORT_VERSION_V1, TRAINING_REPORT_VERSION_V2, TRAINING_REPORT_VERSION_V3,
 };
 
 // Готовая модель: checkpoint, формулы, прогноз по таблице.

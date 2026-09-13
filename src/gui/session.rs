@@ -20,7 +20,7 @@ use crate::fingerprint::DatasetFingerprint;
 use crate::interpret::InterpretOverrides;
 use crate::lifecycle::{CheckEval, CheckedRun, Lifecycle, TestDisclosure};
 use crate::markup::{Message, TableProfile};
-use crate::split::SplitPlan;
+use crate::split::{SplitPlan, REPEAT_SEED_STEP};
 use crate::sweep::{self, SweepChoice, SweepRow};
 use crate::train::LrSchedule;
 use crate::training::Phase;
@@ -152,6 +152,16 @@ pub(super) fn split_plan_label(plan: SplitPlan) -> String {
             "{k}-fold, test {:.0}%, folds seed {folds_seed}, test seed {test_seed}",
             test_frac * 100.0
         ),
+        SplitPlan::RepeatedKFold {
+            k,
+            folds_seed,
+            repeats,
+            test_frac,
+            test_seed,
+        } => format!(
+            "{k}-fold × {repeats} повторов, test {:.0}%, folds seed {folds_seed} (повтор r берёт              seed + r × {REPEAT_SEED_STEP:#x}), test seed {test_seed}",
+            test_frac * 100.0
+        ),
     }
 }
 
@@ -213,6 +223,16 @@ impl ActiveDataset {
                 let test = (rows as f32 * test_frac).round() as usize;
                 let pool = rows.saturating_sub(test);
                 format!("{k}-fold по {pool} строкам + test {test}")
+            }
+            SplitPlan::RepeatedKFold {
+                k,
+                repeats,
+                test_frac,
+                ..
+            } => {
+                let test = (rows as f32 * test_frac).round() as usize;
+                let pool = rows.saturating_sub(test);
+                format!("{k}-fold × {repeats} по {pool} строкам + test {test}")
             }
         }
     }
@@ -412,7 +432,7 @@ impl App {
                         Phase::Development => "development",
                         Phase::Final => "финальное обучение",
                     };
-                    // Живая кривая рисуется только для первого fold: у K-fold
+                    // Живая кривая рисуется только для первого разбиения: у CV
                     // номера эпох повторяются, и общая ломаная не описывает ни
                     // один прогон. Средняя кривая приходит по завершении.
                     if fold == 0 {
@@ -433,7 +453,10 @@ impl App {
                             format!("{label}: эпоха {epoch}, loss {loss:.5}, validation R² {r2:.5}")
                         }
                         (0, None) => format!("{label}: эпоха {epoch}, loss {loss:.5}"),
-                        (f, _) => format!("{label}: fold {}, эпоха {epoch}, loss {loss:.5}", f + 1),
+                        (f, _) => format!(
+                            "{label}: разбиение {}, эпоха {epoch}, loss {loss:.5}",
+                            f + 1
+                        ),
                     };
                 }
                 Event::TrainDone {
@@ -442,6 +465,7 @@ impl App {
                     per_output,
                     check_source,
                     r2_std_folds,
+                    r2_std_repeats,
                     curves,
                     final_eval,
                     check_interpret,
@@ -474,6 +498,7 @@ impl App {
                                         metrics: m.clone(),
                                         per_output: per.clone(),
                                         r2_std_folds: r2_std_folds.unwrap_or(0.0),
+                                        r2_std_repeats: r2_std_repeats.unwrap_or(0.0),
                                     },
                                     interpret: check_interpret,
                                 });

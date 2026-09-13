@@ -1,13 +1,12 @@
 //! Экран обучения: одна конфигурация, поиск по сетке и кривая по эпохам.
 
 use super::messages::{Command, ModelOrigin, PreparedData};
-use super::model::{optional, show_metrics, ModelInfo};
+use super::model::{optional, show_metrics, show_spread, ModelInfo};
 use super::session::{App, SearchRun, NO_DATASET};
 use crate::config::ModelConfig;
 use crate::encoders::{ValueEncoderConfig, ValueEncoderKind};
 use crate::interpret::{self, InterpretOverrides, InterpretProfile};
 use crate::lifecycle::{CandidateSpec, RunIdentity};
-use crate::metrics::EvalSource;
 use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
 use crate::report::Selection;
 use crate::split::DEFAULT_FINAL_INIT_SEED;
@@ -779,12 +778,12 @@ impl App {
         }
 
         // Цена операции — до запуска: она понятнее названия бюджета.
-        let folds = self.dataset.as_ref().map_or(1, |d| match d.split {
-            crate::split::SplitPlan::KFold { k, .. } => k,
-            crate::split::SplitPlan::Holdout { .. } => 1,
-        });
+        let split = self
+            .dataset
+            .as_ref()
+            .map_or_else(crate::split::SplitPlan::default, |d| d.split);
         match &axes {
-            Ok(a) => match sweep::sweep_cost(a, folds) {
+            Ok(a) => match sweep::sweep_cost(a, split) {
                 Ok(cost) => {
                     ui.label(format!("Оценка: {}", cost.describe()));
                 }
@@ -1189,10 +1188,11 @@ impl App {
             // Кривая по эпохам — то, ради чего раньше был отдельный сценарий.
             let points = PlotPoints::from(self.val_curve.clone());
             let recommendation = self.recommended_epochs();
-            // Название говорит, что нарисовано: у K-fold это среднее по
-            // folds, а не кривая одного обучения.
+            // Название говорит, что нарисовано: у CV это среднее по всем
+            // разбиениям (folds, а при повторах — folds × повторы), а не
+            // кривая одного обучения.
             let name = if self.curve_folds > 1 {
-                format!("validation R², среднее по {} folds", self.curve_folds)
+                format!("validation R², среднее по {} разбиениям", self.curve_folds)
             } else {
                 "validation R²".to_string()
             };
@@ -1210,10 +1210,7 @@ impl App {
             let current = self
                 .current_stamp()
                 .is_ok_and(|(_, stamp)| stamp == run.stamp);
-            let source = match run.stamp.eval_source() {
-                EvalSource::Cv { k } => format!("cv-{k}"),
-                _ => "validation".to_string(),
-            };
+            let source = run.stamp.eval_source().label();
             let outputs = self
                 .dataset
                 .as_ref()
@@ -1227,12 +1224,7 @@ impl App {
                 Some(&run.eval.per_output),
                 outputs,
             );
-            if run.eval.r2_std_folds > 0.0 {
-                ui.label(format!(
-                    "Разброс R² между folds: ±{:.5}",
-                    run.eval.r2_std_folds
-                ));
-            }
+            show_spread(ui, run.eval.r2_std_folds, run.eval.r2_std_repeats);
             if !current {
                 ui.colored_label(
                     egui::Color32::from_rgb(200, 120, 0),

@@ -6,10 +6,7 @@ use super::session::{ActiveDataset, App};
 use crate::data::NumericDataset;
 use crate::markup::{analyze_roles, DraftType, RoleReport, SchemaDraft, Severity, TableProfile};
 use crate::schema::{Column, ColumnRole, ColumnType, ModelSchema};
-use crate::split::{
-    SplitPlan, DEFAULT_K, DEFAULT_SPLIT_SEED, DEFAULT_TEST_FRAC, DEFAULT_TRAIN_FRAC,
-    DEFAULT_VAL_FRAC,
-};
+use crate::split::{SplitPlan, DEFAULT_SPLIT_SEED, DEFAULT_TRAIN_FRAC, DEFAULT_VAL_FRAC};
 use crate::table::Table;
 use crate::tnum::{infer_prepare_spec_from_path, parse_categorical, Delimiter, PrepareSpec};
 use eframe::egui;
@@ -502,7 +499,10 @@ impl App {
             if ui.selectable_label(holdout, "Holdout").clicked() && !holdout {
                 plan = SplitPlan::default();
             }
-            let kfold = matches!(plan, SplitPlan::KFold { .. });
+            let kfold = matches!(
+                plan,
+                SplitPlan::KFold { .. } | SplitPlan::RepeatedKFold { .. }
+            );
             if ui.selectable_label(kfold, "K-fold").clicked() && !kfold {
                 plan = SplitPlan::kfold_default();
             }
@@ -545,26 +545,36 @@ impl App {
                 test_frac,
                 test_seed,
             } => {
-                egui::Grid::new("kfold_split")
-                    .num_columns(2)
-                    .show(ui, |ui| {
-                        ui.label("число folds");
-                        ui.add(egui::DragValue::new(k).range(2..=100));
-                        ui.end_row();
-                        ui.label("test");
-                        ui.add(
-                            egui::DragValue::new(test_frac)
-                                .range(0.01..=0.98)
-                                .speed(0.01),
-                        );
-                        ui.end_row();
-                        ui.label("seed folds");
-                        ui.add(egui::DragValue::new(folds_seed));
-                        ui.end_row();
-                        ui.label("seed test");
-                        ui.add(egui::DragValue::new(test_seed));
-                        ui.end_row();
-                    });
+                let mut repeats = 1;
+                Self::ui_kfold(ui, k, folds_seed, &mut repeats, test_frac, test_seed);
+                if repeats > 1 {
+                    plan = SplitPlan::RepeatedKFold {
+                        k: *k,
+                        folds_seed: *folds_seed,
+                        repeats,
+                        test_frac: *test_frac,
+                        test_seed: *test_seed,
+                    };
+                }
+            }
+            SplitPlan::RepeatedKFold {
+                k,
+                folds_seed,
+                repeats,
+                test_frac,
+                test_seed,
+            } => {
+                Self::ui_kfold(ui, k, folds_seed, repeats, test_frac, test_seed);
+                // Один повтор — это и есть обычный K-fold, и записывать его
+                // отдельным видом разбиения не за чем.
+                if *repeats < 2 {
+                    plan = SplitPlan::KFold {
+                        k: *k,
+                        folds_seed: *folds_seed,
+                        test_frac: *test_frac,
+                        test_seed: *test_seed,
+                    };
+                }
             }
         }
 
@@ -575,12 +585,8 @@ impl App {
                     val_frac: DEFAULT_VAL_FRAC,
                     split_seed: DEFAULT_SPLIT_SEED,
                 },
-                SplitPlan::KFold { .. } => SplitPlan::KFold {
-                    k: DEFAULT_K,
-                    folds_seed: DEFAULT_SPLIT_SEED,
-                    test_frac: DEFAULT_TEST_FRAC,
-                    test_seed: DEFAULT_SPLIT_SEED,
-                },
+                SplitPlan::KFold { .. } => SplitPlan::kfold_default(),
+                SplitPlan::RepeatedKFold { .. } => SplitPlan::repeated_kfold_default(),
             };
         }
 
@@ -597,6 +603,48 @@ impl App {
         if active.split != before {
             self.search_selected = None;
             self.status = "план разбиения изменён; прежний поиск устарел".to_string();
+        }
+    }
+
+    /// Поля CV-разбиения. Повторы — обычное число, а не отдельный режим:
+    /// один повтор и есть обычный K-fold, и выбор между ними делает сам
+    /// вызывающий.
+    fn ui_kfold(
+        ui: &mut egui::Ui,
+        k: &mut usize,
+        folds_seed: &mut u64,
+        repeats: &mut usize,
+        test_frac: &mut f32,
+        test_seed: &mut u64,
+    ) {
+        egui::Grid::new("kfold_split")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("число folds");
+                ui.add(egui::DragValue::new(k).range(2..=100));
+                ui.end_row();
+                ui.label("повторов разбиения");
+                ui.add(egui::DragValue::new(repeats).range(1..=20));
+                ui.end_row();
+                ui.label("test");
+                ui.add(
+                    egui::DragValue::new(test_frac)
+                        .range(0.01..=0.98)
+                        .speed(0.01),
+                );
+                ui.end_row();
+                ui.label("seed folds");
+                ui.add(egui::DragValue::new(folds_seed));
+                ui.end_row();
+                ui.label("seed test");
+                ui.add(egui::DragValue::new(test_seed));
+                ui.end_row();
+            });
+        if *repeats > 1 {
+            ui.label(format!(
+                "Обучений на одну проверку: {} — test при этом не меняется",
+                k.saturating_mul(*repeats)
+            ));
         }
     }
 

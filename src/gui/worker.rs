@@ -312,6 +312,7 @@ fn worker_loop(
                                 per_output: None,
                                 check_source: None,
                                 r2_std_folds: None,
+                                r2_std_repeats: None,
                                 curves: Vec::new(),
                                 final_eval: Some(disclosed.eval.clone()),
                                 check_interpret: Vec::new(),
@@ -1321,6 +1322,7 @@ fn train_numeric(
                 metrics: outcome.metrics.clone(),
                 per_output: outcome.per_output.clone(),
                 r2_std_folds: outcome.r2_std_folds,
+                r2_std_repeats: outcome.r2_std_repeats,
             };
             let curves: Vec<Vec<CurvePoint>> = outcome.histories.iter().map(curve).collect();
             let folds = curves.len();
@@ -1337,6 +1339,7 @@ fn train_numeric(
                 metrics: outcome.metrics.clone(),
                 per_output: outcome.per_output.clone(),
                 r2_std_folds: outcome.r2_std_folds,
+                r2_std_repeats: outcome.r2_std_repeats,
                 histories: outcome.histories.clone(),
                 interpret: fold_reports.clone(),
             });
@@ -1349,6 +1352,7 @@ fn train_numeric(
                     per_output: Some(outcome.per_output),
                     check_source: Some(outcome.source),
                     r2_std_folds: Some(outcome.r2_std_folds),
+                    r2_std_repeats: Some(outcome.r2_std_repeats),
                     curves,
                     final_eval: None,
                     // Конвейер отработал на каждом fold: отчётов столько же,
@@ -1414,6 +1418,7 @@ fn train_numeric(
         per_output: check.as_ref().map(|c| c.per_output.clone()),
         check_source,
         r2_std_folds: check.as_ref().map(|c| c.r2_std_folds),
+        r2_std_repeats: check.as_ref().map(|c| c.r2_std_repeats),
         curves: holdout_curves,
         final_eval: final_eval.clone(),
         check_interpret: check_interpret.clone(),
@@ -1539,6 +1544,7 @@ fn send_cancelled(evt_tx: &Sender<Event>, ctx: &egui::Context, stamp: &RunIdenti
         per_output: None,
         check_source: None,
         r2_std_folds: None,
+        r2_std_repeats: None,
         curves: Vec::new(),
         final_eval: None,
         check_interpret: Vec::new(),
@@ -1730,6 +1736,7 @@ mod tests {
             metrics: metrics.clone(),
             per_output: vec![metrics.clone()],
             r2_std_folds: 0.0,
+            r2_std_repeats: 0.0,
             histories: Vec::new(),
             interpret: vec![fold_report.clone()],
         };
@@ -1803,6 +1810,7 @@ mod tests {
             },
             per_output: Vec::new(),
             r2_std_folds: 0.0,
+            r2_std_repeats: 0.0,
             histories: Vec::new(),
             interpret: Vec::new(),
         };

@@ -169,7 +169,14 @@ fn mean_of_all(values: impl Iterator<Item = Option<f32>>) -> Option<f32> {
 #[non_exhaustive]
 pub enum EvalSource {
     Validation,
-    Cv { k: usize },
+    Cv {
+        k: usize,
+    },
+    /// CV, повторённая на нескольких разбиениях pool.
+    RepeatedCv {
+        k: usize,
+        repeats: usize,
+    },
     Test,
 }
 
@@ -179,16 +186,34 @@ impl EvalSource {
         match self {
             EvalSource::Validation => "validation".to_string(),
             EvalSource::Cv { k } => format!("cv-{k}"),
+            EvalSource::RepeatedCv { k, repeats } => format!("cv-{k}x{repeats}"),
             EvalSource::Test => "test".to_string(),
+        }
+    }
+
+    /// Сколько folds в одном повторе: 1 у holdout.
+    pub fn k(&self) -> usize {
+        match *self {
+            EvalSource::Cv { k } | EvalSource::RepeatedCv { k, .. } => k,
+            _ => 1,
+        }
+    }
+
+    /// Сколько повторов: больше одного только у [`EvalSource::RepeatedCv`].
+    pub fn repeats(&self) -> usize {
+        match *self {
+            EvalSource::RepeatedCv { repeats, .. } => repeats,
+            _ => 1,
         }
     }
 }
 
-/// Происхождение ОДНОГО прогона: номер fold (None у holdout) и seed
-/// инициализации.
+/// Происхождение ОДНОГО прогона: номер повтора и fold (None там, где их нет) и
+/// seed инициализации.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RunOrigin {
     pub fold: Option<usize>,
+    pub repeat: Option<usize>,
     pub init_seed: u64,
 }
 
@@ -200,27 +225,39 @@ pub(crate) struct RunEval {
     pub origin: RunOrigin,
 }
 
-/// Происхождение АГРЕГАТА по конфигурации: по каким seed и скольким folds он
-/// собран.
+/// Происхождение АГРЕГАТА по конфигурации: по каким seed, скольким folds и
+/// скольким повторам он собран.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfigOrigin {
     pub init_seeds: Vec<u64>,
+    /// Folds в ОДНОМ повторе.
     pub folds: usize,
+    /// Повторов разбиения; 1 везде, кроме повторённой CV.
+    pub repeats: usize,
     pub source: EvalSource,
 }
 
 /// Агрегат по конфигурации. Порядок свёртки фиксирован: СНАЧАЛА среднее по
-/// folds внутри каждого init_seed, ЗАТЕМ среднее между init_seed. Поэтому
-/// `r2_std_seeds` означает устойчивость к инициализации и ничего больше;
-/// разброс по данным вынесен отдельным числом `r2_std_folds`.
+/// folds внутри повтора, ЗАТЕМ среднее по повторам внутри init_seed, ЗАТЕМ
+/// среднее между init_seed. Поэтому `r2_std_seeds` означает устойчивость к
+/// инициализации и ничего больше; разброс по данным разложен на два числа:
+/// `r2_std_folds` внутри одного разбиения и `r2_std_repeats` между
+/// разбиениями.
+///
+/// Разложение важно практически: большой разброс между folds означает, что
+/// оценка зависит от того, какие строки попали в validation, а большой разброс
+/// между повторами — что она зависит от самого способа нарезки, и одно
+/// K-fold-число тогда случайно.
 #[derive(Debug, Clone)]
 pub(crate) struct ConfigEval {
     pub mean: Metrics,
     pub per_output_mean: Vec<Metrics>,
     /// Std R² между init_seed (0 при одном seed) — то самое `±`.
     pub r2_std_seeds: f32,
-    /// Средний по seed std R² между folds (0 у holdout) — справочно.
+    /// Средний по (seed, повтор) std R² между folds (0 у holdout) — справочно.
     pub r2_std_folds: f32,
+    /// Средний по seed std R² между средними повторов; 0, когда повтор один.
+    pub r2_std_repeats: f32,
     pub origin: ConfigOrigin,
 }
 
@@ -250,11 +287,17 @@ fn population_std(xs: &[f32]) -> f32 {
     (xs.iter().map(|x| (x - m) * (x - m)).sum::<f32>() / n).sqrt()
 }
 
-/// Свернуть прогоны конфигурации в агрегат: folds внутри seed, затем seeds.
+/// Свернуть прогоны конфигурации в агрегат: folds внутри повтора, повторы
+/// внутри seed, затем seeds.
 ///
 /// `init_seeds` задаёт порядок свёртки и попадает в происхождение. Прогон с
 /// seed вне списка — ошибка, а не молчаливое отбрасывание: иначе агрегат
 /// посчитается не по тем данным, о которых отчитывается.
+///
+/// Состав прогонов проверяется полностью: у каждого seed должны быть все
+/// повторы, а у каждого повтора — все folds ровно по одному разу. Неполный
+/// набор означал бы, что часть разбиений отвалилась, а среднее по остатку
+/// выдаётся за оценку плана.
 pub(crate) fn aggregate_runs(
     runs: &[RunEval],
     init_seeds: &[u64],
@@ -270,18 +313,24 @@ pub(crate) fn aggregate_runs(
     if unique_seeds.len() != init_seeds.len() {
         return Err("aggregate_runs: init_seeds содержит дубликаты".to_string());
     }
-    let expected_folds = match source {
-        EvalSource::Validation => 1,
-        EvalSource::Cv { k } if k >= 2 => k,
-        EvalSource::Cv { k } => {
-            return Err(format!(
-                "aggregate_runs: число CV-folds должно быть >= 2, получено {k}"
-            ))
-        }
+    let (expected_folds, expected_repeats) = match source {
+        EvalSource::Validation => (1, 1),
+        EvalSource::Cv { k } => (k, 1),
+        EvalSource::RepeatedCv { k, repeats } => (k, repeats),
         EvalSource::Test => {
             return Err("aggregate_runs: test нельзя агрегировать как результат поиска".to_string())
         }
     };
+    if !matches!(source, EvalSource::Validation) && expected_folds < 2 {
+        return Err(format!(
+            "aggregate_runs: число CV-folds должно быть >= 2, получено {expected_folds}"
+        ));
+    }
+    if matches!(source, EvalSource::RepeatedCv { .. }) && expected_repeats < 2 {
+        return Err(format!(
+            "aggregate_runs: число повторов должно быть >= 2, получено {expected_repeats}"
+        ));
+    }
     if let Some(r) = runs
         .iter()
         .find(|r| !init_seeds.contains(&r.origin.init_seed))
@@ -298,80 +347,117 @@ pub(crate) fn aggregate_runs(
 
     let mut per_seed_mean = Vec::with_capacity(init_seeds.len());
     let mut per_seed_per_output = Vec::with_capacity(init_seeds.len());
-    let mut fold_stds = Vec::with_capacity(init_seeds.len());
+    let mut fold_stds = Vec::new();
+    let mut repeat_stds = Vec::with_capacity(init_seeds.len());
 
     for &seed in init_seeds {
-        let group: Vec<&RunEval> = runs.iter().filter(|r| r.origin.init_seed == seed).collect();
-        if group.is_empty() {
+        let of_seed: Vec<&RunEval> = runs.iter().filter(|r| r.origin.init_seed == seed).collect();
+        if of_seed.is_empty() {
             return Err(format!("aggregate_runs: нет прогонов с init_seed {seed}"));
         }
-        if group.len() != expected_folds {
+        if of_seed.len() != expected_folds * expected_repeats {
             return Err(format!(
-                "aggregate_runs: init_seed {seed} даёт {} прогонов вместо {expected_folds}",
-                group.len()
+                "aggregate_runs: init_seed {seed} даёт {} прогонов вместо {}",
+                of_seed.len(),
+                expected_folds * expected_repeats
             ));
         }
-        match source {
-            EvalSource::Validation => {
-                if group[0].origin.fold.is_some() {
-                    return Err(
-                        "aggregate_runs: holdout validation должна иметь fold=None".to_string()
-                    );
-                }
+
+        let mut per_repeat_mean = Vec::with_capacity(expected_repeats);
+        let mut per_repeat_per_output = Vec::with_capacity(expected_repeats);
+        for repeat in 0..expected_repeats {
+            let wanted = (expected_repeats > 1).then_some(repeat);
+            let group: Vec<&RunEval> = of_seed
+                .iter()
+                .copied()
+                .filter(|r| r.origin.repeat == wanted)
+                .collect();
+            if group.len() != expected_folds {
+                return Err(format!(
+                    "aggregate_runs: init_seed {seed}, повтор {repeat} даёт {} прогонов вместо \
+                     {expected_folds}",
+                    group.len()
+                ));
             }
-            EvalSource::Cv { k } => {
-                let actual: BTreeSet<usize> = group.iter().filter_map(|r| r.origin.fold).collect();
-                let expected: BTreeSet<usize> = (0..k).collect();
-                if actual != expected || group.iter().any(|r| r.origin.fold.is_none()) {
-                    return Err(format!(
-                        "aggregate_runs: init_seed {seed} должен содержать folds 0..{k} ровно по одному"
-                    ));
+            match source {
+                EvalSource::Validation => {
+                    if group[0].origin.fold.is_some() {
+                        return Err(
+                            "aggregate_runs: holdout validation должна иметь fold=None".to_string()
+                        );
+                    }
                 }
+                EvalSource::Cv { k } | EvalSource::RepeatedCv { k, .. } => {
+                    let actual: BTreeSet<usize> =
+                        group.iter().filter_map(|r| r.origin.fold).collect();
+                    let expected: BTreeSet<usize> = (0..k).collect();
+                    if actual != expected || group.iter().any(|r| r.origin.fold.is_none()) {
+                        return Err(format!(
+                            "aggregate_runs: init_seed {seed}, повтор {repeat} должен содержать \
+                             folds 0..{k} ровно по одному"
+                        ));
+                    }
+                }
+                EvalSource::Test => unreachable!("test отвергнут выше"),
             }
-            EvalSource::Test => unreachable!("test отвергнут выше"),
+
+            let metrics: Vec<Metrics> = group.iter().map(|r| r.metrics.clone()).collect();
+            fold_stds.push(population_std(
+                &metrics.iter().map(|m| m.r2).collect::<Vec<_>>(),
+            ));
+            per_repeat_mean.push(mean_metrics(&metrics));
+            per_repeat_per_output.push(mean_per_output(&group, n_outputs));
         }
 
-        let metrics: Vec<Metrics> = group.iter().map(|r| r.metrics.clone()).collect();
-        fold_stds.push(population_std(
-            &metrics.iter().map(|m| m.r2).collect::<Vec<_>>(),
+        repeat_stds.push(population_std(
+            &per_repeat_mean.iter().map(|m| m.r2).collect::<Vec<_>>(),
         ));
-        per_seed_mean.push(mean_metrics(&metrics));
-
-        let per_output: Vec<Metrics> = (0..n_outputs)
-            .map(|j| {
-                mean_metrics(
-                    &group
-                        .iter()
-                        .map(|r| r.per_output[j].clone())
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect();
-        per_seed_per_output.push(per_output);
+        per_seed_mean.push(mean_metrics(&per_repeat_mean));
+        per_seed_per_output.push(mean_by_output(&per_repeat_per_output, n_outputs));
     }
-
-    let per_output_mean = (0..n_outputs)
-        .map(|j| {
-            mean_metrics(
-                &per_seed_per_output
-                    .iter()
-                    .map(|p| p[j].clone())
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect();
 
     Ok(ConfigEval {
         mean: mean_metrics(&per_seed_mean),
-        per_output_mean,
+        per_output_mean: mean_by_output(&per_seed_per_output, n_outputs),
         r2_std_seeds: population_std(&per_seed_mean.iter().map(|m| m.r2).collect::<Vec<_>>()),
         r2_std_folds: fold_stds.iter().sum::<f32>() / fold_stds.len() as f32,
+        r2_std_repeats: repeat_stds.iter().sum::<f32>() / repeat_stds.len() as f32,
         origin: ConfigOrigin {
             init_seeds: init_seeds.to_vec(),
             folds: expected_folds,
+            repeats: expected_repeats,
             source,
         },
     })
+}
+
+/// Поколоночное среднее по прогонам одной группы.
+fn mean_per_output(group: &[&RunEval], n_outputs: usize) -> Vec<Metrics> {
+    (0..n_outputs)
+        .map(|j| {
+            mean_metrics(
+                &group
+                    .iter()
+                    .map(|r| r.per_output[j].clone())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
+/// Поколоночное среднее уже свёрнутых групп: каждый элемент — свой уровень
+/// свёртки (повтор или seed).
+fn mean_by_output(groups: &[Vec<Metrics>], n_outputs: usize) -> Vec<Metrics> {
+    (0..n_outputs)
+        .map(|j| {
+            mean_metrics(
+                &groups
+                    .iter()
+                    .map(|per_output| per_output[j].clone())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
 }
 
 /// Метрики отдельно для каждого выхода (столбца). Агрегатный `evaluate`
@@ -566,6 +652,15 @@ mod tests {
     }
 
     fn run(fold: Option<usize>, init_seed: u64, r2: f32) -> RunEval {
+        repeated_run(fold, None, init_seed, r2)
+    }
+
+    fn repeated_run(
+        fold: Option<usize>,
+        repeat: Option<usize>,
+        init_seed: u64,
+        r2: f32,
+    ) -> RunEval {
         let m = Metrics {
             rmse: 1.0 - r2,
             mae: 1.0 - r2,
@@ -577,7 +672,11 @@ mod tests {
         RunEval {
             per_output: vec![m.clone()],
             metrics: m,
-            origin: RunOrigin { fold, init_seed },
+            origin: RunOrigin {
+                fold,
+                repeat,
+                init_seed,
+            },
         }
     }
 
@@ -606,6 +705,70 @@ mod tests {
         assert_eq!(agg.r2_std_seeds, 0.0);
         assert_eq!(agg.r2_std_folds, 0.0);
         assert!((agg.mean.r2 - 0.9).abs() < 1e-6);
+    }
+
+    /// Порядок свёртки у повторов: folds внутри повтора, повторы внутри seed.
+    /// Каждый уровень разброса считается на своём уровне и не смешивается с
+    /// соседними.
+    #[test]
+    fn aggregate_folds_then_repeats_then_seeds() {
+        // Повтор 0: folds 0.6 и 1.0 -> 0.8; повтор 1: 0.5 и 0.7 -> 0.6.
+        // Среднее по повторам = 0.7; std между повторами = 0.1;
+        // средний std между folds = (0.2 + 0.1) / 2 = 0.15.
+        let runs = vec![
+            repeated_run(Some(0), Some(0), 0, 0.6),
+            repeated_run(Some(1), Some(0), 0, 1.0),
+            repeated_run(Some(0), Some(1), 0, 0.5),
+            repeated_run(Some(1), Some(1), 0, 0.7),
+        ];
+        let agg = aggregate_runs(&runs, &[0], EvalSource::RepeatedCv { k: 2, repeats: 2 }).unwrap();
+
+        assert!((agg.mean.r2 - 0.7).abs() < 1e-6);
+        assert!((agg.r2_std_repeats - 0.1).abs() < 1e-6);
+        assert!((agg.r2_std_folds - 0.15).abs() < 1e-6);
+        assert_eq!(agg.r2_std_seeds, 0.0, "seed один — разброса между ними нет");
+        assert_eq!(agg.origin.folds, 2);
+        assert_eq!(agg.origin.repeats, 2);
+        assert_eq!(agg.per_output_mean.len(), 1);
+        assert!((agg.per_output_mean[0].r2 - 0.7).abs() < 1e-6);
+    }
+
+    /// Разброс между повторами существует только там, где повторы есть: у
+    /// обычной CV это число обязано быть нулём, а не «маленьким».
+    #[test]
+    fn plain_cv_has_no_repeat_spread() {
+        let runs = vec![run(Some(0), 0, 0.8), run(Some(1), 0, 1.0)];
+        let agg = aggregate_runs(&runs, &[0], EvalSource::Cv { k: 2 }).unwrap();
+        assert_eq!(agg.r2_std_repeats, 0.0);
+        assert_eq!(agg.origin.repeats, 1);
+        assert!((agg.r2_std_folds - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn aggregate_rejects_an_incomplete_or_unnumbered_repeat() {
+        let source = EvalSource::RepeatedCv { k: 2, repeats: 2 };
+        // Повтор 1 недосчитался fold: усреднять по остатку нельзя.
+        let missing = vec![
+            repeated_run(Some(0), Some(0), 0, 0.6),
+            repeated_run(Some(1), Some(0), 0, 1.0),
+            repeated_run(Some(0), Some(1), 0, 0.5),
+        ];
+        assert!(aggregate_runs(&missing, &[0], source).is_err());
+
+        // Прогонов столько, сколько нужно, но они не подписаны повтором.
+        let unnumbered = vec![
+            repeated_run(Some(0), None, 0, 0.6),
+            repeated_run(Some(1), None, 0, 1.0),
+            repeated_run(Some(0), Some(1), 0, 0.5),
+            repeated_run(Some(1), Some(1), 0, 0.7),
+        ];
+        assert!(aggregate_runs(&unnumbered, &[0], source).is_err());
+
+        // Один повтор — это обычная CV, и подписываться повторённой она не может.
+        let single = vec![repeated_run(Some(0), Some(0), 0, 0.6)];
+        assert!(
+            aggregate_runs(&single, &[0], EvalSource::RepeatedCv { k: 2, repeats: 1 }).is_err()
+        );
     }
 
     #[test]

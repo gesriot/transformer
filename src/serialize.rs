@@ -23,7 +23,7 @@ use crate::metrics::{EvalSource, Metrics};
 use crate::numeric_model::{KanConfig, ModelKind, NumericConfig, NumericModel};
 use crate::report::{
     CheckRecord, FinalRecord, Selection, TrainingReport, TRAINING_REPORT_VERSION,
-    TRAINING_REPORT_VERSION_V1, TRAINING_REPORT_VERSION_V2,
+    TRAINING_REPORT_VERSION_V1, TRAINING_REPORT_VERSION_V2, TRAINING_REPORT_VERSION_V3,
 };
 use crate::schema::{Column, ColumnRole, ColumnType, ModelSchema};
 use crate::split::{FinalEval, FinalOrigin, SplitPlan};
@@ -1054,7 +1054,10 @@ fn build_report(report: &TrainingReport) -> io::Result<Vec<u8>> {
 fn build_report_for_version(report: &TrainingReport, version: u32) -> io::Result<Vec<u8>> {
     if !matches!(
         version,
-        TRAINING_REPORT_VERSION | TRAINING_REPORT_VERSION_V2 | TRAINING_REPORT_VERSION_V1
+        TRAINING_REPORT_VERSION
+            | TRAINING_REPORT_VERSION_V3
+            | TRAINING_REPORT_VERSION_V2
+            | TRAINING_REPORT_VERSION_V1
     ) {
         return Err(invalid(format!(
             "training_report: запись неизвестной версии {version}"
@@ -1069,7 +1072,10 @@ fn build_report_for_version(report: &TrainingReport, version: u32) -> io::Result
             p.extend_from_slice(&version.to_le_bytes());
             p.extend_from_slice(report.dataset.as_bytes());
         }
-        (TRAINING_REPORT_VERSION_V2 | TRAINING_REPORT_VERSION, Some(model)) => {
+        (
+            TRAINING_REPORT_VERSION_V2 | TRAINING_REPORT_VERSION_V3 | TRAINING_REPORT_VERSION,
+            Some(model),
+        ) => {
             p.extend_from_slice(&version.to_le_bytes());
             p.extend_from_slice(report.dataset.as_bytes());
             // Маркер сохранён как часть уже выпущенного кодирования v2;
@@ -1118,7 +1124,10 @@ fn read_report(bytes: &[u8]) -> io::Result<Option<TrainingReport>> {
     // стоить самой модели.
     if !matches!(
         version,
-        TRAINING_REPORT_VERSION | TRAINING_REPORT_VERSION_V2 | TRAINING_REPORT_VERSION_V1
+        TRAINING_REPORT_VERSION
+            | TRAINING_REPORT_VERSION_V3
+            | TRAINING_REPORT_VERSION_V2
+            | TRAINING_REPORT_VERSION_V1
     ) {
         return Ok(None);
     }
@@ -1314,6 +1323,23 @@ fn build_split(buf: &mut Vec<u8>, split: SplitPlan) {
             buf.extend_from_slice(&test_frac.to_le_bytes());
             buf.extend_from_slice(&test_seed.to_le_bytes());
         }
+        // Повторённый K-fold — свой вид разбиения, а не K-fold с лишним полем:
+        // дописать repeats в запись вида 1 значило бы, что старые файлы вдруг
+        // начинают читаться неверно.
+        SplitPlan::RepeatedKFold {
+            k,
+            folds_seed,
+            repeats,
+            test_frac,
+            test_seed,
+        } => {
+            buf.extend_from_slice(&2u32.to_le_bytes());
+            buf.extend_from_slice(&(k as u64).to_le_bytes());
+            buf.extend_from_slice(&folds_seed.to_le_bytes());
+            buf.extend_from_slice(&(repeats as u64).to_le_bytes());
+            buf.extend_from_slice(&test_frac.to_le_bytes());
+            buf.extend_from_slice(&test_seed.to_le_bytes());
+        }
     }
 }
 
@@ -1327,6 +1353,14 @@ fn read_split(r: &mut &[u8]) -> io::Result<SplitPlan> {
         1 => Ok(SplitPlan::KFold {
             k: usize::try_from(r_u64(r)?).map_err(|_| invalid("split: k не помещается в usize"))?,
             folds_seed: r_u64(r)?,
+            test_frac: r_f32(r)?,
+            test_seed: r_u64(r)?,
+        }),
+        2 => Ok(SplitPlan::RepeatedKFold {
+            k: usize::try_from(r_u64(r)?).map_err(|_| invalid("split: k не помещается в usize"))?,
+            folds_seed: r_u64(r)?,
+            repeats: usize::try_from(r_u64(r)?)
+                .map_err(|_| invalid("split: repeats не помещается в usize"))?,
             test_frac: r_f32(r)?,
             test_seed: r_u64(r)?,
         }),
@@ -1450,7 +1484,7 @@ fn read_objective(code: u32) -> io::Result<SearchObjective> {
 fn build_metrics(buf: &mut Vec<u8>, m: &Metrics, version: u32) -> io::Result<()> {
     buf.extend_from_slice(&m.rmse.to_le_bytes());
     buf.extend_from_slice(&m.mae.to_le_bytes());
-    if version < TRAINING_REPORT_VERSION {
+    if version < TRAINING_REPORT_VERSION_V3 {
         let rel_error = m.rel_error.ok_or_else(|| {
             invalid("метрики: относительная ошибка отсутствует, а формат отчёта её требует")
         })?;
@@ -1497,7 +1531,7 @@ const METRICS_BYTES: usize = 16;
 fn read_metrics(r: &mut &[u8], version: u32) -> io::Result<Metrics> {
     let rmse = r_f32(r)?;
     let mae = r_f32(r)?;
-    if version < TRAINING_REPORT_VERSION {
+    if version < TRAINING_REPORT_VERSION_V3 {
         let rel_error = r_f32(r)?;
         return Ok(Metrics {
             rmse,
@@ -1532,6 +1566,13 @@ fn build_source(buf: &mut Vec<u8>, source: EvalSource) {
             buf.extend_from_slice(&2u32.to_le_bytes());
             buf.extend_from_slice(&0u64.to_le_bytes());
         }
+        // Число повторов дописывается только у своего вида: у остальных
+        // раскладка остаётся прежней.
+        EvalSource::RepeatedCv { k, repeats } => {
+            buf.extend_from_slice(&3u32.to_le_bytes());
+            buf.extend_from_slice(&(k as u64).to_le_bytes());
+            buf.extend_from_slice(&(repeats as u64).to_le_bytes());
+        }
     }
 }
 
@@ -1542,6 +1583,10 @@ fn read_source(r: &mut &[u8]) -> io::Result<EvalSource> {
         0 => Ok(EvalSource::Validation),
         1 => Ok(EvalSource::Cv { k }),
         2 => Ok(EvalSource::Test),
+        3 => Ok(EvalSource::RepeatedCv {
+            k,
+            repeats: r_usize(r, "source: repeats")?,
+        }),
         other => Err(invalid(format!(
             "source: неизвестное происхождение {other}"
         ))),
@@ -1727,6 +1772,15 @@ fn build_check(check: &CheckRecord, version: u32) -> io::Result<Vec<u8>> {
     build_source(&mut p, check.source);
     build_metrics(&mut p, &check.metrics, version)?;
     p.extend_from_slice(&check.r2_std_folds.to_le_bytes());
+    if version >= TRAINING_REPORT_VERSION {
+        p.extend_from_slice(&check.r2_std_repeats.to_le_bytes());
+    } else if check.r2_std_repeats != 0.0 {
+        // Старая раскладка этого числа не знает, а молча потерять разброс
+        // между разбиениями нельзя: без него запись выглядит как обычная CV.
+        return Err(invalid(
+            "проверка: разброс между повторами не помещается в старый формат отчёта",
+        ));
+    }
     w_count(&mut p, check.per_output.len());
     for m in &check.per_output {
         build_metrics(&mut p, m, version)?;
@@ -1751,6 +1805,13 @@ fn read_check(bytes: &[u8], version: u32) -> io::Result<CheckRecord> {
     let source = read_source(&mut r)?;
     let metrics = read_metrics(&mut r, version)?;
     let r2_std_folds = r_f32(&mut r)?;
+    // До v4 повторов не существовало: ноль здесь — не измерение, а отсутствие
+    // самого понятия, и для планов без повторов это одно и то же.
+    let r2_std_repeats = if version >= TRAINING_REPORT_VERSION {
+        r_f32(&mut r)?
+    } else {
+        0.0
+    };
     let n = r_count(&mut r, METRICS_BYTES, "проверка: метрики выходов")?;
     let mut per_output = Vec::with_capacity(n);
     for _ in 0..n {
@@ -1784,6 +1845,7 @@ fn read_check(bytes: &[u8], version: u32) -> io::Result<CheckRecord> {
         metrics,
         per_output,
         r2_std_folds,
+        r2_std_repeats,
         histories,
         interpret,
     })
@@ -2124,6 +2186,7 @@ mod tests {
                 metrics: metrics.clone(),
                 per_output: vec![metrics.clone()],
                 r2_std_folds: 0.02,
+                r2_std_repeats: 0.0,
                 histories: vec![
                     sample_history(EvalSource::Cv { k: 2 }),
                     sample_history(EvalSource::Cv { k: 2 }),
@@ -2229,6 +2292,87 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Повторённая CV переживает запись и чтение: вид разбиения, вид оценки и
+    /// разброс между повторами — новые величины формата, и терять их нельзя.
+    #[test]
+    fn a_repeated_cv_report_survives_a_round_trip() {
+        let nc = numeric_cfg(ModelKind::Kan);
+        let specs = vec![FeatureSpec::Continuous, FeatureSpec::Continuous];
+        let schema = ModelSchema::synthetic_from_specs(&specs, 1).unwrap();
+        let model = nc.build(&specs, 1);
+        let data = blackbox::sum().generate(8, 0);
+        let in_norm = Normalizer::fit(&data.inputs, &specs);
+        let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
+        let profile = InterpretProfile::v1();
+        let model_fp = ModelFingerprint::of(&model, &nc, &in_norm, &out_norm);
+        let mut report = sample_report(&nc, &schema, Some(model_fp));
+
+        let split = SplitPlan::RepeatedKFold {
+            k: 2,
+            folds_seed: 7,
+            repeats: 2,
+            test_frac: 0.2,
+            test_seed: 9,
+        };
+        let source = EvalSource::RepeatedCv { k: 2, repeats: 2 };
+        report.stamp.split = split;
+        let check = report.check.as_mut().unwrap();
+        check.source = source;
+        check.r2_std_repeats = 0.03;
+        // Проверка идёт по каждому разбиению: историй и отчётов конвейера
+        // k × repeats, а не k.
+        check.histories = vec![sample_history(source); 4];
+        check.interpret = vec![check.interpret[0].clone(); 4];
+        let final_run = report.final_run.as_mut().unwrap();
+        final_run.history = final_history(source);
+        final_run.eval.origin.plan = split;
+
+        let path = tmp_path("repeated_report.bin");
+        save_numeric(
+            &path,
+            &nc,
+            &schema,
+            &model,
+            &in_norm,
+            &out_norm,
+            None,
+            Some(&profile),
+            Some(&report),
+        )
+        .unwrap();
+        let loaded = load_numeric_full(&path).unwrap().report.expect("отчёт");
+        assert_eq!(loaded.stamp.split, split);
+        let check = loaded.check.expect("запись о проверке");
+        assert_eq!(check.source, source);
+        assert_eq!(check.r2_std_repeats, 0.03);
+        assert_eq!(check.histories.len(), 4);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Старая раскладка разброса между повторами не знает. Записать его туда
+    /// молча нельзя: прочитанный отчёт выглядел бы как обычная CV.
+    #[test]
+    fn an_old_report_version_refuses_the_repeat_spread() {
+        let nc = numeric_cfg(ModelKind::Kan);
+        let specs = vec![FeatureSpec::Continuous, FeatureSpec::Continuous];
+        let schema = ModelSchema::synthetic_from_specs(&specs, 1).unwrap();
+        let model = nc.build(&specs, 1);
+        let data = blackbox::sum().generate(8, 0);
+        let in_norm = Normalizer::fit(&data.inputs, &specs);
+        let out_norm = Normalizer::fit(&data.outputs, &Normalizer::all_continuous(1));
+        let model_fp = ModelFingerprint::of(&model, &nc, &in_norm, &out_norm);
+        let mut report = sample_report(&nc, &schema, Some(model_fp));
+        report.check.as_mut().unwrap().r2_std_repeats = 0.03;
+
+        let err = build_report_for_version(&report, TRAINING_REPORT_VERSION_V3).unwrap_err();
+        assert!(
+            err.to_string().contains("разброс между повторами"),
+            "текст ошибки: {err}"
+        );
+        // В своей версии тот же отчёт пишется без возражений.
+        assert!(build_report_for_version(&report, TRAINING_REPORT_VERSION).is_ok());
+    }
+
     /// Противоречивый отчёт не записывается: рядом с моделью он выглядел бы
     /// достоверным происхождением, хотя описывает что-то другое.
     #[test]
@@ -2282,6 +2426,15 @@ mod tests {
             .validate_against(model_fp, &nc, &schema, Some(&profile))
             .unwrap_err()
             .contains("подписана как"));
+
+        // Разброс между повторами у разбиения без повторов: такое число
+        // означает, что запись собрана не из того прогона.
+        let mut phantom_repeats = good.clone();
+        phantom_repeats.check.as_mut().unwrap().r2_std_repeats = 0.01;
+        assert!(phantom_repeats
+            .validate_against(model_fp, &nc, &schema, Some(&profile))
+            .unwrap_err()
+            .contains("не имеет повторов"));
 
         // Финальный замер без проверки.
         let mut orphan_final = good.clone();
@@ -2499,6 +2652,26 @@ mod tests {
         assert!(check.metrics.rel_error.is_some(), "в v2 она обязательна");
         assert!(check.metrics.nmae.is_none(), "в v2 её не было");
         assert!(check.metrics.nrmse.is_none());
+    }
+
+    /// v3 знает нормализованные метрики, но не знает повторов. Читается она
+    /// как есть: ноль там означает «повторов не было», а не измеренный ноль,
+    /// и для планов без повторов это одно и то же.
+    #[test]
+    fn a_v3_report_reads_with_metrics_but_without_repeat_spread() {
+        let nc = numeric_cfg(ModelKind::Mlp);
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let model_fp = ModelFingerprint::from_bytes([9; 32]);
+        let mut report = sample_report(&nc, &schema, Some(model_fp));
+        report.check.as_mut().unwrap().metrics.nmae = Some(0.25);
+
+        let bytes = build_report_for_version(&report, TRAINING_REPORT_VERSION_V3).unwrap();
+        let v3 = read_report(&bytes).unwrap().expect("v3 читается");
+        let check = v3.check.expect("проверка");
+        assert_eq!(check.metrics.nmae, Some(0.25));
+        assert_eq!(check.r2_std_folds, 0.02);
+        assert_eq!(check.r2_std_repeats, 0.0);
+        assert_eq!(check.source, EvalSource::Cv { k: 2 });
     }
 
     /// Старый формат не может выразить новые величины: молча терять их при

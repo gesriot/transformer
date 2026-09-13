@@ -26,7 +26,6 @@ use crate::metrics::{EvalSource, Metrics};
 use crate::numeric_model::NumericConfig;
 use crate::schema::ModelSchema;
 use crate::split::FinalEval;
-use crate::split::SplitPlan;
 use crate::training::{SearchObjective, TrainingHistory};
 use std::collections::BTreeSet;
 
@@ -34,16 +33,20 @@ use std::collections::BTreeSet;
 /// а не «test точно не открывался»: отсутствие записи означает неизвестность.
 ///
 /// v2 добавила отпечаток модели, v3 — нормализованные метрики и необязательную
-/// относительную ошибку. Старые версии читаются как есть: повысить их молча
-/// значило бы утверждать то, чего та версия не наблюдала — ни связи с весами,
-/// ни масштаба train, по которому только и считаются nMAE и nRMSE.
-pub const TRAINING_REPORT_VERSION: u32 = 3;
+/// относительную ошибку, v4 — разброс между повторами CV. Старые версии
+/// читаются как есть: повысить их молча значило бы утверждать то, чего та
+/// версия не наблюдала — ни связи с весами, ни масштаба train, по которому
+/// только и считаются nMAE и nRMSE, ни разброса между разбиениями.
+pub const TRAINING_REPORT_VERSION: u32 = 4;
 
 /// Первая версия отчёта — без отпечатка модели.
 pub const TRAINING_REPORT_VERSION_V1: u32 = 1;
 
 /// Вторая версия — с отпечатком модели, но со старыми метриками.
 pub const TRAINING_REPORT_VERSION_V2: u32 = 2;
+
+/// Третья версия — нормализованные метрики, но без разброса между повторами.
+pub const TRAINING_REPORT_VERSION_V3: u32 = 3;
 
 /// Как была выбрана конфигурация.
 #[derive(Clone, Debug, PartialEq)]
@@ -70,11 +73,13 @@ pub struct CheckRecord {
     pub source: EvalSource,
     pub metrics: Metrics,
     pub per_output: Vec<Metrics>,
-    /// Разброс R² между folds; 0 у holdout.
+    /// Разброс R² между folds внутри одного повтора; 0 у holdout.
     pub r2_std_folds: f32,
-    /// История обучения каждого fold — целиком, без прореживания.
+    /// Разброс R² между повторами; 0 везде, кроме повторённой CV.
+    pub r2_std_repeats: f32,
+    /// История обучения каждого разбиения — целиком, без прореживания.
     pub histories: Vec<TrainingHistory>,
-    /// Отчёт конвейера каждого fold; пусто, если конвейера не просили.
+    /// Отчёт конвейера каждого разбиения; пусто, если конвейера не просили.
     pub interpret: Vec<InterpretReport>,
 }
 
@@ -160,10 +165,9 @@ impl TrainingReport {
                 return Err("seeds поиска содержат повторы".to_string());
             }
         }
-        let folds = match self.stamp.split {
-            SplitPlan::Holdout { .. } => 1,
-            SplitPlan::KFold { k, .. } => k,
-        };
+        // Разбиений столько, сколько обучений требует проверка: у повторённой
+        // CV это k × repeats, а не k.
+        let folds = self.stamp.split.n_splits();
         if let Some(check) = &self.check {
             if check.source != self.stamp.eval_source() {
                 return Err(format!(
@@ -174,8 +178,17 @@ impl TrainingReport {
             }
             if check.histories.len() != folds {
                 return Err(format!(
-                    "историй проверки {}, а folds {folds}",
+                    "историй проверки {}, а разбиений {folds}",
                     check.histories.len()
+                ));
+            }
+            // Разброс между повторами при единственном разбиении описывать
+            // нечему: такое число означает, что запись собрана не из того
+            // прогона, которым подписана.
+            if check.source.repeats() < 2 && check.r2_std_repeats != 0.0 {
+                return Err(format!(
+                    "проверка {} не имеет повторов, но записан разброс между ними",
+                    check.source.label()
                 ));
             }
             // Правило точное: с профилем — отчёт на каждый fold, без профиля
