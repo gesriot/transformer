@@ -22,6 +22,10 @@ pub struct PrepareSpec {
     pub has_header: bool,
     /// (индекс входа, cardinality) для категориальных признаков.
     pub categorical: Vec<(usize, usize)>,
+    /// Лист книги. `None` — лист не выбран: у книги с единственным листом это
+    /// он и есть, у книги с несколькими — ошибка. Для текстовой таблицы должен
+    /// оставаться `None`: листов у неё нет.
+    pub sheet: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -182,9 +186,10 @@ pub fn infer_prepare_spec_from_text(
 
 pub fn infer_prepare_spec_from_path(
     path: impl AsRef<Path>,
+    sheet: Option<&str>,
     delimiter: Delimiter,
 ) -> Result<InferredPrepareSpec, String> {
-    let table = Table::read_path(path, delimiter, false)?;
+    let table = Table::read_sheet(path, sheet, delimiter, false)?;
     infer_prepare_spec_from_table(&table, delimiter)
 }
 
@@ -251,14 +256,22 @@ pub(crate) fn table_schema_from_prepare_spec(
 ///
 /// Эвристика та же, что у `prepare`: заголовок вида `x…/y…`. Если её не хватает,
 /// ошибка отправляет к `prepare`, где разметка задаётся флагами.
-pub fn read_numeric_source(path: &str) -> Result<(NumericDataset, ModelSchema), String> {
+pub fn read_numeric_source(
+    path: &str,
+    sheet: Option<&str>,
+) -> Result<(NumericDataset, ModelSchema), String> {
     let source_path = Path::new(path);
     if is_tnum_source(source_path)? {
+        if let Some(sheet) = sheet {
+            return Err(format!(
+                "{path}: лист '{sheet}' указан для .tnum, а листы есть только у книг"
+            ));
+        }
         return read_numeric_tnum(path).map_err(|e| format!("чтение {path}: {e}"));
     }
     // Читаем таблицу один раз: иначе файл мог измениться между распознаванием
     // заголовка и конвертацией, а Excel пришлось бы разбирать дважды.
-    let table = Table::read_path(source_path, Delimiter::Auto, false)?;
+    let table = Table::read_sheet(source_path, sheet, Delimiter::Auto, false)?;
     let inferred = infer_prepare_spec_from_table(&table, Delimiter::Auto).map_err(|e| {
         format!(
             "{path}: {e}\n\
@@ -271,6 +284,7 @@ pub fn read_numeric_source(path: &str) -> Result<(NumericDataset, ModelSchema), 
         delimiter: inferred.delimiter,
         has_header: inferred.has_header,
         categorical: inferred.categorical,
+        sheet: sheet.map(str::to_string),
     };
     let table = if spec.has_header {
         table.promote_first_row_to_header()?
@@ -309,6 +323,11 @@ fn category_columns(spec: &PrepareSpec) -> Vec<usize> {
 
 /// Конвертирует таблицу в строку формата `.tnum`.
 pub fn table_to_tnum(input: &str, spec: &PrepareSpec) -> Result<String, String> {
+    if let Some(sheet) = &spec.sheet {
+        return Err(format!(
+            "лист '{sheet}' указан для текста, а листы есть только у книг"
+        ));
+    }
     to_tnum(
         &Table::parse_text(input, spec.delimiter, spec.has_header)?,
         spec,
@@ -317,7 +336,12 @@ pub fn table_to_tnum(input: &str, spec: &PrepareSpec) -> Result<String, String> 
 
 pub fn table_path_to_tnum(path: impl AsRef<Path>, spec: &PrepareSpec) -> Result<String, String> {
     to_tnum(
-        &Table::read_path(path.as_ref(), spec.delimiter, spec.has_header)?,
+        &Table::read_sheet(
+            path.as_ref(),
+            spec.sheet.as_deref(),
+            spec.delimiter,
+            spec.has_header,
+        )?,
         spec,
     )
 }
@@ -385,6 +409,7 @@ mod tests {
             delimiter: Delimiter::Auto,
             has_header: true,
             categorical: cat,
+            sheet: None,
         }
     }
 
@@ -416,6 +441,7 @@ mod tests {
             delimiter: inferred.delimiter,
             has_header: inferred.has_header,
             categorical: inferred.categorical,
+            sheet: None,
         };
         let out = table_to_tnum(csv, &spec).unwrap();
         assert!(out.contains("specs C C C K:3\n"));
@@ -494,6 +520,7 @@ mod tests {
                 delimiter: Delimiter::Auto,
                 has_header: true,
                 categorical: Vec::new(),
+                sheet: None,
             },
         )
         .unwrap_err();
@@ -520,8 +547,8 @@ mod tests {
         std::fs::write(&csv, "x0,x1,x2,y0\n0.5,-0.2,7.0,2.0\n1.5,0.3,8.0,3.0\n").unwrap();
 
         prepare_tnum_file(&csv, &tnum, &spec(vec![])).unwrap();
-        let (from_csv, csv_schema) = read_numeric_source(csv.to_str().unwrap()).unwrap();
-        let (from_tnum, tnum_schema) = read_numeric_source(tnum.to_str().unwrap()).unwrap();
+        let (from_csv, csv_schema) = read_numeric_source(csv.to_str().unwrap(), None).unwrap();
+        let (from_tnum, tnum_schema) = read_numeric_source(tnum.to_str().unwrap(), None).unwrap();
 
         assert_eq!(
             csv_schema.feature_specs(),
@@ -546,7 +573,7 @@ mod tests {
             "TRNUM1\ninputs 1\noutputs 1\nspecs C\nrows 1\ndata\n2 3\n",
         )
         .unwrap();
-        let (dataset, schema) = read_numeric_source(path.to_str().unwrap()).unwrap();
+        let (dataset, schema) = read_numeric_source(path.to_str().unwrap(), None).unwrap();
         assert_eq!(dataset.inputs[[0, 0]], 2.0);
         assert_eq!(dataset.outputs[[0, 0]], 3.0);
         assert_eq!(schema.n_inputs(), 1);
@@ -559,7 +586,8 @@ mod tests {
         let path = std::env::temp_dir().join("transformer_direct_numeric_source.csv");
         std::fs::write(&path, csv).unwrap();
 
-        let (direct_data, direct_schema) = read_numeric_source(path.to_str().unwrap()).unwrap();
+        let (direct_data, direct_schema) =
+            read_numeric_source(path.to_str().unwrap(), None).unwrap();
         let prepared = table_to_tnum(
             csv,
             &PrepareSpec {
@@ -568,6 +596,7 @@ mod tests {
                 delimiter: Delimiter::Auto,
                 has_header: true,
                 categorical: vec![(1, 3)],
+                sheet: None,
             },
         )
         .unwrap();
@@ -579,6 +608,59 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    /// Конвертация читает выбранный лист, а не первый попавшийся: у книги с
+    /// несколькими листами `sheet` — обязательная часть спецификации.
+    #[test]
+    fn prepare_converts_the_chosen_sheet_of_a_workbook() {
+        let dir = std::env::temp_dir().join(format!("transformer_sheet_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("book.xlsx");
+        let output = dir.join("book.tnum");
+        crate::table::write_test_workbook(
+            &input,
+            &[
+                ("Титульный", &[&["отчёт"]]),
+                (
+                    "Опыты",
+                    &[&["x0", "x1", "y0"], &["1", "2", "3"], &["4", "5", "6"]],
+                ),
+            ],
+        );
+
+        let sheet_spec = |sheet: Option<&str>| PrepareSpec {
+            n_inputs: 2,
+            n_outputs: 1,
+            delimiter: Delimiter::Auto,
+            has_header: true,
+            categorical: Vec::new(),
+            sheet: sheet.map(str::to_string),
+        };
+
+        // Без выбора листа конвертации нет: она бы описала не те данные.
+        let err = prepare_tnum_file(&input, &output, &sheet_spec(None)).unwrap_err();
+        assert!(err.contains("Опыты"), "{err}");
+
+        let stats = prepare_tnum_file(&input, &output, &sheet_spec(Some("Опыты"))).unwrap();
+        assert_eq!((stats.rows, stats.n_inputs, stats.n_outputs), (2, 2, 1));
+        let (data, schema) = crate::data::read_numeric_tnum(output.to_str().unwrap()).unwrap();
+        assert_eq!(data.inputs.dim(), (2, 2));
+        assert_eq!(data.outputs[[1, 0]], 6.0);
+        assert_eq!(schema.output_names(), vec!["y0"]);
+
+        // Тот же лист выбирается и при чтении источника напрямую.
+        let (direct, _) = read_numeric_source(input.to_str().unwrap(), Some("Опыты")).unwrap();
+        assert_eq!(direct.outputs, data.outputs);
+        let err = read_numeric_source(input.to_str().unwrap(), None).unwrap_err();
+        assert!(err.contains("Титульный"), "{err}");
+
+        // У `.tnum` листов нет — имя листа для него ошибка, а не мелочь.
+        let err = read_numeric_source(output.to_str().unwrap(), Some("Опыты")).unwrap_err();
+        assert!(err.contains("листы есть только у книг"), "{err}");
+
+        std::fs::remove_file(&input).ok();
+        std::fs::remove_file(&output).ok();
+    }
+
     #[test]
     fn prepare_preserves_header_names_and_falls_back_without_header() {
         let named = PrepareSpec {
@@ -587,6 +669,7 @@ mod tests {
             delimiter: Delimiter::Comma,
             has_header: true,
             categorical: vec![],
+            sheet: None,
         };
         let text =
             table_to_tnum("температура,скорость потока,влажность\n80,1.5,12\n", &named).unwrap();

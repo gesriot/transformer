@@ -159,6 +159,18 @@ impl ModelOrigin {
     }
 }
 
+/// Какое файловое поле спрашивает про лист. Ответ worker-а должен вернуться
+/// туда же, откуда пришёл вопрос: полей с книгами несколько.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SheetSlot {
+    /// Таблица, открываемая для разметки.
+    Markup,
+    /// Вход конвертации в `.tnum`.
+    Prepare,
+    /// Вход экспорта прогнозов.
+    Export,
+}
+
 /// Команды UI -> worker.
 pub(crate) enum Command {
     /// Открыть набор данных: сгенерировать чёрный ящик или прочитать `.tnum`.
@@ -198,6 +210,8 @@ pub(crate) enum Command {
     ExportPredictions {
         input: String,
         output: String,
+        /// Лист входной книги; `None` — лист не выбран.
+        sheet: Option<String>,
     },
     SampleKanEdge {
         layer: usize,
@@ -240,6 +254,9 @@ pub(crate) enum Command {
     OpenTable {
         path: String,
         has_header: bool,
+        /// Лист книги; `None` — лист не выбран, и у книги с несколькими
+        /// листами worker вернёт [`Event::ChooseSheet`] вместо чтения.
+        sheet: Option<String>,
     },
     Shutdown,
 }
@@ -291,6 +308,13 @@ pub(crate) enum Event {
         /// Единственный замер на test: есть только у финального обучения.
         final_eval: Option<FinalEval>,
         cancelled: bool,
+    },
+    /// В книге несколько листов, а лист не выбран: читать наугад нельзя.
+    /// Список уходит в то же поле интерфейса, которое просило файл.
+    ChooseSheet {
+        slot: SheetSlot,
+        path: String,
+        sheets: Vec<String>,
     },
     /// Набор данных открыт и готов к работе.
     DatasetOpened {

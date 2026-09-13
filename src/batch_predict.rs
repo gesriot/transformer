@@ -50,10 +50,14 @@ pub struct ExportSummary {
 /// схеме — существующие заменяются, отсутствующие добавляются; посторонние
 /// колонки сохраняются как значения.
 ///
+/// Читается ОДИН лист: `sheet` выбирает его по имени, `None` подходит книге с
+/// единственным листом. Молча брать первый нельзя — см. [`Table::read_sheet`].
+///
 /// Исходная книга НЕ сохраняется: стили, формулы, дополнительные листы и
 /// структура теряются, результат — минимальная новая книга.
 pub fn export_predictions<F>(
     input: &str,
+    sheet: Option<&str>,
     output: &str,
     schema: &ModelSchema,
     predict: F,
@@ -67,7 +71,7 @@ where
                 .to_string(),
         );
     }
-    let table = Table::read_path(input, Delimiter::Auto, true)?;
+    let table = Table::read_sheet(input, sheet, Delimiter::Auto, true)?;
     let header = table
         .header()
         .ok_or_else(|| format!("{input}: нужна строка заголовков с именами колонок"))?
@@ -373,6 +377,53 @@ mod tests {
         (table.header().unwrap().to_vec(), table.rows().to_vec())
     }
 
+    /// Прогноз считается по выбранному листу. Без выбора экспорт не начинается:
+    /// молча посчитать по титульному листу хуже, чем не посчитать вовсе.
+    #[test]
+    fn export_reads_the_chosen_sheet() {
+        let input = tmp_path("export_book.xlsx");
+        let output = tmp_path("export_book_out.xlsx");
+        crate::table::write_test_workbook(
+            &input,
+            &[
+                ("Титульный", &[&["отчёт"]]),
+                (
+                    "Опыты",
+                    &[
+                        &["материал", "температура", "влажность"],
+                        &["глина", "70", "0"],
+                    ],
+                ),
+            ],
+        );
+
+        let err = export_predictions(
+            input.to_str().unwrap(),
+            None,
+            output.to_str().unwrap(),
+            &schema(),
+            double,
+        )
+        .unwrap_err();
+        assert!(err.contains("Опыты"), "{err}");
+
+        let summary = export_predictions(
+            input.to_str().unwrap(),
+            Some("Опыты"),
+            output.to_str().unwrap(),
+            &schema(),
+            double,
+        )
+        .unwrap();
+        assert_eq!(summary.rows, 1);
+        let (header, rows) = read_back(&output);
+        assert!(header.contains(&"влажность".to_string()));
+        assert_eq!(rows.len(), 1);
+
+        std::fs::remove_file(&input).ok();
+        std::fs::remove_file(&output).ok();
+    }
+
     /// Колонки связываются по именам, а не по позиции: порядок в таблице свой,
     /// посторонняя колонка сохраняется, отсутствующий выход добавляется.
     #[test]
@@ -390,6 +441,7 @@ mod tests {
 
         let summary = export_predictions(
             input.to_str().unwrap(),
+            None,
             output.to_str().unwrap(),
             &schema(),
             double,
@@ -440,6 +492,7 @@ mod tests {
 
         export_predictions(
             input.to_str().unwrap(),
+            None,
             output.to_str().unwrap(),
             &schema(),
             double,
@@ -468,6 +521,7 @@ mod tests {
         .unwrap();
         let err = export_predictions(
             duplicate.to_str().unwrap(),
+            None,
             tmp_path("unused_duplicate.xlsx").to_str().unwrap(),
             &schema(),
             double,
@@ -482,6 +536,7 @@ mod tests {
         std::fs::write(&valid, "температура,материал\n70,глина\n").unwrap();
         let err = export_predictions(
             valid.to_str().unwrap(),
+            None,
             tmp_path("unused_shape.xlsx").to_str().unwrap(),
             &schema(),
             |inputs| {
@@ -505,6 +560,7 @@ mod tests {
         std::fs::write(&input, contents).unwrap();
         let err = export_predictions(
             input.to_str().unwrap(),
+            None,
             input.to_str().unwrap(),
             &schema(),
             double,
@@ -527,6 +583,7 @@ mod tests {
         .unwrap();
         let err = export_predictions(
             input.to_str().unwrap(),
+            None,
             tmp_path("unused.xlsx").to_str().unwrap(),
             &schema(),
             double,
@@ -553,6 +610,7 @@ mod tests {
         .unwrap();
         let err = export_predictions(
             input.to_str().unwrap(),
+            None,
             tmp_path("unused2.xlsx").to_str().unwrap(),
             &schema(),
             double,
@@ -575,6 +633,7 @@ mod tests {
 
         export_predictions(
             input.to_str().unwrap(),
+            None,
             output.to_str().unwrap(),
             &schema(),
             double,

@@ -53,6 +53,7 @@ struct Flags {
 /// Допустимые флаги для train. Неизвестный флаг отвергается,
 /// чтобы опечатка не привела к молчаливому обучению дефолтной конфигурации.
 const TRAIN_FLAGS: &[&str] = &[
+    "sheet",
     "epochs",
     "eval-every",
     "model",
@@ -86,14 +87,15 @@ const TRAIN_FLAGS: &[&str] = &[
 const TRAIN_BOOL_FLAGS: &[&str] = &["diagnose", "kan-symbolic", "kan-compact", "interpret"];
 
 /// Флаги подкоманды predict: табличная форма.
-const PREDICT_FLAGS: &[&str] = &["table", "out"];
+const PREDICT_FLAGS: &[&str] = &["table", "sheet", "out"];
 
 /// Флаги подкоманды prepare (таблица -> .tnum).
-const PREPARE_FLAGS: &[&str] = &["inputs", "outputs", "delimiter", "categorical"];
+const PREPARE_FLAGS: &[&str] = &["inputs", "outputs", "delimiter", "categorical", "sheet"];
 const PREPARE_BOOL_FLAGS: &[&str] = &["has-header"];
 
 /// Флаги подкоманды search (оси — CSV-списки).
 const SEARCH_FLAGS: &[&str] = &[
+    "sheet",
     "model-kinds",
     "seeds",
     "d-models",
@@ -488,6 +490,7 @@ fn print_usage() {
     );
     eprintln!("  transformer predict <model.bin> <v1> <v2> ...");
     eprintln!("  transformer predict <model.bin> --table <вход> --out <выход.xlsx>");
+    eprintln!("         --sheet <имя листа> — для книги Excel с несколькими листами");
     #[cfg(feature = "demo")]
     {
         eprintln!("  transformer demo train <чёрный ящик> [флаги обучения]");
@@ -1034,7 +1037,7 @@ fn run_train(rest: &[String]) {
         .unwrap_or_else(|| fail("укажите данные: transformer train <файл>"));
     require_data_file(path);
 
-    let (data, schema) = match read_numeric_source(path) {
+    let (data, schema) = match read_numeric_source(path, f.get("sheet")) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Не удалось прочитать {path}: {e}");
@@ -1211,18 +1214,31 @@ fn run_diagnostics(
 /// нельзя.
 #[derive(Debug)]
 enum PredictForm {
-    Table { input: String, output: String },
+    Table {
+        input: String,
+        /// Лист книги; `None` у текстовой таблицы и у книги с единственным
+        /// листом.
+        sheet: Option<String>,
+        output: String,
+    },
     Row(Vec<String>),
 }
 
 fn predict_form(
     table: Option<&str>,
+    sheet: Option<&str>,
     out: Option<&str>,
     positionals: &[String],
 ) -> Result<PredictForm, String> {
+    // Лист есть только у таблицы: у формы одной строки он означал бы, что
+    // пользователь ждёт чтения файла, которого в этой форме нет.
+    if sheet.is_some() && table.is_none() {
+        return Err("--sheet относится к --table: у формы одной строки листов нет".to_string());
+    }
     match (table, out) {
         (Some(input), Some(output)) if positionals.is_empty() => Ok(PredictForm::Table {
             input: input.to_string(),
+            sheet: sheet.map(str::to_string),
             output: output.to_string(),
         }),
         (Some(_), Some(_)) => Err("нельзя смешивать формы: либо --table и --out для \
@@ -1271,8 +1287,8 @@ fn run_predict(rest: &[String]) {
         }
     };
     let f = Flags::parse(&rest[1..], PREDICT_FLAGS, &[]).unwrap_or_else(|e| fail(&e));
-    let form =
-        predict_form(f.get("table"), f.get("out"), &f.positionals).unwrap_or_else(|e| fail(&e));
+    let form = predict_form(f.get("table"), f.get("sheet"), f.get("out"), &f.positionals)
+        .unwrap_or_else(|e| fail(&e));
 
     let checkpoint = match load_numeric_full(path) {
         Ok(c) => c,
@@ -1286,8 +1302,12 @@ fn run_predict(rest: &[String]) {
 
     // Таблица и одна строка идут через один слой схемы и одно ядро прогноза.
     let row = match &form {
-        PredictForm::Table { input, output } => {
-            let summary = export_predictions(input, output, schema, |inputs| {
+        PredictForm::Table {
+            input,
+            sheet,
+            output,
+        } => {
+            let summary = export_predictions(input, sheet.as_deref(), output, schema, |inputs| {
                 predict::predict_rows(
                     &checkpoint.model,
                     &checkpoint.in_norm,
@@ -1462,7 +1482,7 @@ fn run_prepare(rest: &[String]) {
         f.get("categorical"),
     ) {
         (Some(_), Some(_), Some(_)) => None,
-        _ => infer_prepare_spec_from_path(input, delimiter).ok(),
+        _ => infer_prepare_spec_from_path(input, f.get("sheet"), delimiter).ok(),
     };
     let n_inputs = f
         .usize("inputs")
@@ -1490,6 +1510,7 @@ fn run_prepare(rest: &[String]) {
         delimiter,
         has_header,
         categorical,
+        sheet: f.get("sheet").map(str::to_string),
     };
 
     let stats = prepare_tnum_file(input, output, &spec).unwrap_or_else(|e| fail(&e));
@@ -1565,7 +1586,7 @@ fn run_search(rest: &[String]) {
         .pos(0)
         .unwrap_or_else(|| fail("укажите данные: transformer search <файл>"));
     require_data_file(path);
-    let (data, schema) = read_numeric_source(path).unwrap_or_else(|e| fail(&e));
+    let (data, schema) = read_numeric_source(path, f.get("sheet")).unwrap_or_else(|e| fail(&e));
     let dataset = Dataset::new(data, schema).unwrap_or_else(|e| fail(&e));
     let prepared = SplitPlan::default()
         .prepare(dataset.data())
@@ -1934,33 +1955,52 @@ mod tests {
 
     #[test]
     fn table_form_needs_both_flags_and_no_values() {
-        let both = predict_form(Some("in.xlsx"), Some("out.xlsx"), &[]).unwrap();
+        let both = predict_form(Some("in.xlsx"), None, Some("out.xlsx"), &[]).unwrap();
         match both {
-            PredictForm::Table { input, output } => {
+            PredictForm::Table {
+                input,
+                sheet,
+                output,
+            } => {
                 assert_eq!((input.as_str(), output.as_str()), ("in.xlsx", "out.xlsx"));
+                assert_eq!(sheet, None, "лист не выбран, пока его не указали");
             }
             PredictForm::Row(_) => panic!("ожидалась табличная форма"),
         }
         for (t, o) in [(Some("in.xlsx"), None), (None, Some("out.xlsx"))] {
-            let e = predict_form(t, o, &[]).unwrap_err();
+            let e = predict_form(t, None, o, &[]).unwrap_err();
             assert!(e.contains("оба флага"), "{e}");
         }
     }
 
+    /// Лист относится к таблице: у формы одной строки файла нет вовсе, и
+    /// принимать `--sheet` там значило бы обещать чтение, которого не будет.
+    #[test]
+    fn a_sheet_belongs_to_the_table_form() {
+        let table =
+            predict_form(Some("in.xlsx"), Some("Данные 2024"), Some("out.xlsx"), &[]).unwrap();
+        match table {
+            PredictForm::Table { sheet, .. } => assert_eq!(sheet.as_deref(), Some("Данные 2024")),
+            PredictForm::Row(_) => panic!("ожидалась табличная форма"),
+        }
+        let e = predict_form(None, Some("Лист1"), None, &row(&["70"])).unwrap_err();
+        assert!(e.contains("--sheet"), "{e}");
+    }
+
     #[test]
     fn forms_do_not_mix() {
-        let e = predict_form(Some("in.xlsx"), Some("out.xlsx"), &row(&["70"])).unwrap_err();
+        let e = predict_form(Some("in.xlsx"), None, Some("out.xlsx"), &row(&["70"])).unwrap_err();
         assert!(e.contains("смешивать"), "{e}");
-        let e = predict_form(Some("in.xlsx"), None, &row(&["70"])).unwrap_err();
+        let e = predict_form(Some("in.xlsx"), None, None, &row(&["70"])).unwrap_err();
         assert!(e.contains("оба флага"), "{e}");
     }
 
     #[test]
     fn short_form_keeps_its_values_and_rejects_an_empty_call() {
-        match predict_form(None, None, &row(&["70", "глина"])).unwrap() {
+        match predict_form(None, None, None, &row(&["70", "глина"])).unwrap() {
             PredictForm::Row(values) => assert_eq!(values, row(&["70", "глина"])),
             PredictForm::Table { .. } => panic!("ожидалась короткая форма"),
         }
-        assert!(predict_form(None, None, &[]).is_err());
+        assert!(predict_form(None, None, None, &[]).is_err());
     }
 }

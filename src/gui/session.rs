@@ -9,9 +9,10 @@ use super::data::{MarkupState, PrepareForm};
 use super::demo::TextForm;
 use super::messages::{
     Command, CurvePoint, DatasetOrigin, DiagnosticsResult, Event, KanModelInfo, KanSymbolicInfo,
-    ModelOrigin, PreparedData,
+    ModelOrigin, PreparedData, SheetSlot,
 };
 use super::model::{ModelInfo, ModelView};
+use super::sheets::SheetState;
 use super::train::{CustomSearchForm, SearchForm, TrainForm, TrainingMode};
 use super::worker::Worker;
 use crate::data::OutOfRange;
@@ -330,6 +331,8 @@ pub(crate) struct App {
     pub(super) generated_text: String,
     // Совместимая явная конвертация в .tnum внутри раздела «Данные».
     pub(super) prepare_form: PrepareForm,
+    /// Выбор листа книги: по одному состоянию на файловое поле.
+    pub(super) sheets: SheetState,
 }
 
 impl App {
@@ -390,6 +393,7 @@ impl App {
             #[cfg(feature = "demo")]
             generated_text: String::new(),
             prepare_form: PrepareForm::default(),
+            sheets: SheetState::default(),
         }
     }
 
@@ -397,6 +401,26 @@ impl App {
         while let Some(ev) = self.worker.try_recv() {
             match ev {
                 Event::Status(s) => self.status = s,
+                // Книгу не читаем наугад: список листов уходит в то поле, из
+                // которого пришёл файл, а операция ждёт выбора.
+                Event::ChooseSheet { slot, path, sheets } => {
+                    let name = std::path::Path::new(&path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.clone());
+                    match slot {
+                        SheetSlot::Markup => {
+                            self.table_opening = false;
+                            self.sheets.markup.offer(path, sheets);
+                        }
+                        SheetSlot::Prepare => self.sheets.prepare.offer(path, sheets),
+                        SheetSlot::Export => {
+                            self.batch_predicting = false;
+                            self.sheets.export.offer(path, sheets);
+                        }
+                    }
+                    self.status = format!("в книге {name} несколько листов: выберите лист");
+                }
                 Event::Error(e) => {
                     self.training = false;
                     self.searching = false;
@@ -871,6 +895,26 @@ impl App {
                 }
             }
         });
+        let idle = !self.busy();
+        self.ui_markup_sheet(ui, idle);
+    }
+
+    /// Выбор листа для разметки: появляется, когда worker отказался читать
+    /// книгу наугад. Файл уже выбран — переспрашивать его незачем.
+    fn ui_markup_sheet(&mut self, ui: &mut egui::Ui, idle: bool) {
+        let Some((path, has_header)) = self.sheets.markup_request.clone() else {
+            return;
+        };
+        self.sheets.markup.ui(ui, "markup_sheet", &path);
+        if self.sheets.markup.sheet_for(&path).is_none() {
+            return;
+        }
+        if ui
+            .add_enabled(idle, egui::Button::new("Открыть выбранный лист"))
+            .clicked()
+        {
+            self.open_table(path, has_header);
+        }
     }
 
     /// Путь таблицы, если активные данные пришли из разметки.
@@ -947,10 +991,21 @@ impl App {
         }
     }
 
+    /// Открыть таблицу для разметки.
+    ///
+    /// Лист берётся из уже сделанного выбора для этого же файла: у книги с
+    /// несколькими листами worker вернёт вопрос, и повторный вызов придёт сюда
+    /// уже с ответом.
     pub(super) fn open_table(&mut self, path: String, has_header: bool) {
+        let sheet = self.sheets.markup.sheet_for(&path).map(str::to_string);
+        self.sheets.markup_request = Some((path.clone(), has_header));
         self.table_opening = true;
         self.status = format!("чтение {path}…");
-        self.worker.send(Command::OpenTable { path, has_header });
+        self.worker.send(Command::OpenTable {
+            path,
+            has_header,
+            sheet,
+        });
     }
 
     pub(super) fn apply_choice_to_train(&mut self, choice: &SweepChoice) {

@@ -43,26 +43,76 @@ pub struct Table {
     row_numbers: Vec<usize>,
 }
 
+/// Книга ли это: решается по расширению, как и выбор читателя.
+pub fn is_workbook(path: impl AsRef<Path>) -> bool {
+    matches!(
+        path.as_ref()
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("xlsx" | "xlsm" | "xlsb" | "xls" | "ods")
+    )
+}
+
+/// Имена листов книги в порядке самой книги.
+///
+/// Отдельная операция, потому что выбор листа делается ДО чтения данных: иначе
+/// пришлось бы либо угадывать лист, либо читать книгу дважды.
+pub fn workbook_sheets(path: impl AsRef<Path>) -> Result<Vec<String>, String> {
+    let path = path.as_ref();
+    if !is_workbook(path) {
+        return Err(format!(
+            "{}: это не книга Excel/ODS, листов у неё нет",
+            path.display()
+        ));
+    }
+    let workbook =
+        open_workbook_auto(path).map_err(|e| format!("чтение {}: {e}", path.display()))?;
+    Ok(workbook.sheet_names())
+}
+
 impl Table {
+    /// Прочитать таблицу, не выбирая лист.
+    ///
+    /// У книги с единственным листом выбирать нечего; книга с несколькими
+    /// листами — ошибка, см. [`Table::read_sheet`].
     pub fn read_path(
         path: impl AsRef<Path>,
         delimiter: Delimiter,
         has_header: bool,
     ) -> Result<Self, String> {
+        Self::read_sheet(path, None, delimiter, has_header)
+    }
+
+    /// Прочитать конкретный лист книги.
+    ///
+    /// `sheet: None` означает «лист не выбран»: у книги с одним листом это тот
+    /// самый лист, у книги с несколькими — ошибка со списком имён. Молча брать
+    /// первый нельзя: в реальных книгах первым часто лежит титульный лист или
+    /// прошлогодние данные, и такая ошибка не видна ни в одной метрике.
+    ///
+    /// У текстовой таблицы листов нет, поэтому имя для неё — тоже ошибка, а не
+    /// игнорируемый аргумент.
+    pub fn read_sheet(
+        path: impl AsRef<Path>,
+        sheet: Option<&str>,
+        delimiter: Delimiter,
+        has_header: bool,
+    ) -> Result<Self, String> {
         let path = path.as_ref();
         let source = path.display().to_string();
-        let rows = match path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("xlsx" | "xlsm" | "xlsb" | "xls" | "ods") => read_workbook(path)?,
-            _ => {
-                let text =
-                    std::fs::read_to_string(path).map_err(|e| format!("чтение {source}: {e}"))?;
-                split_text(&text, delimiter).map_err(|e| format!("{source}: {e}"))?
+        let rows = if is_workbook(path) {
+            read_workbook(path, sheet)?
+        } else {
+            if let Some(sheet) = sheet {
+                return Err(format!(
+                    "{source}: лист '{sheet}' указан для текстовой таблицы, а листы есть только у книг"
+                ));
             }
+            let text =
+                std::fs::read_to_string(path).map_err(|e| format!("чтение {source}: {e}"))?;
+            split_text(&text, delimiter).map_err(|e| format!("{source}: {e}"))?
         };
         Self::from_rows(source, rows, has_header)
     }
@@ -337,14 +387,37 @@ fn cell_to_text(cell: &Data, row: usize, col: usize) -> Result<String, String> {
     }
 }
 
-fn read_workbook(path: &Path) -> Result<Vec<(usize, Vec<String>)>, String> {
+/// Какой лист читать: выбранный по имени либо единственный.
+fn choose_sheet(path: &Path, names: &[String], wanted: Option<&str>) -> Result<String, String> {
+    let listed = || names.join(", ");
+    match wanted {
+        Some(name) => names
+            .iter()
+            .find(|sheet| sheet.as_str() == name)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "{}: листа '{name}' в книге нет. Есть: {}",
+                    path.display(),
+                    listed()
+                )
+            }),
+        None => match names {
+            [] => Err(format!("{}: книга без листов", path.display())),
+            [only] => Ok(only.clone()),
+            _ => Err(format!(
+                "{}: в книге несколько листов: {}. Укажите лист явно: брать первый молча нельзя",
+                path.display(),
+                listed()
+            )),
+        },
+    }
+}
+
+fn read_workbook(path: &Path, wanted: Option<&str>) -> Result<Vec<(usize, Vec<String>)>, String> {
     let mut workbook =
         open_workbook_auto(path).map_err(|e| format!("чтение {}: {e}", path.display()))?;
-    let sheet = workbook
-        .sheet_names()
-        .first()
-        .cloned()
-        .ok_or_else(|| format!("{}: workbook без листов", path.display()))?;
+    let sheet = choose_sheet(path, &workbook.sheet_names(), wanted)?;
     let range = workbook
         .worksheet_range(&sheet)
         .map_err(|e| format!("чтение {} листа '{sheet}': {e}", path.display()))?;
@@ -372,10 +445,174 @@ fn read_workbook(path: &Path) -> Result<Vec<(usize, Vec<String>)>, String> {
     Ok(rows)
 }
 
+/// Тестовая книга с несколькими листами.
+///
+/// Живёт рядом с чтением, а не в тестах одного модуля: такой файл нужен и
+/// конвертации, и экспорту, и worker-у, а три копии одного XML разойдутся.
+#[cfg(test)]
+pub(crate) fn write_test_workbook(path: &Path, sheets: &[(&str, &[&[&str]])]) {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    let file = std::fs::File::create(path).unwrap();
+    let mut zip = ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let part = |zip: &mut ZipWriter<std::fs::File>, name: &str, xml: &str| {
+        zip.start_file(name, options).unwrap();
+        zip.write_all(xml.as_bytes()).unwrap();
+    };
+
+    let mut types = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>"#,
+    );
+    let mut book = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+      xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>"#,
+    );
+    let mut rels = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">"#,
+    );
+    for (i, (name, rows)) in sheets.iter().enumerate() {
+        let n = i + 1;
+        types.push_str(&format!(
+            r#"<Override PartName="/xl/worksheets/sheet{n}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>"#
+        ));
+        book.push_str(&format!(
+            r#"<sheet name="{name}" sheetId="{n}" r:id="rId{n}"/>"#
+        ));
+        rels.push_str(&format!(
+            r#"<Relationship Id="rId{n}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{n}.xml"/>"#
+        ));
+
+        let mut sheet = String::from(
+            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>"#,
+        );
+        for (r, row) in rows.iter().enumerate() {
+            sheet.push_str(&format!(r#"<row r="{}">"#, r + 1));
+            for (c, cell) in row.iter().enumerate() {
+                let col = (b'A' + c as u8) as char;
+                sheet.push_str(&format!(
+                    r#"<c r="{col}{}" t="inlineStr"><is><t>{cell}</t></is></c>"#,
+                    r + 1
+                ));
+            }
+            sheet.push_str("</row>");
+        }
+        sheet.push_str("</sheetData></worksheet>");
+        part(&mut zip, &format!("xl/worksheets/sheet{n}.xml"), &sheet);
+    }
+    types.push_str("</Types>");
+    book.push_str("</sheets></workbook>");
+    rels.push_str("</Relationships>");
+
+    part(&mut zip, "[Content_Types].xml", &types);
+    part(
+        &mut zip,
+        "_rels/.rels",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#,
+    );
+    part(&mut zip, "xl/workbook.xml", &book);
+    part(&mut zip, "xl/_rels/workbook.xml.rels", &rels);
+    zip.finish().unwrap();
+}
+
 #[cfg(test)]
 mod tests {
+    use super::write_test_workbook as write_workbook;
     use super::*;
     use crate::schema::{Column, ColumnRole, TableSchema};
+
+    fn tmp_book(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("transformer_sheets_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    /// Единственный лист — выбирать нечего, и спрашивать не о чем.
+    #[test]
+    fn a_single_sheet_workbook_reads_without_a_choice() {
+        let path = tmp_book("one.xlsx");
+        write_workbook(&path, &[("Данные", &[&["x0", "y0"], &["1", "2"]])]);
+
+        let table = Table::read_path(&path, Delimiter::Auto, true).unwrap();
+        assert_eq!(
+            table.header().unwrap(),
+            &["x0".to_string(), "y0".to_string()]
+        );
+        assert_eq!(table.rows()[0], vec!["1", "2"]);
+        assert_eq!(workbook_sheets(&path).unwrap(), vec!["Данные".to_string()]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Несколько листов без выбора — ошибка со списком, а не первый лист.
+    /// Титульный лист и рабочая таблица в файле выглядят одинаково.
+    #[test]
+    fn a_multi_sheet_workbook_refuses_to_guess() {
+        let path = tmp_book("many.xlsx");
+        write_workbook(
+            &path,
+            &[
+                ("Титульный", &[&["отчёт за год"]]),
+                ("Опыты", &[&["x0", "y0"], &["3", "4"]]),
+            ],
+        );
+
+        let err = Table::read_path(&path, Delimiter::Auto, true).unwrap_err();
+        assert!(err.contains("Титульный"), "{err}");
+        assert!(err.contains("Опыты"), "{err}");
+        assert!(err.contains("молча"), "{err}");
+
+        assert_eq!(
+            workbook_sheets(&path).unwrap(),
+            vec!["Титульный".to_string(), "Опыты".to_string()],
+            "порядок — как в книге"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_named_sheet_is_read_and_an_unknown_one_lists_the_others() {
+        let path = tmp_book("named.xlsx");
+        write_workbook(
+            &path,
+            &[
+                ("Титульный", &[&["отчёт за год"]]),
+                ("Опыты", &[&["x0", "y0"], &["3", "4"]]),
+            ],
+        );
+
+        let table = Table::read_sheet(&path, Some("Опыты"), Delimiter::Auto, true).unwrap();
+        assert_eq!(table.rows()[0], vec!["3", "4"]);
+
+        let err = Table::read_sheet(&path, Some("опыты"), Delimiter::Auto, true).unwrap_err();
+        assert!(err.contains("Титульный, Опыты"), "{err}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// У текста листов нет: имя листа для него — ошибка, а не игнорируемый
+    /// аргумент.
+    #[test]
+    fn a_text_table_has_no_sheets() {
+        let path = tmp_book("plain.csv");
+        std::fs::write(&path, "x0,y0\n1,2\n").unwrap();
+
+        assert!(Table::read_path(&path, Delimiter::Auto, true).is_ok());
+        let err = Table::read_sheet(&path, Some("Лист1"), Delimiter::Auto, true).unwrap_err();
+        assert!(err.contains("листы есть только у книг"), "{err}");
+        assert!(workbook_sheets(&path).is_err());
+        assert!(!is_workbook(&path));
+        std::fs::remove_file(&path).ok();
+    }
 
     fn schema(cols: Vec<Column>) -> TableSchema {
         TableSchema::new(cols).unwrap()

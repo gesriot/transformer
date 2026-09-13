@@ -137,7 +137,12 @@ impl Default for PrepareForm {
 }
 
 impl PrepareForm {
-    pub(super) fn build(&self) -> Result<(String, String, PrepareSpec), String> {
+    /// Собрать команду конвертации. Лист приходит снаружи: его выбирают в
+    /// отдельном состоянии, общем для всех файловых полей.
+    pub(super) fn build(
+        &self,
+        sheet: Option<String>,
+    ) -> Result<(String, String, PrepareSpec), String> {
         if self.input_path.is_empty() {
             return Err("выберите входную таблицу".to_string());
         }
@@ -160,6 +165,7 @@ impl PrepareForm {
                 delimiter,
                 has_header: self.has_header,
                 categorical,
+                sheet,
             },
         ))
     }
@@ -170,7 +176,21 @@ impl App {
         if self.prepare_form.input_path.is_empty() {
             return;
         }
-        match infer_prepare_spec_from_path(&self.prepare_form.input_path, Delimiter::Auto) {
+        // Автоопределение читает тот же лист, что и конвертация: у книги с
+        // несколькими листами до выбора читать нечего.
+        let sheet = self
+            .sheets
+            .prepare
+            .sheet_for(&self.prepare_form.input_path)
+            .map(str::to_string);
+        if sheet.is_none() && self.sheets.prepare.awaiting(&self.prepare_form.input_path) {
+            return;
+        }
+        match infer_prepare_spec_from_path(
+            &self.prepare_form.input_path,
+            sheet.as_deref(),
+            Delimiter::Auto,
+        ) {
             Ok(inferred) => {
                 self.prepare_form.inputs = inferred.n_inputs;
                 self.prepare_form.outputs = inferred.n_outputs;
@@ -660,6 +680,8 @@ impl App {
                     .pick_file()
                 {
                     self.prepare_form.input_path = p.display().to_string();
+                    // Прежний выбор относился к другой книге.
+                    self.sheets.prepare.clear();
                     self.apply_prepare_inference();
                 }
             }
@@ -669,6 +691,17 @@ impl App {
                 &self.prepare_form.input_path
             });
         });
+        let input_path = self.prepare_form.input_path.clone();
+        let sheet_before = self
+            .sheets
+            .prepare
+            .sheet_for(&input_path)
+            .map(str::to_string);
+        self.sheets.prepare.ui(ui, "prepare_sheet", &input_path);
+        // Лист выбран только что: подсказки автоопределения относятся к нему.
+        if sheet_before.is_none() && self.sheets.prepare.sheet_for(&input_path).is_some() {
+            self.apply_prepare_inference();
+        }
         ui.horizontal(|ui| {
             if ui.button("Выход .tnum…").clicked() {
                 if let Some(p) = rfd::FileDialog::new()
@@ -713,7 +746,12 @@ impl App {
             .add_enabled(!self.busy(), egui::Button::new("Convert"))
             .clicked()
         {
-            match self.prepare_form.build() {
+            let sheet = self
+                .sheets
+                .prepare
+                .sheet_for(&self.prepare_form.input_path)
+                .map(str::to_string);
+            match self.prepare_form.build(sheet) {
                 Ok((input, output, spec)) => {
                     self.worker.send(Command::Prepare {
                         input,

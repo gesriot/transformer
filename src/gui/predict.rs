@@ -30,11 +30,24 @@ impl App {
         else {
             return;
         };
+        // Книга сменилась — прежний выбор листа к ней не относится.
+        self.sheets.export.clear();
+        self.send_export(input.display().to_string(), output.display().to_string());
+    }
+
+    /// Отправить экспорт с уже выбранным (или ещё не выбранным) листом.
+    ///
+    /// Пути запоминаются: у книги с несколькими листами worker вернёт вопрос,
+    /// а диалогов выбора файлов к тому моменту уже нет.
+    pub(super) fn send_export(&mut self, input: String, output: String) {
+        let sheet = self.sheets.export.sheet_for(&input).map(str::to_string);
+        self.sheets.export_request = Some((input.clone(), output.clone()));
         self.batch_predicting = true;
         self.status = "экспорт таблицы с прогнозами…".to_string();
         self.worker.send(Command::ExportPredictions {
-            input: input.display().to_string(),
-            output: output.display().to_string(),
+            input,
+            output,
+            sheet,
         });
     }
 
@@ -153,7 +166,30 @@ impl App {
                 {
                     self.export_predictions_dialog();
                 }
+                self.ui_export_sheet(ui);
             }
+        }
+    }
+
+    /// Выбор листа входной книги: появляется, когда worker отказался читать
+    /// книгу наугад. Пути уже известны — переспрашивать файл незачем.
+    fn ui_export_sheet(&mut self, ui: &mut egui::Ui) {
+        let Some((input, output)) = self.sheets.export_request.clone() else {
+            return;
+        };
+        self.sheets.export.ui(ui, "export_sheet", &input);
+        let chosen = self.sheets.export.sheet_for(&input).is_some();
+        if !chosen {
+            return;
+        }
+        if ui
+            .add_enabled(
+                !self.busy(),
+                egui::Button::new("Экспортировать выбранный лист"),
+            )
+            .clicked()
+        {
+            self.send_export(input, output);
         }
     }
 }

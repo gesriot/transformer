@@ -7,7 +7,7 @@
 
 use super::messages::{
     Command, CurvePoint, DatasetOrigin, DiagnosticsResult, Event, KanModelInfo, KanSymbolicInfo,
-    KanWeakEdge, ModelOrigin, PreparedData,
+    KanWeakEdge, ModelOrigin, PreparedData, SheetSlot,
 };
 use crate::batch_predict::{export_predictions, ExportSummary};
 #[cfg(any(feature = "demo", test))]
@@ -38,7 +38,7 @@ use crate::split::DEFAULT_DATA_SEED;
 use crate::split::{FinalEval, SplitPlan};
 use crate::sweep::{self, SweepAxes, SweepObjective};
 use crate::symbolic;
-use crate::table::{Delimiter, Table};
+use crate::table::{is_workbook, workbook_sheets, Delimiter, Table};
 #[cfg(feature = "demo")]
 use crate::textmodel::TextModel;
 use crate::tnum::{
@@ -421,12 +421,28 @@ fn worker_loop(
                 }
                 ctx.request_repaint();
             }
-            Command::ExportPredictions { input, output } => {
+            Command::ExportPredictions {
+                input,
+                output,
+                sheet,
+            } => {
                 match &current {
-                    Some(l) => match do_export(l, &input, &output) {
-                        Ok(summary) => {
-                            let _ = evt_tx.send(Event::ExportDone { output, summary });
+                    Some(l) => match sheets_to_choose(&input, sheet.as_deref()) {
+                        Ok(Some(sheets)) => {
+                            let _ = evt_tx.send(Event::ChooseSheet {
+                                slot: SheetSlot::Export,
+                                path: input,
+                                sheets,
+                            });
                         }
+                        Ok(None) => match do_export(l, &input, sheet.as_deref(), &output) {
+                            Ok(summary) => {
+                                let _ = evt_tx.send(Event::ExportDone { output, summary });
+                            }
+                            Err(e) => {
+                                let _ = evt_tx.send(Event::Error(e));
+                            }
+                        },
                         Err(e) => {
                             let _ = evt_tx.send(Event::Error(e));
                         }
@@ -550,9 +566,16 @@ fn worker_loop(
                 }
                 ctx.request_repaint();
             }
-            Command::OpenTable { path, has_header } => {
-                match open_table(&path, has_header) {
-                    Ok((table, profile, suggested_inputs, suggested_categories)) => {
+            Command::OpenTable {
+                path,
+                has_header,
+                sheet,
+            } => {
+                match sheets_to_choose(&path, sheet.as_deref()).and_then(|choice| match choice {
+                    Some(sheets) => Ok(Err(sheets)),
+                    None => open_table(&path, sheet.as_deref(), has_header).map(Ok),
+                }) {
+                    Ok(Ok((table, profile, suggested_inputs, suggested_categories))) => {
                         let _ = evt_tx.send(Event::TableOpened {
                             path,
                             has_header,
@@ -560,6 +583,13 @@ fn worker_loop(
                             profile: Box::new(profile),
                             suggested_inputs,
                             suggested_categories,
+                        });
+                    }
+                    Ok(Err(sheets)) => {
+                        let _ = evt_tx.send(Event::ChooseSheet {
+                            slot: SheetSlot::Markup,
+                            path,
+                            sheets,
                         });
                     }
                     Err(e) => {
@@ -573,15 +603,27 @@ fn worker_loop(
                 output,
                 spec,
             } => {
-                match prepare_tnum(&input, &output, &spec) {
-                    Ok((rows, n_inputs, n_outputs)) => {
-                        let _ = evt_tx.send(Event::PrepareDone {
-                            output,
-                            rows,
-                            n_inputs,
-                            n_outputs,
+                match sheets_to_choose(&input, spec.sheet.as_deref()) {
+                    Ok(Some(sheets)) => {
+                        let _ = evt_tx.send(Event::ChooseSheet {
+                            slot: SheetSlot::Prepare,
+                            path: input,
+                            sheets,
                         });
                     }
+                    Ok(None) => match prepare_tnum(&input, &output, &spec) {
+                        Ok((rows, n_inputs, n_outputs)) => {
+                            let _ = evt_tx.send(Event::PrepareDone {
+                                output,
+                                rows,
+                                n_inputs,
+                                n_outputs,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = evt_tx.send(Event::Error(e));
+                        }
+                    },
                     Err(e) => {
                         let _ = evt_tx.send(Event::Error(e));
                     }
@@ -859,10 +901,27 @@ fn do_predict(l: &Loaded, values: &[f32]) -> Result<(Vec<f32>, Vec<OutOfRange>),
     Ok((result.outputs.row(0).to_vec(), extrapolation))
 }
 
-fn do_export(l: &Loaded, input: &str, output: &str) -> Result<ExportSummary, String> {
-    export_predictions(input, output, &l.schema, |inputs| {
+fn do_export(
+    l: &Loaded,
+    input: &str,
+    sheet: Option<&str>,
+    output: &str,
+) -> Result<ExportSummary, String> {
+    export_predictions(input, sheet, output, &l.schema, |inputs| {
         predict_rows(&l.model, &l.in_norm, &l.out_norm, inputs)
     })
+}
+
+/// Нужно ли спросить лист, прежде чем читать файл.
+///
+/// `Some(листы)` — книга неоднозначна: выбор за человеком. `None` — читать
+/// можно: это не книга, лист уже выбран или он в книге единственный.
+fn sheets_to_choose(path: &str, sheet: Option<&str>) -> Result<Option<Vec<String>>, String> {
+    if sheet.is_some() || !is_workbook(path) {
+        return Ok(None);
+    }
+    let sheets = workbook_sheets(path)?;
+    Ok((sheets.len() > 1).then_some(sheets))
 }
 
 /// Поиск конфигурации на активном наборе данных.
@@ -1066,7 +1125,9 @@ fn open_dataset(origin: &DatasetOrigin) -> Result<PreparedData, String> {
                 ModelSchema::synthetic(bb.n_inputs(), bb.n_outputs)?,
             )
         }
-        DatasetOrigin::File(path) => read_numeric_source(path)?,
+        // Через это поле интерфейс открывает только `.tnum`: у него листов
+        // нет, и спрашивать не о чем.
+        DatasetOrigin::File(path) => read_numeric_source(path, None)?,
         DatasetOrigin::Table(path) => {
             return Err(format!(
                 "{path}: размеченная таблица приходит из диалога разметки, а не из чтения"
@@ -1084,11 +1145,12 @@ fn open_dataset(origin: &DatasetOrigin) -> Result<PreparedData, String> {
 /// вход/выход, но роли всё равно подтверждает пользователь.
 fn open_table(
     path: &str,
+    sheet: Option<&str>,
     has_header: bool,
 ) -> Result<(Table, TableProfile, Option<usize>, Vec<usize>), String> {
     // Сначала читаем без выделенного заголовка: старая эвристика должна увидеть
     // первую строку, а файл при этом остаётся прочитан ровно один раз.
-    let raw = Table::read_path(path, Delimiter::Auto, false)?;
+    let raw = Table::read_sheet(path, sheet, Delimiter::Auto, false)?;
     let inferred = has_header
         .then(|| infer_prepare_spec_from_table(&raw, Delimiter::Auto).ok())
         .flatten();
@@ -2628,6 +2690,47 @@ mod tests {
         assert_eq!(resaved.interpret, Some(profile));
     }
 
+    /// Вопрос о листе задаётся ровно там, где он неоднозначен: у текста и у
+    /// книги с одним листом интерфейс не должен спрашивать ни о чём, а у книги
+    /// с несколькими — не должен читать.
+    #[test]
+    fn a_sheet_is_asked_only_when_the_workbook_is_ambiguous() {
+        let dir =
+            std::env::temp_dir().join(format!("transformer_gui_sheets_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let many = dir.join("many.xlsx");
+        let one = dir.join("one.xlsx");
+        let text = dir.join("plain.csv");
+        crate::table::write_test_workbook(
+            &many,
+            &[
+                ("Титульный", &[&["отчёт"]]),
+                ("Опыты", &[&["x0", "y0"], &["1", "2"]]),
+            ],
+        );
+        crate::table::write_test_workbook(&one, &[("Опыты", &[&["x0", "y0"], &["1", "2"]])]);
+        std::fs::write(&text, "x0,y0\n1,2\n").unwrap();
+
+        let ask = |path: &std::path::Path, sheet: Option<&str>| {
+            sheets_to_choose(path.to_str().unwrap(), sheet).unwrap()
+        };
+        assert_eq!(
+            ask(&many, None),
+            Some(vec!["Титульный".to_string(), "Опыты".to_string()])
+        );
+        assert_eq!(ask(&many, Some("Опыты")), None, "лист уже выбран");
+        assert_eq!(ask(&one, None), None, "выбирать не из чего");
+        assert_eq!(ask(&text, None), None, "у текста листов нет");
+
+        // А выбранный лист действительно доходит до чтения.
+        let (table, _, _, _) = open_table(many.to_str().unwrap(), Some("Опыты"), true).unwrap();
+        assert_eq!(table.rows(), [["1".to_string(), "2".to_string()]]);
+
+        std::fs::remove_file(&many).ok();
+        std::fs::remove_file(&one).ok();
+        std::fs::remove_file(&text).ok();
+    }
+
     #[test]
     fn open_table_preserves_inferred_categorical_columns() {
         let path = std::env::temp_dir().join(format!(
@@ -2637,7 +2740,7 @@ mod tests {
         std::fs::write(&path, "x0,material_id,y0\n1,0,2\n3,1,4\n").unwrap();
 
         let (table, _, suggested_inputs, suggested_categories) =
-            open_table(path.to_str().unwrap(), true).unwrap();
+            open_table(path.to_str().unwrap(), None, true).unwrap();
 
         std::fs::remove_file(path).ok();
         assert_eq!(table.header().unwrap(), ["x0", "material_id", "y0"]);

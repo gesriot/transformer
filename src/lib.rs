@@ -85,7 +85,7 @@ pub use markup::{
     analyze_roles, ColumnProfile, DraftColumn, DraftType, LinearDependency, Message, RoleReport,
     SchemaDraft, Severity, TableProfile,
 };
-pub use table::{Delimiter, Table};
+pub use table::{is_workbook, workbook_sheets, Delimiter, Table};
 pub use tnum::{
     infer_prepare_spec_from_path, infer_prepare_spec_from_text, parse_categorical,
     prepare_tnum_file, read_numeric_source, table_path_to_tnum, table_to_tnum, InferredPrepareSpec,

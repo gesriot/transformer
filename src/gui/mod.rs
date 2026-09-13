@@ -9,6 +9,7 @@ mod messages;
 mod model;
 mod predict;
 mod session;
+mod sheets;
 mod train;
 mod worker;
 
