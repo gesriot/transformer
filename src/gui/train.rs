@@ -1,8 +1,7 @@
 //! Экран обучения: одна конфигурация, поиск по сетке и кривая по эпохам.
 
 use super::messages::{Command, ModelOrigin, PreparedData};
-use super::model::ModelInfo;
-use super::model::{optional, NA_NOTE};
+use super::model::{optional, show_metrics, ModelInfo};
 use super::session::{App, SearchRun, NO_DATASET};
 use crate::config::ModelConfig;
 use crate::encoders::{ValueEncoderConfig, ValueEncoderKind};
@@ -1215,17 +1214,19 @@ impl App {
                 EvalSource::Cv { k } => format!("cv-{k}"),
                 _ => "validation".to_string(),
             };
-            let m = &run.eval.metrics;
-            ui.label(format!(
-                "{source}: R²={:.5}   RMSE={:.5}   MAE={:.5}   nMAE={}",
-                m.r2,
-                m.rmse,
-                m.mae,
-                optional(m.nmae, 5)
-            ));
-            if m.nmae.is_none() {
-                ui.label(NA_NOTE);
-            }
+            let outputs = self
+                .dataset
+                .as_ref()
+                .filter(|dataset| dataset.fingerprint == run.stamp.dataset)
+                .map(|dataset| dataset.prepared.schema.outputs())
+                .unwrap_or(&[]);
+            show_metrics(
+                ui,
+                &source,
+                &run.eval.metrics,
+                Some(&run.eval.per_output),
+                outputs,
+            );
             if run.eval.r2_std_folds > 0.0 {
                 ui.label(format!(
                     "Разброс R² между folds: ±{:.5}",
@@ -1282,15 +1283,22 @@ impl App {
                 (true, false) => "test этого набора, раскрытый другим кандидатом",
                 (false, _) => "test прежнего набора данных",
             };
-            ui.label(format!(
-                "{prefix} ({} строк, единственный замер): RMSE={:.5}   MAE={:.5}   \
-                 nMAE={}   R²={:.5}",
-                f.origin.test_rows,
-                f.metrics.rmse,
-                f.metrics.mae,
-                optional(f.metrics.nmae, 5),
-                f.metrics.r2
-            ));
+            let outputs = self
+                .dataset
+                .as_ref()
+                .filter(|dataset| dataset.fingerprint == disclosed.dataset())
+                .map(|dataset| dataset.prepared.schema.outputs())
+                .unwrap_or(&[]);
+            show_metrics(
+                ui,
+                &format!(
+                    "{prefix} ({} строк, единственный замер)",
+                    f.origin.test_rows
+                ),
+                &f.metrics,
+                Some(&f.per_output),
+                outputs,
+            );
             match (same_dataset, current) {
                 (true, true) => {}
                 (true, false) => {

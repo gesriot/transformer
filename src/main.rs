@@ -639,7 +639,7 @@ fn print_metrics(title: &str, m: &Metrics, per: &[Metrics], schema: &ModelSchema
             .max(4);
         println!("\nПо выходам (RMSE и MAE — в единицах своего выхода):");
         println!(
-            "  {:<width$}       R²       RMSE        MAE       nMAE",
+            "  {:<width$}       R²       RMSE        MAE       nMAE  rel.error",
             "выход"
         );
         for (j, pm) in per.iter().enumerate() {
@@ -647,12 +647,13 @@ fn print_metrics(title: &str, m: &Metrics, per: &[Metrics], schema: &ModelSchema
             // Ширина считается в символах: у кириллицы и °C байт больше.
             let pad = width.saturating_sub(name.chars().count());
             println!(
-                "  {name}{:pad$}  {:>8.5}  {:>9.5}  {:>9.5}  {:>9}",
+                "  {name}{:pad$}  {:>8.5}  {:>9.5}  {:>9.5}  {:>9}  {:>9}",
                 "",
                 pm.r2,
                 pm.rmse,
                 pm.mae,
-                optional(pm.nmae, 5)
+                optional(pm.nmae, 5),
+                optional_percent(pm.rel_error, 2)
             );
         }
     }
@@ -685,8 +686,13 @@ fn metrics_summary(m: &Metrics, per: &[Metrics], schema: &ModelSchema) -> Vec<St
         lines.push(format!("  RMSE        = {:.5}{unit}", m.rmse));
         lines.push(format!("  MAE         = {:.5}{unit}", m.mae));
     } else {
-        let worst = per.iter().map(|pm| pm.r2).fold(f32::INFINITY, f32::min);
-        lines.push(format!("  worst y R²  = {worst:.5}"));
+        let worst = per
+            .iter()
+            .map(|pm| pm.r2)
+            .reduce(f32::min)
+            .filter(|value| value.is_finite());
+        lines[0] = format!("  aggregate R² = {:.5}", m.r2);
+        lines.push(format!("  worst y R²   = {}", optional(worst, 5)));
     }
     // nMAE нормирован масштабом обучающих таргетов: «ошибка в долях того, как
     // сильно выход вообще меняется». Он безразмерен, поэтому сравним и между
@@ -698,7 +704,10 @@ fn metrics_summary(m: &Metrics, per: &[Metrics], schema: &ModelSchema) -> Vec<St
             optional_percent(m.rel_error, 2)
         ));
     }
-    if m.nmae.is_none() || (single && m.rel_error.is_none()) {
+    if m.nmae.is_none()
+        || (single && m.rel_error.is_none())
+        || (!single && per.iter().any(|pm| pm.rel_error.is_none()))
+    {
         lines.push(NA_NOTE.to_string());
     }
     lines
@@ -804,7 +813,7 @@ fn run_train_flow(
             // Рекомендация должна быть видна между development и refit, а не
             // после того, как финальная модель уже обучена и test открыт.
             if phase == Phase::Development {
-                print_val_curve(&trained.history);
+                print_val_curve(&trained.history, dataset.schema().n_outputs());
             }
         },
     )
@@ -1336,7 +1345,7 @@ fn run_predict(rest: &[String]) {
 
 /// Кривая validation по эпохам и рекомендованная остановка. Печатается только
 /// при `--eval-every`: без замеров точек нет.
-fn print_val_curve(history: &TrainingHistory) {
+fn print_val_curve(history: &TrainingHistory, n_outputs: usize) {
     let measured: Vec<(usize, f32, &Metrics)> = history
         .points
         .iter()
@@ -1349,15 +1358,27 @@ fn print_val_curve(history: &TrainingHistory) {
         "\nКривая development по эпохам ({}; до post-train конвейера):",
         history.source.label()
     );
-    println!("epochs  train_loss     RMSE       MAE        nMAE        R²");
-    for (epoch, loss, m) in &measured {
-        println!(
-            "{epoch:>6}  {loss:>10.5}  {:>9.5}  {:>9.5}  {:>9}  {:>8.5}",
-            m.rmse,
-            m.mae,
-            optional(m.nmae, 5),
-            m.r2
-        );
+    if n_outputs <= 1 {
+        println!("epochs  train_loss     RMSE       MAE        nMAE        R²");
+        for (epoch, loss, m) in &measured {
+            println!(
+                "{epoch:>6}  {loss:>10.5}  {:>9.5}  {:>9.5}  {:>9}  {:>8.5}",
+                m.rmse,
+                m.mae,
+                optional(m.nmae, 5),
+                m.r2
+            );
+        }
+    } else {
+        // RMSE и MAE истории агрегированы по выходам и не имеют общей единицы.
+        println!("epochs  train_loss       nMAE  aggregate R²");
+        for (epoch, loss, m) in &measured {
+            println!(
+                "{epoch:>6}  {loss:>10.5}  {:>9}  {:>12.5}",
+                optional(m.nmae, 5),
+                m.r2
+            );
+        }
     }
     let r2s: Vec<f32> = measured.iter().map(|(_, _, m)| m.r2).collect();
     let losses: Vec<f32> = measured.iter().map(|(_, loss, _)| *loss).collect();
@@ -1805,8 +1826,8 @@ mod tests {
         let per = vec![metrics(0.9, Some(0.2)), metrics(0.4, Some(0.3))];
         let lines = metrics_summary(&metrics(0.8, Some(0.25)), &per, &schema).join("\n");
 
-        assert!(lines.contains("R²"), "{lines}");
-        assert!(lines.contains("worst y R²  = 0.40000"), "{lines}");
+        assert!(lines.contains("aggregate R² = 0.80000"), "{lines}");
+        assert!(lines.contains("worst y R²   = 0.40000"), "{lines}");
         assert!(lines.contains("nMAE"), "{lines}");
         assert!(!lines.contains("RMSE"), "общий RMSE не величина: {lines}");
         assert!(!lines.contains("MAE         ="), "общий MAE: {lines}");

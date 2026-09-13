@@ -455,12 +455,37 @@ impl App {
                         ui.label(format!("{:.5} (KAN: {kan_r2:.5})", metrics.r2));
                         ui.end_row();
                         ui.label("Ошибка формул");
-                        ui.label(format!(
-                            "RMSE {:.5}, rel. {}",
-                            metrics.rmse,
-                            optional_percent(metrics.rel_error, 2)
-                        ));
+                        let multiple_outputs = self
+                            .model_info
+                            .as_ref()
+                            .is_some_and(|info| info.schema.n_outputs() > 1);
+                        if multiple_outputs {
+                            // Общий RMSE смешивал бы единицы разных выходов.
+                            ui.label(format!(
+                                "nMAE {}, rel. {}",
+                                optional(metrics.nmae, 5),
+                                optional_percent(metrics.rel_error, 2)
+                            ));
+                        } else {
+                            let unit = self
+                                .model_info
+                                .as_ref()
+                                .and_then(|info| info.schema.outputs().first())
+                                .and_then(|column| column.unit())
+                                .map(|unit| format!(" ({unit})"))
+                                .unwrap_or_default();
+                            ui.label(format!(
+                                "RMSE {:.5}{unit}, rel. {}",
+                                metrics.rmse,
+                                optional_percent(metrics.rel_error, 2)
+                            ));
+                        }
                         ui.end_row();
+                        if metrics.nmae.is_none() || metrics.rel_error.is_none() {
+                            ui.label("Метрики");
+                            ui.label(NA_NOTE);
+                            ui.end_row();
+                        }
                         if label == "train+validation" {
                             ui.label("Интерпретация");
                             ui.label("верность формул финальной модели, не оценка обобщения");
@@ -651,26 +676,31 @@ fn output_label(column: &crate::schema::Column) -> String {
     }
 }
 
-fn show_metrics(
+pub(super) fn show_metrics(
     ui: &mut egui::Ui,
     label: &str,
     aggregate: &Metrics,
     per_output: Option<&[Metrics]>,
     outputs: &[crate::schema::Column],
 ) {
+    // При показе исторического test схема прежнего набора может быть уже
+    // недоступна. Число поколоночных метрик всё равно не даёт принять такой
+    // результат за одновыходной и смешать его размерные величины.
+    let n_outputs = per_output.map_or(outputs.len(), |per| per.len().max(outputs.len()));
     // У одного выхода общий RMSE и есть его собственный: смешивать нечего.
-    if outputs.len() <= 1 {
+    if n_outputs <= 1 {
         ui.label(format!(
-            "{label}: R²={:.5}   RMSE={:.5}   MAE={:.5}   nMAE={}",
+            "{label}: R²={:.5}   RMSE={:.5}   MAE={:.5}   nMAE={}   rel.error={}",
             aggregate.r2,
             aggregate.rmse,
             aggregate.mae,
-            optional(aggregate.nmae, 5)
+            optional(aggregate.nmae, 5),
+            optional_percent(aggregate.rel_error, 2)
         ));
         if let Some(unit) = outputs.first().and_then(|c| c.unit()) {
             ui.label(format!("RMSE и MAE — в единицах выхода ({unit})."));
         }
-        if aggregate.nmae.is_none() {
+        if aggregate.nmae.is_none() || aggregate.rel_error.is_none() {
             ui.label(NA_NOTE);
         }
         return;
@@ -682,7 +712,7 @@ fn show_metrics(
         .map(|per| per.iter().map(|m| m.r2).fold(f32::INFINITY, f32::min))
         .filter(|v| v.is_finite());
     ui.label(format!(
-        "{label}: R²={:.5}   worst-output R²={}   nMAE={}",
+        "{label}: aggregate R²={:.5}   worst-output R²={}   nMAE={}",
         aggregate.r2,
         optional(worst_r2, 5),
         optional(aggregate.nmae, 5)
@@ -703,9 +733,14 @@ fn show_metrics(
             ui.label("nMAE");
             ui.label("rel.error");
             ui.end_row();
-            for (column, metrics) in outputs.iter().zip(per_output) {
+            for (index, metrics) in per_output.iter().enumerate() {
                 na |= metrics.nmae.is_none() || metrics.rel_error.is_none();
-                ui.label(output_label(column));
+                ui.label(
+                    outputs
+                        .get(index)
+                        .map(output_label)
+                        .unwrap_or_else(|| format!("y{index}")),
+                );
                 ui.label(format!("{:.5}", metrics.r2));
                 ui.label(format!("{:.5}", metrics.rmse));
                 ui.label(format!("{:.5}", metrics.mae));
