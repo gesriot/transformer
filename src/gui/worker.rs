@@ -664,7 +664,10 @@ fn source_desc(origin: &DatasetOrigin) -> String {
         #[cfg(any(feature = "demo", test))]
         DatasetOrigin::Blackbox(name) => format!("blackbox: {name}"),
         DatasetOrigin::File(path) => format!("файл: {path}"),
-        DatasetOrigin::Table(path) => format!("таблица: {path}"),
+        DatasetOrigin::Table { path, sheet } => match sheet {
+            Some(sheet) => format!("таблица: {path}, лист '{sheet}'"),
+            None => format!("таблица: {path}"),
+        },
     }
 }
 
@@ -1128,7 +1131,7 @@ fn open_dataset(origin: &DatasetOrigin) -> Result<PreparedData, String> {
         // Через это поле интерфейс открывает только `.tnum`: у него листов
         // нет, и спрашивать не о чем.
         DatasetOrigin::File(path) => read_numeric_source(path, None)?,
-        DatasetOrigin::Table(path) => {
+        DatasetOrigin::Table { path, .. } => {
             return Err(format!(
                 "{path}: размеченная таблица приходит из диалога разметки, а не из чтения"
             ))

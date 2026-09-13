@@ -218,7 +218,7 @@ pub(crate) fn table_schema_from_prepare_spec(
     if table.n_columns() != expected {
         return Err(format!(
             "{}: ожидалось {expected} колонок ({} вход + {} выход), получено {}",
-            table.source(),
+            table.source_label(),
             spec.n_inputs,
             spec.n_outputs,
             table.n_columns()

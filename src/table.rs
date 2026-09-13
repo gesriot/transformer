@@ -17,9 +17,11 @@
 
 use crate::data::NumericDataset;
 use crate::schema::{ColumnRole, ColumnType, TableSchema};
-use calamine::{open_workbook_auto, Data, Reader};
+use calamine::{open_workbook_auto, Data, Reader, SheetType};
 use ndarray::Array2;
 use std::path::Path;
+
+type LocatedRows = Vec<(usize, Vec<String>)>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Delimiter {
@@ -36,6 +38,8 @@ pub enum Delimiter {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Table {
     source: String,
+    /// Выбранный worksheet книги; `None` у текстового источника.
+    sheet: Option<String>,
     header: Option<Vec<String>>,
     rows: Vec<Vec<String>>,
     // Номер каждой строки в исходном файле. Простого `index + 1` недостаточно:
@@ -55,10 +59,11 @@ pub fn is_workbook(path: impl AsRef<Path>) -> bool {
     )
 }
 
-/// Имена листов книги в порядке самой книги.
+/// Имена табличных листов книги в порядке самой книги.
 ///
 /// Отдельная операция, потому что выбор листа делается ДО чтения данных: иначе
-/// пришлось бы либо угадывать лист, либо читать книгу дважды.
+/// пришлось бы угадывать лист. Chart/dialog/macro sheets не возвращаются:
+/// считать из них таблицу значений этот слой всё равно не может.
 pub fn workbook_sheets(path: impl AsRef<Path>) -> Result<Vec<String>, String> {
     let path = path.as_ref();
     if !is_workbook(path) {
@@ -69,7 +74,15 @@ pub fn workbook_sheets(path: impl AsRef<Path>) -> Result<Vec<String>, String> {
     }
     let workbook =
         open_workbook_auto(path).map_err(|e| format!("чтение {}: {e}", path.display()))?;
-    Ok(workbook.sheet_names())
+    Ok(worksheet_names(workbook.sheets_metadata()))
+}
+
+fn worksheet_names(sheets: &[calamine::Sheet]) -> Vec<String> {
+    sheets
+        .iter()
+        .filter(|sheet| sheet.typ == SheetType::WorkSheet)
+        .map(|sheet| sheet.name.clone())
+        .collect()
 }
 
 impl Table {
@@ -102,8 +115,9 @@ impl Table {
     ) -> Result<Self, String> {
         let path = path.as_ref();
         let source = path.display().to_string();
-        let rows = if is_workbook(path) {
-            read_workbook(path, sheet)?
+        let (sheet, rows) = if is_workbook(path) {
+            let (sheet, rows) = read_workbook(path, sheet)?;
+            (Some(sheet), rows)
         } else {
             if let Some(sheet) = sheet {
                 return Err(format!(
@@ -112,14 +126,18 @@ impl Table {
             }
             let text =
                 std::fs::read_to_string(path).map_err(|e| format!("чтение {source}: {e}"))?;
-            split_text(&text, delimiter).map_err(|e| format!("{source}: {e}"))?
+            (
+                None,
+                split_text(&text, delimiter).map_err(|e| format!("{source}: {e}"))?,
+            )
         };
-        Self::from_rows(source, rows, has_header)
+        Self::from_rows(source, sheet, rows, has_header)
     }
 
     pub fn parse_text(text: &str, delimiter: Delimiter, has_header: bool) -> Result<Self, String> {
         Self::from_rows(
             "<текст>".to_string(),
+            None,
             split_text(text, delimiter).map_err(|e| format!("<текст>: {e}"))?,
             has_header,
         )
@@ -127,16 +145,18 @@ impl Table {
 
     fn from_rows(
         source: String,
-        mut located_rows: Vec<(usize, Vec<String>)>,
+        sheet: Option<String>,
+        mut located_rows: LocatedRows,
         has_header: bool,
     ) -> Result<Self, String> {
+        let source_label = source_label(&source, sheet.as_deref());
         if located_rows.is_empty() {
-            return Err(format!("{source}: нет строк данных"));
+            return Err(format!("{source_label}: нет строк данных"));
         }
         let header = if has_header {
             let (_, header) = located_rows.remove(0);
             if located_rows.is_empty() {
-                return Err(format!("{source}: нет строк данных после заголовка"));
+                return Err(format!("{source_label}: нет строк данных после заголовка"));
             }
             Some(header)
         } else {
@@ -145,6 +165,7 @@ impl Table {
         let (row_numbers, rows) = located_rows.into_iter().unzip();
         Ok(Self {
             source,
+            sheet,
             header,
             rows,
             row_numbers,
@@ -160,7 +181,10 @@ impl Table {
             return Ok(self);
         }
         if self.rows.len() < 2 {
-            return Err(format!("{}: нет строк данных после заголовка", self.source));
+            return Err(format!(
+                "{}: нет строк данных после заголовка",
+                self.source_label()
+            ));
         }
         self.header = Some(self.rows.remove(0));
         self.row_numbers.remove(0);
@@ -169,6 +193,16 @@ impl Table {
 
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// Выбранный worksheet книги; у текстовой таблицы листа нет.
+    pub fn sheet(&self) -> Option<&str> {
+        self.sheet.as_deref()
+    }
+
+    /// Источник для сообщений человеку: имя листа нельзя терять рядом с путём.
+    pub fn source_label(&self) -> String {
+        source_label(&self.source, self.sheet())
     }
 
     pub fn header(&self) -> Option<&[String]> {
@@ -224,7 +258,7 @@ impl Table {
         if columns.len() != self.n_columns() {
             return Err(format!(
                 "{}: схема описывает {} колонок, в таблице {}",
-                self.source,
+                self.source_label(),
                 columns.len(),
                 self.n_columns()
             ));
@@ -238,7 +272,7 @@ impl Table {
             if row.len() != columns.len() {
                 return Err(format!(
                     "{}: строка {}: ожидалось {} колонок, получено {}",
-                    self.source,
+                    self.source_label(),
                     self.file_row(r),
                     columns.len(),
                     row.len()
@@ -275,7 +309,7 @@ impl Table {
         allow_category_code: bool,
     ) -> Result<f32, String> {
         let column = &schema.columns()[c];
-        let at = format!("{}: строка {}", self.source, self.file_row(r));
+        let at = format!("{}: строка {}", self.source_label(), self.file_row(r));
         let where_ = format!("{at}, колонка '{}'", column.name());
         if text.trim().is_empty() {
             return Err(format!("{where_}: пустая ячейка"));
@@ -316,6 +350,13 @@ impl Table {
             return Err(format!("{where_}: значение не конечно: '{text}'"));
         }
         Ok(value)
+    }
+}
+
+fn source_label(source: &str, sheet: Option<&str>) -> String {
+    match sheet {
+        Some(sheet) => format!("{source}, лист '{sheet}'"),
+        None => source.to_string(),
     }
 }
 
@@ -403,7 +444,7 @@ fn choose_sheet(path: &Path, names: &[String], wanted: Option<&str>) -> Result<S
                 )
             }),
         None => match names {
-            [] => Err(format!("{}: книга без листов", path.display())),
+            [] => Err(format!("{}: книга без табличных листов", path.display())),
             [only] => Ok(only.clone()),
             _ => Err(format!(
                 "{}: в книге несколько листов: {}. Укажите лист явно: брать первый молча нельзя",
@@ -414,10 +455,10 @@ fn choose_sheet(path: &Path, names: &[String], wanted: Option<&str>) -> Result<S
     }
 }
 
-fn read_workbook(path: &Path, wanted: Option<&str>) -> Result<Vec<(usize, Vec<String>)>, String> {
+fn read_workbook(path: &Path, wanted: Option<&str>) -> Result<(String, LocatedRows), String> {
     let mut workbook =
         open_workbook_auto(path).map_err(|e| format!("чтение {}: {e}", path.display()))?;
-    let sheet = choose_sheet(path, &workbook.sheet_names(), wanted)?;
+    let sheet = choose_sheet(path, &worksheet_names(workbook.sheets_metadata()), wanted)?;
     let range = workbook
         .worksheet_range(&sheet)
         .map_err(|e| format!("чтение {} листа '{sheet}': {e}", path.display()))?;
@@ -431,7 +472,7 @@ fn read_workbook(path: &Path, wanted: Option<&str>) -> Result<Vec<(usize, Vec<St
             .enumerate()
             .map(|(c, cell)| cell_to_text(cell, source_row, start_col as usize + c + 1))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+            .map_err(|e| format!("{}, лист '{sheet}': {e}", path.display()))?;
         if cells.iter().any(|t| !t.trim().is_empty()) {
             // Внутренние и хвостовые пустые ячейки сохраняются. `Range` уже
             // ограничен используемой областью листа; удалив хвост, мы бы
@@ -440,9 +481,12 @@ fn read_workbook(path: &Path, wanted: Option<&str>) -> Result<Vec<(usize, Vec<St
         }
     }
     if rows.is_empty() {
-        return Err(format!("{}: нет строк данных", path.display()));
+        return Err(format!(
+            "{}, лист '{sheet}': нет строк данных",
+            path.display()
+        ));
     }
-    Ok(rows)
+    Ok((sheet, rows))
 }
 
 /// Тестовая книга с несколькими листами.
@@ -531,6 +575,7 @@ mod tests {
     use super::write_test_workbook as write_workbook;
     use super::*;
     use crate::schema::{Column, ColumnRole, TableSchema};
+    use calamine::{Sheet, SheetVisible};
 
     fn tmp_book(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("transformer_sheets_{}", std::process::id()));
@@ -545,6 +590,7 @@ mod tests {
         write_workbook(&path, &[("Данные", &[&["x0", "y0"], &["1", "2"]])]);
 
         let table = Table::read_path(&path, Delimiter::Auto, true).unwrap();
+        assert_eq!(table.sheet(), Some("Данные"));
         assert_eq!(
             table.header().unwrap(),
             &["x0".to_string(), "y0".to_string()]
@@ -592,6 +638,8 @@ mod tests {
         );
 
         let table = Table::read_sheet(&path, Some("Опыты"), Delimiter::Auto, true).unwrap();
+        assert_eq!(table.sheet(), Some("Опыты"));
+        assert!(table.source_label().contains("лист 'Опыты'"));
         assert_eq!(table.rows()[0], vec!["3", "4"]);
 
         let err = Table::read_sheet(&path, Some("опыты"), Delimiter::Auto, true).unwrap_err();
@@ -611,7 +659,41 @@ mod tests {
         assert!(err.contains("листы есть только у книг"), "{err}");
         assert!(workbook_sheets(&path).is_err());
         assert!(!is_workbook(&path));
+        assert_eq!(
+            Table::read_path(&path, Delimiter::Auto, true)
+                .unwrap()
+                .sheet(),
+            None
+        );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Chart/dialog sheets Excel называет листами, но таблицу данных из них
+    /// прочитать нельзя. Они не должны превращать одну таблицу в ложную
+    /// неоднозначность и не должны появляться среди вариантов GUI/CLI.
+    #[test]
+    fn only_worksheets_are_offered_as_data_sources() {
+        let sheets = vec![
+            Sheet {
+                name: "Данные".to_string(),
+                typ: SheetType::WorkSheet,
+                visible: SheetVisible::Visible,
+            },
+            Sheet {
+                name: "Диаграмма".to_string(),
+                typ: SheetType::ChartSheet,
+                visible: SheetVisible::Visible,
+            },
+            Sheet {
+                name: "Скрытые данные".to_string(),
+                typ: SheetType::WorkSheet,
+                visible: SheetVisible::Hidden,
+            },
+        ];
+        assert_eq!(
+            worksheet_names(&sheets),
+            vec!["Данные".to_string(), "Скрытые данные".to_string()]
+        );
     }
 
     fn schema(cols: Vec<Column>) -> TableSchema {

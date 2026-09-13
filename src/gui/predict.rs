@@ -177,7 +177,7 @@ impl App {
         let Some((input, output)) = self.sheets.export_request.clone() else {
             return;
         };
-        self.sheets.export.ui(ui, "export_sheet", &input);
+        let _ = self.sheets.export.ui(ui, "export_sheet", &input);
         let chosen = self.sheets.export.sheet_for(&input).is_some();
         if !chosen {
             return;

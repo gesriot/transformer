@@ -577,7 +577,7 @@ impl App {
                     suggested_categories,
                 } => {
                     self.table_opening = false;
-                    self.status = format!("таблица открыта: {path}");
+                    self.status = format!("таблица открыта: {}", table.source_label());
                     self.markup = Some(MarkupState::new(
                         path,
                         has_header,
@@ -883,15 +883,18 @@ impl App {
                     )
                     .pick_file()
                 {
-                    self.open_table(p.display().to_string(), true);
+                    // Выбор файла — новая операция: даже для того же пути нельзя
+                    // молча подставить лист от прошлого открытия.
+                    self.sheets.markup.clear();
+                    self.open_table(p.display().to_string(), None, true);
                 }
             }
-            if let Some((path, has_header)) = self.markup_source() {
+            if let Some((path, sheet, has_header)) = self.markup_source() {
                 if ui
                     .add_enabled(idle, egui::Button::new("Разметить заново…"))
                     .clicked()
                 {
-                    self.open_table(path, has_header);
+                    self.open_table(path, sheet, has_header);
                 }
             }
         });
@@ -905,7 +908,7 @@ impl App {
         let Some((path, has_header)) = self.sheets.markup_request.clone() else {
             return;
         };
-        self.sheets.markup.ui(ui, "markup_sheet", &path);
+        let _ = self.sheets.markup.ui(ui, "markup_sheet", &path);
         if self.sheets.markup.sheet_for(&path).is_none() {
             return;
         }
@@ -913,15 +916,18 @@ impl App {
             .add_enabled(idle, egui::Button::new("Открыть выбранный лист"))
             .clicked()
         {
-            self.open_table(path, has_header);
+            let sheet = self.sheets.markup.sheet_for(&path).map(str::to_string);
+            self.open_table(path, sheet, has_header);
         }
     }
 
     /// Путь таблицы, если активные данные пришли из разметки.
-    fn markup_source(&self) -> Option<(String, bool)> {
+    fn markup_source(&self) -> Option<(String, Option<String>, bool)> {
         let active = self.dataset.as_ref()?;
         match &active.prepared.origin {
-            DatasetOrigin::Table(path) => Some((path.clone(), active.table_has_header)),
+            DatasetOrigin::Table { path, sheet } => {
+                Some((path.clone(), sheet.clone(), active.table_has_header))
+            }
             _ => None,
         }
     }
@@ -993,11 +999,10 @@ impl App {
 
     /// Открыть таблицу для разметки.
     ///
-    /// Лист берётся из уже сделанного выбора для этого же файла: у книги с
-    /// несколькими листами worker вернёт вопрос, и повторный вызов придёт сюда
-    /// уже с ответом.
-    pub(super) fn open_table(&mut self, path: String, has_header: bool) {
-        let sheet = self.sheets.markup.sheet_for(&path).map(str::to_string);
+    /// `sheet: None` разрешает автовыбор единственного worksheet; для
+    /// неоднозначной книги worker вернёт список, и повторный вызов придёт сюда с
+    /// явным именем.
+    pub(super) fn open_table(&mut self, path: String, sheet: Option<String>, has_header: bool) {
         self.sheets.markup_request = Some((path.clone(), has_header));
         self.table_opening = true;
         self.status = format!("чтение {path}…");
@@ -1186,5 +1191,14 @@ mod tests {
             test_seed: 2,
         };
         assert_eq!(dataset.split_summary(), "5-fold по 12 строкам + test 4");
+    }
+
+    #[test]
+    fn a_table_origin_keeps_the_selected_sheet_visible() {
+        let origin = DatasetOrigin::Table {
+            path: "/tmp/experiments.xlsx".to_string(),
+            sheet: Some("Опыты 2026".to_string()),
+        };
+        assert_eq!(origin.short_name(), "experiments.xlsx · лист 'Опыты 2026'");
     }
 }

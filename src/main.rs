@@ -978,6 +978,15 @@ fn require_data_file(path: &str) {
     ));
 }
 
+/// Путь без имени листа снова неоднозначен в журнале запуска, даже если при
+/// чтении выбор был строгим.
+fn source_label(path: &str, sheet: Option<&str>) -> String {
+    match sheet {
+        Some(sheet) => format!("{path}, лист '{sheet}'"),
+        None => path.to_string(),
+    }
+}
+
 fn validate_train_positionals(f: &Flags) -> Result<(), String> {
     f.require_positionals(1, 3, "<источник> [эпохи] [модель.bin]")?;
     if f.has("epochs") && f.pos(1).is_some() {
@@ -1045,7 +1054,8 @@ fn run_train(rest: &[String]) {
         }
     };
     println!(
-        "Датасет: {path} ({} строк, {} вход -> {} выход)",
+        "Датасет: {} ({} строк, {} вход -> {} выход)",
+        source_label(path, f.get("sheet")),
         data.len(),
         data.inputs.ncols(),
         data.outputs.ncols()
@@ -1476,22 +1486,26 @@ fn run_prepare(rest: &[String]) {
             "--delimiter: ожидалось auto|comma|tab|space, получено '{o}'"
         )),
     };
-    let inferred = match (
-        f.usize("inputs").unwrap_or_else(|e| fail(&e)),
-        f.usize("outputs").unwrap_or_else(|e| fail(&e)),
-        f.get("categorical"),
-    ) {
+    let explicit_inputs = f.usize("inputs").unwrap_or_else(|e| fail(&e));
+    let explicit_outputs = f.usize("outputs").unwrap_or_else(|e| fail(&e));
+    let needs_inferred_dimensions = explicit_inputs.is_none() || explicit_outputs.is_none();
+    let inferred = match (explicit_inputs, explicit_outputs, f.get("categorical")) {
         (Some(_), Some(_), Some(_)) => None,
-        _ => infer_prepare_spec_from_path(input, f.get("sheet"), delimiter).ok(),
+        _ => match infer_prepare_spec_from_path(input, f.get("sheet"), delimiter) {
+            Ok(inferred) => Some(inferred),
+            // Если без эвристики нельзя даже узнать ширину схемы, её ошибка
+            // важнее общей подсказки про --inputs: в частности, так не теряется
+            // список листов неоднозначной книги.
+            Err(error) if needs_inferred_dimensions => fail(&error),
+            // Размеры заданы явно: неудачная необязательная подсказка категорий
+            // не должна запрещать явную конвертацию.
+            Err(_) => None,
+        },
     };
-    let n_inputs = f
-        .usize("inputs")
-        .unwrap_or_else(|e| fail(&e))
+    let n_inputs = explicit_inputs
         .or_else(|| inferred.as_ref().map(|i| i.n_inputs))
         .unwrap_or_else(|| fail("--inputs обязателен (или нужен заголовок x.../y... для auto)"));
-    let n_outputs = f
-        .usize("outputs")
-        .unwrap_or_else(|e| fail(&e))
+    let n_outputs = explicit_outputs
         .or_else(|| inferred.as_ref().map(|i| i.n_outputs))
         .unwrap_or_else(|| fail("--outputs обязателен (или нужен заголовок x.../y... для auto)"));
     let categorical = if let Some(raw) = f.get("categorical") {
@@ -1594,7 +1608,7 @@ fn run_search(rest: &[String]) {
 
     let axes = axes_from(&f);
     warn_categorical_without_embedding(&axes.model_kinds, dataset.schema());
-    announce_search(path, &axes);
+    announce_search(&source_label(path, f.get("sheet")), &axes);
     let never = std::sync::atomic::AtomicBool::new(false);
     let result = run_sweep(
         &dataset,

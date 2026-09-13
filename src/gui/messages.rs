@@ -34,8 +34,10 @@ pub(crate) enum DatasetOrigin {
     Blackbox(String),
     /// `.tnum` со своей схемой.
     File(String),
-    /// Таблица, размеченная пользователем в диалоге.
-    Table(String),
+    /// Таблица, размеченная пользователем в диалоге. Лист хранится рядом
+    /// с путём: иначе в шапке и повторной разметке книга снова стала бы
+    /// неоднозначной.
+    Table { path: String, sheet: Option<String> },
 }
 
 impl DatasetOrigin {
@@ -52,12 +54,20 @@ impl DatasetOrigin {
         match self {
             #[cfg(any(feature = "demo", test))]
             DatasetOrigin::Blackbox(name) => format!("чёрный ящик: {name}"),
-            DatasetOrigin::File(path) | DatasetOrigin::Table(path) => std::path::Path::new(path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.clone()),
+            DatasetOrigin::File(path) => short_path(path),
+            DatasetOrigin::Table { path, sheet } => match sheet {
+                Some(sheet) => format!("{} · лист '{sheet}'", short_path(path)),
+                None => short_path(path),
+            },
         }
     }
+}
+
+fn short_path(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string())
 }
 
 /// Готовый набор данных: значения, схема и происхождение.

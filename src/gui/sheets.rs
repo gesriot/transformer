@@ -48,10 +48,11 @@ impl SheetChoice {
     }
 
     /// Список листов; рисуется только когда он относится к `path`.
-    pub(super) fn ui(&mut self, ui: &mut egui::Ui, id: &'static str, path: &str) {
+    pub(super) fn ui(&mut self, ui: &mut egui::Ui, id: &'static str, path: &str) -> bool {
         if self.path != path || self.sheets.is_empty() {
-            return;
+            return false;
         }
+        let before = self.selected.clone();
         ui.horizontal(|ui| {
             ui.label(format!("листов в книге: {}", self.sheets.len()));
             let mut picked = None;
@@ -73,6 +74,7 @@ impl SheetChoice {
                 self.selected = picked;
             }
         });
+        self.selected != before
     }
 }
 

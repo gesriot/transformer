@@ -16,6 +16,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub(super) struct PreparedTable {
     pub(super) path: String,
+    pub(super) sheet: Option<String>,
     pub(super) has_header: bool,
     pub(super) data: Arc<NumericDataset>,
     pub(super) schema: ModelSchema,
@@ -95,6 +96,7 @@ impl MarkupState {
         let data = self.table.to_dataset(&schema)?;
         Ok(PreparedTable {
             path: self.path.clone(),
+            sheet: self.table.sheet().map(str::to_string),
             has_header: self.has_header,
             data: Arc::new(data),
             schema: schema.to_model_schema()?,
@@ -226,7 +228,7 @@ impl App {
         };
         let mut open = true;
         let mut applied: Option<(PreparedTable, TableProfile, Vec<crate::markup::Message>)> = None;
-        let mut reopen: Option<(String, bool)> = None;
+        let mut reopen: Option<(String, Option<String>, bool)> = None;
 
         egui::Window::new("Разметка таблицы")
             .open(&mut open)
@@ -235,7 +237,7 @@ impl App {
             .show(ctx, |ui| {
                 ui.label(format!(
                     "{} — {} строк, {} колонок",
-                    state.path,
+                    state.table.source_label(),
                     state.profile.rows,
                     state.draft.len()
                 ));
@@ -246,7 +248,11 @@ impl App {
                 {
                     // Заголовок меняет разбор файла, поэтому таблица читается
                     // заново — иначе имена и данные разъедутся.
-                    reopen = Some((state.path.clone(), has_header));
+                    reopen = Some((
+                        state.path.clone(),
+                        state.table.sheet().map(str::to_string),
+                        has_header,
+                    ));
                 }
 
                 ui.separator();
@@ -405,7 +411,10 @@ impl App {
             self.set_dataset(
                 ActiveDataset::new(
                     PreparedData {
-                        origin: DatasetOrigin::Table(prepared.path.clone()),
+                        origin: DatasetOrigin::Table {
+                            path: prepared.path.clone(),
+                            sheet: prepared.sheet.clone(),
+                        },
                         data: Arc::clone(&prepared.data),
                         schema: prepared.schema.clone(),
                     },
@@ -417,11 +426,11 @@ impl App {
             );
             self.status = "разметка применена".to_string();
             self.markup = None;
-        } else if let Some((path, has_header)) = reopen {
+        } else if let Some((path, sheet, has_header)) = reopen {
             // Старую интерпретацию больше нельзя применить, пока worker читает
             // файл заново с другой семантикой первой строки.
             self.markup = None;
-            self.open_table(path, has_header);
+            self.open_table(path, sheet, has_header);
         } else if !open {
             self.markup = None;
         }
@@ -692,14 +701,10 @@ impl App {
             });
         });
         let input_path = self.prepare_form.input_path.clone();
-        let sheet_before = self
-            .sheets
-            .prepare
-            .sheet_for(&input_path)
-            .map(str::to_string);
-        self.sheets.prepare.ui(ui, "prepare_sheet", &input_path);
-        // Лист выбран только что: подсказки автоопределения относятся к нему.
-        if sheet_before.is_none() && self.sheets.prepare.sheet_for(&input_path).is_some() {
+        let sheet_changed = self.sheets.prepare.ui(ui, "prepare_sheet", &input_path);
+        // Любая смена листа меняет таблицу: подсказки ролей и
+        // категорий нельзя оставлять от предыдущего листа.
+        if sheet_changed {
             self.apply_prepare_inference();
         }
         ui.horizontal(|ui| {
@@ -819,7 +824,10 @@ mod tests {
 
         let active = ActiveDataset::new(
             PreparedData {
-                origin: DatasetOrigin::Table(prepared.path.clone()),
+                origin: DatasetOrigin::Table {
+                    path: prepared.path.clone(),
+                    sheet: prepared.sheet.clone(),
+                },
                 data: Arc::clone(&prepared.data),
                 schema: prepared.schema.clone(),
             },
@@ -853,7 +861,10 @@ mod tests {
         let prepared = state.apply().unwrap();
         let active = ActiveDataset::new(
             PreparedData {
-                origin: DatasetOrigin::Table(prepared.path.clone()),
+                origin: DatasetOrigin::Table {
+                    path: prepared.path.clone(),
+                    sheet: prepared.sheet.clone(),
+                },
                 data: Arc::clone(&prepared.data),
                 schema: prepared.schema.clone(),
             },
