@@ -163,25 +163,6 @@ fn mean_of_all(values: impl Iterator<Item = Option<f32>>) -> Option<f32> {
     (count > 0).then(|| sum / count as f32)
 }
 
-/// Необязательная величина в тексте: «N/A» вместо выдуманного числа.
-///
-/// Ноль на месте «неизвестно» читался бы как отличный результат, поэтому
-/// подставлять его нельзя.
-pub fn optional(value: Option<f32>, digits: usize) -> String {
-    match value {
-        Some(v) => format!("{v:.digits$}"),
-        None => "N/A".to_string(),
-    }
-}
-
-/// Необязательная величина в процентах.
-pub fn optional_percent(value: Option<f32>, digits: usize) -> String {
-    match value {
-        Some(v) => format!("{:.digits$}%", v * 100.0),
-        None => "N/A".to_string(),
-    }
-}
-
 /// Откуда взята метрика. Без этого поля число «R² = 0.98» неинтерпретируемо:
 /// validation и test означают разное, а по validation ещё и выбирают конфиг.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

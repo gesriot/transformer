@@ -4,7 +4,7 @@ use super::messages::Command;
 use super::messages::ModelOrigin;
 use super::session::{split_plan_label, App, KAN_CURVE_SAMPLES};
 use crate::interpret::InterpretReport;
-use crate::metrics::{optional, optional_percent, EvalSource, Metrics};
+use crate::metrics::{EvalSource, Metrics};
 use crate::numeric_model::ModelKind;
 use crate::report::TrainingReport;
 use crate::schema::ModelSchema;
@@ -621,6 +621,36 @@ impl App {
     }
 }
 
+/// Необязательная величина: «N/A» вместо выдуманного числа. Форматирование
+/// живёт в интерфейсе — библиотека числа не рисует.
+pub(super) fn optional(value: Option<f32>, digits: usize) -> String {
+    match value {
+        Some(v) => format!("{v:.digits$}"),
+        None => "N/A".to_string(),
+    }
+}
+
+pub(super) fn optional_percent(value: Option<f32>, digits: usize) -> String {
+    match value {
+        Some(v) => format!("{:.digits$}%", v * 100.0),
+        None => "N/A".to_string(),
+    }
+}
+
+/// Пояснение к «N/A»: показывается там, где оно встретилось, а не в общей
+/// легенде, — иначе его читать негде.
+pub(super) const NA_NOTE: &str =
+    "N/A: нормализованная метрика недоступна при нулевом или неизвестном масштабе train; \
+     относительная — ещё и при target около нуля.";
+
+/// Подпись выхода с единицами: RMSE и MAE измеряются в них же.
+fn output_label(column: &crate::schema::Column) -> String {
+    match column.unit() {
+        Some(unit) => format!("{}, {unit}", column.display_name()),
+        None => column.display_name(),
+    }
+}
+
 fn show_metrics(
     ui: &mut egui::Ui,
     label: &str,
@@ -628,36 +658,63 @@ fn show_metrics(
     per_output: Option<&[Metrics]>,
     outputs: &[crate::schema::Column],
 ) {
+    // У одного выхода общий RMSE и есть его собственный: смешивать нечего.
+    if outputs.len() <= 1 {
+        ui.label(format!(
+            "{label}: R²={:.5}   RMSE={:.5}   MAE={:.5}   nMAE={}",
+            aggregate.r2,
+            aggregate.rmse,
+            aggregate.mae,
+            optional(aggregate.nmae, 5)
+        ));
+        if let Some(unit) = outputs.first().and_then(|c| c.unit()) {
+            ui.label(format!("RMSE и MAE — в единицах выхода ({unit})."));
+        }
+        if aggregate.nmae.is_none() {
+            ui.label(NA_NOTE);
+        }
+        return;
+    }
+
+    // У нескольких выходов общие RMSE и MAE складывали бы разные единицы:
+    // «в среднем 3 °C и 3 %» не величина. Наружу идут только безразмерные.
+    let worst_r2 = per_output
+        .map(|per| per.iter().map(|m| m.r2).fold(f32::INFINITY, f32::min))
+        .filter(|v| v.is_finite());
     ui.label(format!(
-        "{label}: RMSE={:.5}   MAE={:.5}   nMAE={}   R²={:.5}   rel.error={}",
-        aggregate.rmse,
-        aggregate.mae,
-        optional(aggregate.nmae, 5),
+        "{label}: R²={:.5}   worst-output R²={}   nMAE={}",
         aggregate.r2,
-        optional_percent(aggregate.rel_error, 2)
+        optional(worst_r2, 5),
+        optional(aggregate.nmae, 5)
     ));
+    ui.label("RMSE и MAE — по каждому выходу: у выходов разные единицы.");
     let Some(per_output) = per_output else {
         return;
     };
+    let mut na = false;
     egui::Grid::new(format!("{label}_per_output_metrics"))
         .num_columns(6)
         .striped(true)
         .show(ui, |ui| {
             ui.label("выход");
+            ui.label("R²");
             ui.label("RMSE");
             ui.label("MAE");
             ui.label("nMAE");
-            ui.label("R²");
             ui.label("rel.error");
             ui.end_row();
             for (column, metrics) in outputs.iter().zip(per_output) {
-                ui.label(column.display_name());
+                na |= metrics.nmae.is_none() || metrics.rel_error.is_none();
+                ui.label(output_label(column));
+                ui.label(format!("{:.5}", metrics.r2));
                 ui.label(format!("{:.5}", metrics.rmse));
                 ui.label(format!("{:.5}", metrics.mae));
                 ui.label(optional(metrics.nmae, 5));
-                ui.label(format!("{:.5}", metrics.r2));
                 ui.label(optional_percent(metrics.rel_error, 2));
                 ui.end_row();
             }
         });
+    if na {
+        ui.label(NA_NOTE);
+    }
 }

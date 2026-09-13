@@ -197,9 +197,6 @@ pub struct SweepRow {
     /// Средний nRMSE по прогонам; `None`, если масштаба train не существует
     /// хотя бы у одного выхода.
     pub nrmse_mean: Option<f32>,
-    /// Средняя относительная ошибка; `None`, если она неприменима хотя бы у
-    /// одного прогона.
-    pub rel_mean: Option<f32>,
     /// Откуда метрики: validation или CV. Ранжирование по test невозможно —
     /// поиск его не видит.
     pub source: EvalSource,
@@ -661,7 +658,6 @@ fn row_from_config_eval(
         worst_output_r2_mean: per_output_r2.iter().copied().fold(f32::INFINITY, f32::min),
         mean_output_r2_mean: mean(&per_output_r2),
         nrmse_mean,
-        rel_mean: agg.mean.rel_error,
         source: agg.origin.source,
     }
 }
@@ -1086,7 +1082,6 @@ mod tests {
             worst_output_r2_mean: 0.0,
             mean_output_r2_mean: 0.0,
             nrmse_mean: None,
-            rel_mean: None,
             source: EvalSource::Validation,
         };
         let mut ranked = vec![row("negative", -1.0, &val), row("positive", 2.0, &val)];

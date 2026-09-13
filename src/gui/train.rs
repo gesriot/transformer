@@ -2,12 +2,13 @@
 
 use super::messages::{Command, ModelOrigin, PreparedData};
 use super::model::ModelInfo;
+use super::model::{optional, NA_NOTE};
 use super::session::{App, SearchRun, NO_DATASET};
 use crate::config::ModelConfig;
 use crate::encoders::{ValueEncoderConfig, ValueEncoderKind};
 use crate::interpret::{self, InterpretOverrides, InterpretProfile};
 use crate::lifecycle::{CandidateSpec, RunIdentity};
-use crate::metrics::{optional, optional_percent, EvalSource};
+use crate::metrics::EvalSource;
 use crate::numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig};
 use crate::report::Selection;
 use crate::split::DEFAULT_FINAL_INIT_SEED;
@@ -876,7 +877,7 @@ impl App {
             .max_height(300.0)
             .show(ui, |ui| {
                 egui::Grid::new("search_rows")
-                    .num_columns(8)
+                    .num_columns(7)
                     .striped(true)
                     .show(ui, |ui| {
                         ui.label("#");
@@ -885,7 +886,6 @@ impl App {
                         ui.label("worst y");
                         ui.label("mean y");
                         ui.label("aggr nRMSE");
-                        ui.label("rel");
                         ui.label("конфигурация");
                         ui.end_row();
                         for (i, row) in self.search_rows.iter().enumerate() {
@@ -907,7 +907,6 @@ impl App {
                             ui.label(format!("{:.5}", row.worst_output_r2_mean));
                             ui.label(format!("{:.5}", row.mean_output_r2_mean));
                             ui.label(optional(row.nrmse_mean, 5));
-                            ui.label(optional_percent(row.rel_mean, 1));
                             ui.label(&row.label);
                             ui.end_row();
                         }
@@ -1218,12 +1217,15 @@ impl App {
             };
             let m = &run.eval.metrics;
             ui.label(format!(
-                "{source}: RMSE={:.5}   MAE={:.5}   rel.error={:.2}%   R²={:.5}",
+                "{source}: R²={:.5}   RMSE={:.5}   MAE={:.5}   nMAE={}",
+                m.r2,
                 m.rmse,
                 m.mae,
-                optional_percent(m.rel_error, 2),
-                m.r2
+                optional(m.nmae, 5)
             ));
+            if m.nmae.is_none() {
+                ui.label(NA_NOTE);
+            }
             if run.eval.r2_std_folds > 0.0 {
                 ui.label(format!(
                     "Разброс R² между folds: ±{:.5}",

@@ -103,7 +103,7 @@ pub use numeric_model::{validate_numeric, KanConfig, ModelKind, NumericConfig, N
 pub use surrogate::SurrogateModel;
 
 // Обучение: активный набор, один сценарий и его протокол оценки.
-pub use metrics::{evaluate, optional, optional_percent, EvalSource, Metrics, TargetScale};
+pub use metrics::{evaluate, EvalSource, Metrics, TargetScale};
 pub use split::{
     FinalEval, FinalOrigin, HoldoutTest, PreparedSplit, SearchPool, SplitPlan, DEFAULT_DATA_SEED,
     DEFAULT_FINAL_INIT_SEED, DEFAULT_K, DEFAULT_SPLIT_SEED, DEFAULT_TEST_FRAC, DEFAULT_TRAIN_FRAC,

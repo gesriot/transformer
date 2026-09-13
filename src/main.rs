@@ -30,16 +30,16 @@ use transformer::{
 };
 use transformer::{
     calibration_sample, evaluate, evaluate_on, evaluate_surrogate, export_predictions,
-    infer_prepare_spec_from_path, load_numeric_full, optional, optional_percent, parse_categorical,
-    predict_dataset, prepare_tnum_file, read_numeric_source, recommended_epoch, run_sweep,
-    run_training, save_numeric, sweep_cost, symbolize, validate_numeric, validate_train,
-    CandidateSpec, CheckRecord, Dataset, DatasetFingerprint, Delimiter, EvalSchedule,
-    ExportSummary, FeatureSpec, FinalRecord, InterpretOverrides, InterpretProfile, InterpretReport,
-    KanConfig, LrSchedule, Metrics, ModelConfig, ModelFingerprint, ModelKind, ModelSchema,
-    Normalizer, NumericConfig, NumericDataset, NumericModel, Phase, PrepareSpec, RunIdentity,
-    SearchObjective, Selection, SplitPlan, SweepAxes, SweepResult, SweepRow, TargetScale,
-    TrainConfig, TrainedModel, TrainingHistory, TrainingReport, TrainingSetup, ValueEncoderConfig,
-    ValueEncoderKind, DEFAULT_FINAL_INIT_SEED, DEFAULT_SPLIT_SEED,
+    infer_prepare_spec_from_path, load_numeric_full, parse_categorical, predict_dataset,
+    prepare_tnum_file, read_numeric_source, recommended_epoch, run_sweep, run_training,
+    save_numeric, sweep_cost, symbolize, validate_numeric, validate_train, CandidateSpec,
+    CheckRecord, Dataset, DatasetFingerprint, Delimiter, EvalSchedule, ExportSummary, FeatureSpec,
+    FinalRecord, InterpretOverrides, InterpretProfile, InterpretReport, KanConfig, LrSchedule,
+    Metrics, ModelConfig, ModelFingerprint, ModelKind, ModelSchema, Normalizer, NumericConfig,
+    NumericDataset, NumericModel, Phase, PrepareSpec, RunIdentity, SearchObjective, Selection,
+    SplitPlan, SweepAxes, SweepResult, SweepRow, TargetScale, TrainConfig, TrainedModel,
+    TrainingHistory, TrainingReport, TrainingSetup, ValueEncoderConfig, ValueEncoderKind,
+    DEFAULT_FINAL_INIT_SEED, DEFAULT_SPLIT_SEED,
 };
 use transformer::{diagnostics, interpret, predict};
 
@@ -597,29 +597,49 @@ fn warn_categorical_without_embedding(kinds: &[ModelKind], schema: &ModelSchema)
     }
 }
 
+/// Необязательная величина: «N/A» вместо выдуманного числа. Форматирование
+/// живёт здесь, а не в библиотеке: числа рисует интерфейс.
+fn optional(value: Option<f32>, digits: usize) -> String {
+    match value {
+        Some(v) => format!("{v:.digits$}"),
+        None => "N/A".to_string(),
+    }
+}
+
+fn optional_percent(value: Option<f32>, digits: usize) -> String {
+    match value {
+        Some(v) => format!("{:.digits$}%", v * 100.0),
+        None => "N/A".to_string(),
+    }
+}
+
+/// Пояснение к «N/A» — рядом с тем местом, где оно встретилось.
+const NA_NOTE: &str = "  N/A: нормализованная метрика недоступна при нулевом или неизвестном \
+                       масштабе train;\n       относительная — ещё и при target около нуля.";
+
 /// Печать метрик с явным указанием, откуда они взяты. Выходы называются по
 /// схеме: у модели без имён это по-прежнему `y0`, `y1`, …
+///
+/// У нескольких выходов общих RMSE и MAE в сводке нет: складывать градусы с
+/// процентами нельзя, и «в среднем 3» не величина. Наверху остаётся
+/// безразмерное — R², худший выход и nMAE, — а размерное показывается по
+/// каждому выходу со своими единицами.
 fn print_metrics(title: &str, m: &Metrics, per: &[Metrics], schema: &ModelSchema) {
-    println!("\n{title} (в исходных единицах):");
-    println!("  RMSE        = {:.5}", m.rmse);
-    println!("  MAE         = {:.5}", m.mae);
-    // nMAE нормирован масштабом обучающих таргетов: «ошибка в долях того, как
-    // сильно выход вообще меняется».
-    println!("  nMAE        = {}", optional(m.nmae, 5));
-    println!("  R²          = {:.5}", m.r2);
-    println!("  rel. error  = {}", optional_percent(m.rel_error, 2));
-
+    println!("\n{title}:");
+    for line in metrics_summary(m, per, schema) {
+        println!("{line}");
+    }
     if per.len() > 1 {
-        let names: Vec<String> = schema.outputs().iter().map(|c| c.display_name()).collect();
+        let names: Vec<String> = schema.outputs().iter().map(output_label).collect();
         let width = names
             .iter()
             .map(|n| n.chars().count())
             .max()
             .unwrap_or(4)
             .max(4);
-        println!("\nПо выходам:");
+        println!("\nПо выходам (RMSE и MAE — в единицах своего выхода):");
         println!(
-            "  {:<width$}  RMSE        MAE       nMAE        R²",
+            "  {:<width$}       R²       RMSE        MAE       nMAE",
             "выход"
         );
         for (j, pm) in per.iter().enumerate() {
@@ -627,15 +647,61 @@ fn print_metrics(title: &str, m: &Metrics, per: &[Metrics], schema: &ModelSchema
             // Ширина считается в символах: у кириллицы и °C байт больше.
             let pad = width.saturating_sub(name.chars().count());
             println!(
-                "  {name}{:pad$}  {:>9.5}  {:>9.5}  {:>9}  {:>8.5}",
+                "  {name}{:pad$}  {:>8.5}  {:>9.5}  {:>9.5}  {:>9}",
                 "",
+                pm.r2,
                 pm.rmse,
                 pm.mae,
-                optional(pm.nmae, 5),
-                pm.r2
+                optional(pm.nmae, 5)
             );
         }
     }
+}
+
+/// Подпись выхода с единицами: в них измеряются RMSE и MAE.
+fn output_label(column: &transformer::Column) -> String {
+    match column.unit() {
+        Some(unit) => format!("{}, {unit}", column.display_name()),
+        None => column.display_name(),
+    }
+}
+
+/// Строки сводки.
+///
+/// У нескольких выходов общих RMSE и MAE здесь нет: складывать градусы с
+/// процентами нельзя, и «в среднем 3» не величина. Наверху остаётся
+/// безразмерное — R², худший выход и nMAE, — а размерное показывается по
+/// каждому выходу отдельно.
+fn metrics_summary(m: &Metrics, per: &[Metrics], schema: &ModelSchema) -> Vec<String> {
+    let outputs = schema.outputs();
+    let single = outputs.len() <= 1;
+    let mut lines = vec![format!("  R²          = {:.5}", m.r2)];
+    if single {
+        let unit = outputs
+            .first()
+            .and_then(|c| c.unit())
+            .map(|u| format!(" ({u})"))
+            .unwrap_or_default();
+        lines.push(format!("  RMSE        = {:.5}{unit}", m.rmse));
+        lines.push(format!("  MAE         = {:.5}{unit}", m.mae));
+    } else {
+        let worst = per.iter().map(|pm| pm.r2).fold(f32::INFINITY, f32::min);
+        lines.push(format!("  worst y R²  = {worst:.5}"));
+    }
+    // nMAE нормирован масштабом обучающих таргетов: «ошибка в долях того, как
+    // сильно выход вообще меняется». Он безразмерен, поэтому сравним и между
+    // выходами, и между наборами.
+    lines.push(format!("  nMAE        = {}", optional(m.nmae, 5)));
+    if single {
+        lines.push(format!(
+            "  rel. error  = {}",
+            optional_percent(m.rel_error, 2)
+        ));
+    }
+    if m.nmae.is_none() || (single && m.rel_error.is_none()) {
+        lines.push(NA_NOTE.to_string());
+    }
+    lines
 }
 
 /// Общий поток обучения для файла и встроенной демонстрационной задачи.
@@ -1718,6 +1784,63 @@ mod tests {
 
     fn row(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn metrics(r2: f32, nmae: Option<f32>) -> Metrics {
+        Metrics {
+            rmse: 1.0,
+            mae: 0.5,
+            rel_error: Some(0.1),
+            r2,
+            nmae,
+            nrmse: nmae,
+        }
+    }
+
+    /// У нескольких выходов общих RMSE и MAE в сводке нет: они складывали бы
+    /// разные единицы. Наверху остаётся безразмерное, размерное — по выходам.
+    #[test]
+    fn a_multi_output_summary_has_no_shared_units() {
+        let schema = ModelSchema::synthetic(2, 2).unwrap();
+        let per = vec![metrics(0.9, Some(0.2)), metrics(0.4, Some(0.3))];
+        let lines = metrics_summary(&metrics(0.8, Some(0.25)), &per, &schema).join("\n");
+
+        assert!(lines.contains("R²"), "{lines}");
+        assert!(lines.contains("worst y R²  = 0.40000"), "{lines}");
+        assert!(lines.contains("nMAE"), "{lines}");
+        assert!(!lines.contains("RMSE"), "общий RMSE не величина: {lines}");
+        assert!(!lines.contains("MAE         ="), "общий MAE: {lines}");
+        // Относительная ошибка ушла из сводки: она остаётся поштучной
+        // диагностикой.
+        assert!(!lines.contains("rel. error"), "{lines}");
+    }
+
+    /// У одного выхода складывать нечего: RMSE и MAE показываются вместе с R²
+    /// и nMAE, а единицы подписаны.
+    #[test]
+    fn a_single_output_summary_keeps_absolute_metrics() {
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let per = vec![metrics(0.9, Some(0.2))];
+        let lines = metrics_summary(&metrics(0.9, Some(0.2)), &per, &schema).join("\n");
+
+        assert!(lines.contains("RMSE        = 1.00000"), "{lines}");
+        assert!(lines.contains("MAE         = 0.50000"), "{lines}");
+        assert!(lines.contains("nMAE        = 0.20000"), "{lines}");
+        assert!(lines.contains("rel. error  = 10.00%"), "{lines}");
+        assert!(!lines.contains("N/A"), "все величины есть: {lines}");
+    }
+
+    /// «N/A» не остаётся без объяснения: иначе оно читается как поломка.
+    #[test]
+    fn an_unavailable_metric_is_explained() {
+        let schema = ModelSchema::synthetic(2, 1).unwrap();
+        let mut m = metrics(0.9, None);
+        m.rel_error = None;
+        let lines = metrics_summary(&m, &[m.clone()], &schema).join("\n");
+
+        assert!(lines.contains("nMAE        = N/A"), "{lines}");
+        assert!(lines.contains("rel. error  = N/A"), "{lines}");
+        assert!(lines.contains("масштабе train"), "пояснение рядом: {lines}");
     }
 
     #[test]
