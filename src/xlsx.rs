@@ -46,7 +46,6 @@ pub(crate) struct CellEdit {
 }
 
 /// Части пакета, которые правка затрагивает помимо самого листа.
-const CALC_CHAIN: &str = "xl/calcChain.xml";
 const CONTENT_TYPES: &str = "[Content_Types].xml";
 const WORKBOOK: &str = "xl/workbook.xml";
 const WORKBOOK_RELS: &str = "xl/_rels/workbook.xml.rels";
@@ -82,23 +81,32 @@ pub(crate) fn patch_sheet(
         .map_err(|e| format!("{}, лист '{sheet}': {e}", input.display()))?;
 
     // Кэш порядка вычислений восстанавливается приложением, а согласовать его
-    // с правкой мы не можем: удаляем целиком и просим полный пересчёт.
-    //
-    // Всё это делается только там, где цепочка есть. Её наличие и означает,
-    // что в книге считаются формулы: книге без вычислений навязывать пересчёт
-    // незачем — тогда и `workbook.xml` остаётся тем же файлом.
-    let drops_calc_chain = archive.index_for_name(CALC_CHAIN).is_some();
+    // с правкой мы не можем: удаляем целиком, когда он есть. Полный пересчёт
+    // просим всегда: calcChain необязателен, поэтому его отсутствие ничего не
+    // говорит о наличии формул и актуальности их сохранённых значений.
+    let calc_chain = calculation_chain_part(&rels)?;
+    if let Some(part) = &calc_chain {
+        if archive.index_for_name(part).is_none() {
+            return Err(format!(
+                "{}: связь calcChain указывает на отсутствующую часть {part}",
+                input.display()
+            ));
+        }
+    }
 
     let mut replacements: BTreeMap<&str, String> = BTreeMap::new();
     replacements.insert(sheet_part.as_str(), patched_sheet);
-    if drops_calc_chain {
-        replacements.insert(WORKBOOK, force_full_calc(&workbook));
+    replacements.insert(WORKBOOK, force_full_calc(&workbook));
+    if let Some(part) = &calc_chain {
         replacements.insert(WORKBOOK_RELS, drop_calc_chain_relationship(&rels));
-        replacements.insert(CONTENT_TYPES, drop_calc_chain_override(&content_types));
+        replacements.insert(
+            CONTENT_TYPES,
+            drop_calc_chain_override(&content_types, part),
+        );
     }
 
     write_atomically(output, |file| {
-        copy_package(&mut archive, file, &replacements, drops_calc_chain)
+        copy_package(&mut archive, file, &replacements, calc_chain.as_deref())
     })
     .map_err(|e| format!("запись {}: {e}", output.display()))
 }
@@ -148,14 +156,14 @@ fn copy_package<R: Read + Seek, W: Write + Seek>(
     archive: &mut ZipArchive<R>,
     out: W,
     replacements: &BTreeMap<&str, String>,
-    drop_calc_chain: bool,
+    drop_part: Option<&str>,
 ) -> io::Result<()> {
     let mut zip = ZipWriter::new(out);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     for index in 0..archive.len() {
         let entry = archive.by_index_raw(index).map_err(io::Error::other)?;
         let name = entry.name().to_string();
-        if drop_calc_chain && name == CALC_CHAIN {
+        if drop_part == Some(name.as_str()) {
             continue;
         }
         match replacements.get(name.as_str()) {
@@ -252,15 +260,40 @@ fn attribute(tag: &str, name: &str) -> Option<String> {
 /// Убрать связь на `calcChain.xml` из `workbook.xml.rels`.
 fn drop_calc_chain_relationship(rels: &str) -> String {
     remove_elements(rels, "<Relationship ", |tag| {
-        attribute(tag, "Target").is_some_and(|target| resolve_target(&target) == CALC_CHAIN)
+        attribute(tag, "Type").is_some_and(|kind| relationship_kind(&kind) == "calcChain")
     })
 }
 
 /// Убрать объявление типа `calcChain.xml` из `[Content_Types].xml`.
-fn drop_calc_chain_override(types: &str) -> String {
+fn drop_calc_chain_override(types: &str, part: &str) -> String {
     remove_elements(types, "<Override ", |tag| {
-        attribute(tag, "PartName").as_deref() == Some("/xl/calcChain.xml")
+        attribute(tag, "PartName").is_some_and(|name| name.trim_start_matches('/') == part)
     })
+}
+
+/// Часть цепочки определяется связью workbook, а не условным именем файла.
+fn calculation_chain_part(rels: &str) -> Result<Option<String>, String> {
+    let mut rest = rels;
+    let mut found = None;
+    while let Some(tag) = next_tag(&mut rest, "<Relationship ") {
+        let Some(kind) = attribute(tag, "Type") else {
+            continue;
+        };
+        if relationship_kind(&kind) != "calcChain" {
+            continue;
+        }
+        if found.is_some() {
+            return Err("в workbook.xml.rels несколько связей calcChain".to_string());
+        }
+        let target =
+            attribute(tag, "Target").ok_or_else(|| "связь calcChain без Target".to_string())?;
+        found = Some(resolve_target(&target));
+    }
+    Ok(found)
+}
+
+fn relationship_kind(kind: &str) -> &str {
+    kind.rsplit('/').next().unwrap_or(kind)
 }
 
 fn remove_elements(xml: &str, prefix: &str, drop: impl Fn(&str) -> bool) -> String {
@@ -302,9 +335,11 @@ fn force_full_calc(workbook: &str) -> String {
         out.push_str(rest);
         return out;
     }
-    // Книги без <calcPr> существуют: тогда элемент добавляется. Его место в
-    // схеме — перед закрывающим тегом книги.
-    match workbook.rfind("</workbook>") {
+    // Книги без <calcPr> существуют: тогда элемент добавляется перед первым
+    // элементом, который по схеме CT_Workbook идёт после calcPr. Простое
+    // добавление перед </workbook> поставило бы calcPr после extLst и сделало
+    // бы формально валидный XML невалидным SpreadsheetML.
+    match calc_pr_insertion_point(workbook) {
         Some(at) => {
             let mut out = String::with_capacity(workbook.len() + 64);
             out.push_str(&workbook[..at]);
@@ -314,6 +349,25 @@ fn force_full_calc(workbook: &str) -> String {
         }
         None => workbook.to_string(),
     }
+}
+
+fn calc_pr_insertion_point(workbook: &str) -> Option<usize> {
+    const AFTER_CALC_PR: [&str; 9] = [
+        "<oleSize",
+        "<customWorkbookViews",
+        "<pivotCaches",
+        "<smartTagPr",
+        "<smartTagTypes",
+        "<webPublishing",
+        "<fileRecoveryPr",
+        "<webPublishObjects",
+        "<extLst",
+    ];
+    AFTER_CALC_PR
+        .iter()
+        .filter_map(|tag| workbook.find(tag))
+        .min()
+        .or_else(|| workbook.rfind("</workbook>"))
 }
 
 /// Заменить значение атрибута или дописать его в конец тега.
@@ -675,6 +729,8 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    const DEFAULT_CALC_CHAIN: &str = "xl/calcChain.xml";
+
     /// Книга собирается из явных частей: правка обязана не трогать ни одну из
     /// них, кроме листа и метаданных расчёта.
     fn write_book(path: &Path, parts: &[(&str, &str)]) {
@@ -699,6 +755,12 @@ mod tests {
             out.insert(part.name().to_string(), bytes);
         }
         out
+    }
+
+    fn part_names(path: &Path) -> Vec<String> {
+        let file = std::fs::File::open(path).unwrap();
+        let archive = ZipArchive::new(file).unwrap();
+        archive.file_names().map(str::to_string).collect()
     }
 
     fn tmp(name: &str) -> std::path::PathBuf {
@@ -779,9 +841,13 @@ mod tests {
         for name in ["_rels/.rels", "xl/worksheets/sheet1.xml", "xl/styles.xml"] {
             assert_eq!(before[name], after[name], "часть {name} изменилась");
         }
-        // Порядок частей в пакете тоже сохраняется, кроме удалённой.
-        let names: Vec<&String> = after.keys().collect();
-        assert!(!names.iter().any(|n| n.as_str() == "xl/calcChain.xml"));
+        // Порядок частей в пакете тоже сохраняется, кроме удалённой. BTreeMap
+        // выше этого не проверяет: он сортирует имена сам.
+        let expected_names: Vec<String> = part_names(&input)
+            .into_iter()
+            .filter(|name| name != DEFAULT_CALC_CHAIN)
+            .collect();
+        assert_eq!(part_names(&output), expected_names);
         std::fs::remove_file(&input).ok();
         std::fs::remove_file(&output).ok();
     }
@@ -895,19 +961,59 @@ mod tests {
         std::fs::remove_file(&output).ok();
     }
 
-    /// В книге без вычислений менять нечего, кроме самого листа: указывать
-    /// пересчёт там, где ничего не считается, — лишняя правка файла.
+    /// OPC не закрепляет имя части за `xl/calcChain.xml`: как и worksheet,
+    /// цепочку нужно находить через relationship target.
     #[test]
-    fn a_workbook_without_formulas_keeps_its_settings() {
-        let input = tmp("nocalc_in.xlsx");
-        let output = tmp("nocalc_out.xlsx");
+    fn a_calculation_chain_with_a_custom_part_name_is_dropped() {
+        let input = tmp("custom_calc_in.xlsx");
+        let output = tmp("custom_calc_out.xlsx");
+        let custom_part = "xl/calculation/cache.xml";
+        let types = TYPES.replace("/xl/calcChain.xml", "/xl/calculation/cache.xml");
+        let rels = BOOK_RELS.replace("calcChain.xml", "calculation/cache.xml");
         write_book(
             &input,
             &[
-                ("[Content_Types].xml", TYPES),
+                ("[Content_Types].xml", &types),
                 ("_rels/.rels", ROOT_RELS),
                 ("xl/workbook.xml", BOOK),
-                ("xl/_rels/workbook.xml.rels", BOOK_RELS),
+                ("xl/_rels/workbook.xml.rels", &rels),
+                ("xl/worksheets/sheet1.xml", TITLE_SHEET),
+                ("xl/worksheets/data.xml", DATA_SHEET),
+                (custom_part, CALC_CHAIN_XML),
+                ("xl/styles.xml", STYLES),
+            ],
+        );
+
+        patch_sheet(&input, &output, "Опыты", &[number(2, 2, 1.0)]).unwrap();
+
+        let after = parts_of(&output);
+        assert!(!after.contains_key(custom_part));
+        assert!(!String::from_utf8(after[WORKBOOK_RELS].clone())
+            .unwrap()
+            .contains("calcChain"));
+        assert!(!String::from_utf8(after[CONTENT_TYPES].clone())
+            .unwrap()
+            .contains("calcChain"));
+        std::fs::remove_file(&input).ok();
+        std::fs::remove_file(&output).ok();
+    }
+
+    /// Формулы допустимы без calcChain: цепочка — необязательный кэш, поэтому
+    /// её отсутствие не позволяет оставить сохранённые результаты формул как
+    /// будто они актуальны после изменения входных значений.
+    #[test]
+    fn formulas_without_a_calculation_chain_still_force_recalculation() {
+        let input = tmp("formula_without_chain_in.xlsx");
+        let output = tmp("formula_without_chain_out.xlsx");
+        let types = drop_calc_chain_override(TYPES, DEFAULT_CALC_CHAIN);
+        let rels = drop_calc_chain_relationship(BOOK_RELS);
+        write_book(
+            &input,
+            &[
+                ("[Content_Types].xml", &types),
+                ("_rels/.rels", ROOT_RELS),
+                ("xl/workbook.xml", BOOK),
+                ("xl/_rels/workbook.xml.rels", &rels),
                 ("xl/worksheets/sheet1.xml", TITLE_SHEET),
                 ("xl/worksheets/data.xml", DATA_SHEET),
                 ("xl/styles.xml", STYLES),
@@ -921,7 +1027,6 @@ mod tests {
         for name in [
             "[Content_Types].xml",
             "_rels/.rels",
-            "xl/workbook.xml",
             "xl/_rels/workbook.xml.rels",
             "xl/worksheets/sheet1.xml",
             "xl/styles.xml",
@@ -932,6 +1037,9 @@ mod tests {
             before["xl/worksheets/data.xml"],
             after["xl/worksheets/data.xml"]
         );
+        let book = String::from_utf8(after["xl/workbook.xml"].clone()).unwrap();
+        assert!(book.contains(r#"fullCalcOnLoad="1""#), "{book}");
+        assert!(book.contains(r#"forceFullCalc="1""#), "{book}");
         std::fs::remove_file(&input).ok();
         std::fs::remove_file(&output).ok();
     }
@@ -942,6 +1050,15 @@ mod tests {
         let book = BOOK.replace(r#"<calcPr calcId="191029" calcMode="manual"/>"#, "");
         let patched = force_full_calc(&book);
         assert!(patched.contains(r#"<calcPr fullCalcOnLoad="1" forceFullCalc="1"/></workbook>"#));
+
+        let with_tail = book.replace(
+            "</workbook>",
+            "<pivotCaches/><extLst><ext uri=\"keep\"/></extLst></workbook>",
+        );
+        let patched = force_full_calc(&with_tail);
+        let calc = patched.find("<calcPr ").unwrap();
+        assert!(calc < patched.find("<pivotCaches").unwrap(), "{patched}");
+        assert!(patched.contains("<ext uri=\"keep\"/>"), "{patched}");
     }
 
     /// Подписанная книга и книга с макросами не правятся: подпись стала бы
