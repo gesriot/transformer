@@ -215,8 +215,8 @@ pub(crate) enum Command {
     LoadModel(String),
     SaveModel(String),
     Predict(Vec<f32>),
-    /// Экспорт таблицы с прогнозами: результат — новая книга, исходная не
-    /// сохраняется.
+    /// Экспорт таблицы с прогнозами. Для `.xlsx` результат — копия исходной
+    /// книги с изменённым листом; для остальных источников — новая книга.
     ExportPredictions {
         input: String,
         output: String,

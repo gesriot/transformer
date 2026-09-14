@@ -45,6 +45,25 @@ pub struct Table {
     // Номер каждой строки в исходном файле. Простого `index + 1` недостаточно:
     // комментарии и пустые строки между записями не попадают в `rows`.
     row_numbers: Vec<usize>,
+    /// Номер строки заголовка в источнике; `None`, когда заголовка нет.
+    header_row: Option<usize>,
+    /// Физическая колонка Excel (1-based), с которой начинается таблица;
+    /// `None` у текстового источника — колонок листа у него нет.
+    first_column: Option<usize>,
+}
+
+/// Где таблица лежит в листе книги: физические координаты Excel, 1-based.
+///
+/// Нужны, чтобы записать результат обратно в ТУ ЖЕ ячейку исходного файла.
+/// Без них известен только порядок строк, а лист может начинаться не с `A1`:
+/// сверху бывает заголовок отчёта, слева — пустая колонка под поля.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SheetAnchor {
+    /// Строка заголовка; `None`, когда таблицу читали без заголовка.
+    pub header_row: Option<usize>,
+    /// Колонка первой колонки таблицы.
+    pub first_column: usize,
 }
 
 /// Книга ли это: решается по расширению, как и выбор читателя.
@@ -115,9 +134,9 @@ impl Table {
     ) -> Result<Self, String> {
         let path = path.as_ref();
         let source = path.display().to_string();
-        let (sheet, rows) = if is_workbook(path) {
-            let (sheet, rows) = read_workbook(path, sheet)?;
-            (Some(sheet), rows)
+        let (sheet, first_column, rows) = if is_workbook(path) {
+            let (sheet, first_column, rows) = read_workbook(path, sheet)?;
+            (Some(sheet), Some(first_column), rows)
         } else {
             if let Some(sheet) = sheet {
                 return Err(format!(
@@ -128,15 +147,17 @@ impl Table {
                 std::fs::read_to_string(path).map_err(|e| format!("чтение {source}: {e}"))?;
             (
                 None,
+                None,
                 split_text(&text, delimiter).map_err(|e| format!("{source}: {e}"))?,
             )
         };
-        Self::from_rows(source, sheet, rows, has_header)
+        Self::from_rows(source, sheet, first_column, rows, has_header)
     }
 
     pub fn parse_text(text: &str, delimiter: Delimiter, has_header: bool) -> Result<Self, String> {
         Self::from_rows(
             "<текст>".to_string(),
+            None,
             None,
             split_text(text, delimiter).map_err(|e| format!("<текст>: {e}"))?,
             has_header,
@@ -146,6 +167,7 @@ impl Table {
     fn from_rows(
         source: String,
         sheet: Option<String>,
+        first_column: Option<usize>,
         mut located_rows: LocatedRows,
         has_header: bool,
     ) -> Result<Self, String> {
@@ -153,11 +175,13 @@ impl Table {
         if located_rows.is_empty() {
             return Err(format!("{source_label}: нет строк данных"));
         }
+        let mut header_row = None;
         let header = if has_header {
-            let (_, header) = located_rows.remove(0);
+            let (number, header) = located_rows.remove(0);
             if located_rows.is_empty() {
                 return Err(format!("{source_label}: нет строк данных после заголовка"));
             }
+            header_row = Some(number);
             Some(header)
         } else {
             None
@@ -169,6 +193,8 @@ impl Table {
             header,
             rows,
             row_numbers,
+            header_row,
+            first_column,
         })
     }
 
@@ -187,7 +213,7 @@ impl Table {
             ));
         }
         self.header = Some(self.rows.remove(0));
-        self.row_numbers.remove(0);
+        self.header_row = Some(self.row_numbers.remove(0));
         Ok(self)
     }
 
@@ -203,6 +229,27 @@ impl Table {
     /// Источник для сообщений человеку: имя листа нельзя терять рядом с путём.
     pub fn source_label(&self) -> String {
         source_label(&self.source, self.sheet())
+    }
+
+    /// Координаты таблицы в листе книги; `None` у текстового источника.
+    pub fn anchor(&self) -> Option<SheetAnchor> {
+        self.first_column.map(|first_column| SheetAnchor {
+            header_row: self.header_row,
+            first_column,
+        })
+    }
+
+    /// Физическая колонка Excel для колонки таблицы `c` (1-based).
+    ///
+    /// `None` у текстового источника: колонок листа там нет, и выдумывать их
+    /// нельзя — по ним потом правят файл.
+    ///
+    /// # Panics
+    ///
+    /// Если `c >= self.n_columns()`.
+    pub fn sheet_column(&self, c: usize) -> Option<usize> {
+        assert!(c < self.n_columns(), "колонка {c} вне таблицы");
+        self.first_column.map(|first| first + c)
     }
 
     pub fn header(&self) -> Option<&[String]> {
@@ -455,7 +502,12 @@ fn choose_sheet(path: &Path, names: &[String], wanted: Option<&str>) -> Result<S
     }
 }
 
-fn read_workbook(path: &Path, wanted: Option<&str>) -> Result<(String, LocatedRows), String> {
+/// Прочитать лист: имя выбранного листа, его первая колонка (1-based) и
+/// строки вместе с их физическими номерами.
+fn read_workbook(
+    path: &Path,
+    wanted: Option<&str>,
+) -> Result<(String, usize, LocatedRows), String> {
     let mut workbook =
         open_workbook_auto(path).map_err(|e| format!("чтение {}: {e}", path.display()))?;
     let sheet = choose_sheet(path, &worksheet_names(workbook.sheets_metadata()), wanted)?;
@@ -486,7 +538,7 @@ fn read_workbook(path: &Path, wanted: Option<&str>) -> Result<(String, LocatedRo
             path.display()
         ));
     }
-    Ok((sheet, rows))
+    Ok((sheet, start_col as usize + 1, rows))
 }
 
 /// Тестовая книга с несколькими листами.
@@ -539,8 +591,16 @@ pub(crate) fn write_test_workbook(path: &Path, sheets: &[(&str, &[&[&str]])]) {
             r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>"#,
         );
         for (r, row) in rows.iter().enumerate() {
+            // Пустые ячейки не записываются вовсе — как это делает Excel:
+            // иначе используемая область листа начиналась бы всегда с A1.
+            if row.iter().all(|cell| cell.is_empty()) {
+                continue;
+            }
             sheet.push_str(&format!(r#"<row r="{}">"#, r + 1));
             for (c, cell) in row.iter().enumerate() {
+                if cell.is_empty() {
+                    continue;
+                }
                 let col = (b'A' + c as u8) as char;
                 sheet.push_str(&format!(
                     r#"<c r="{col}{}" t="inlineStr"><is><t>{cell}</t></is></c>"#,
@@ -598,6 +658,64 @@ mod tests {
         assert_eq!(table.rows()[0], vec!["1", "2"]);
         assert_eq!(workbook_sheets(&path).unwrap(), vec!["Данные".to_string()]);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Координаты нужны, чтобы записать результат в ТУ ЖЕ ячейку исходного
+    /// файла: лист может начинаться не с `A1`.
+    #[test]
+    fn a_workbook_table_knows_where_it_sits_in_the_sheet() {
+        let path = tmp_book("anchor.xlsx");
+        // Таблица начинается с C3: сверху заголовок отчёта, слева пустая
+        // колонка. calamine отдаёт использованную область, а не весь лист.
+        write_workbook(
+            &path,
+            &[(
+                "Опыты",
+                &[
+                    &[""],
+                    &[""],
+                    &["", "", "x0", "y0"],
+                    &["", "", "1", "2"],
+                    &["", "", "3", "4"],
+                ],
+            )],
+        );
+
+        let table = Table::read_path(&path, Delimiter::Auto, true).unwrap();
+        let anchor = table.anchor().expect("книга: координаты известны");
+        assert_eq!(anchor.first_column, 3, "таблица начинается с колонки C");
+        assert_eq!(anchor.header_row, Some(3), "заголовок в строке 3");
+        assert_eq!(table.file_row(0), 4);
+        assert_eq!(table.file_row(1), 5);
+        assert_eq!(table.sheet_column(0), Some(3));
+        assert_eq!(table.sheet_column(1), Some(4));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Заголовок, распознанный уже после чтения, — та же строка листа.
+    #[test]
+    fn promoting_a_header_keeps_its_sheet_row() {
+        let path = tmp_book("promote.xlsx");
+        write_workbook(
+            &path,
+            &[("Опыты", &[&["x0", "y0"], &["1", "2"], &["3", "4"]])],
+        );
+
+        let raw = Table::read_path(&path, Delimiter::Auto, false).unwrap();
+        assert_eq!(raw.anchor().unwrap().header_row, None);
+        let table = raw.promote_first_row_to_header().unwrap();
+        assert_eq!(table.anchor().unwrap().header_row, Some(1));
+        assert_eq!(table.file_row(0), 2);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// У текста нет ни колонок листа, ни адресов ячеек: выдумывать их нельзя —
+    /// по ним потом правят файл.
+    #[test]
+    fn a_text_table_has_no_sheet_coordinates() {
+        let table = Table::parse_text("x0,y0\n1,2\n", Delimiter::Auto, true).unwrap();
+        assert_eq!(table.anchor(), None);
+        assert_eq!(table.sheet_column(0), None);
     }
 
     /// Несколько листов без выбора — ошибка со списком, а не первый лист.

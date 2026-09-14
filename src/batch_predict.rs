@@ -1,12 +1,17 @@
 //! Экспорт таблицы с прогнозами по именам колонок из схемы модели.
 //!
-//! Writer намеренно создаёт новую минимальную книгу: значения выбранного
-//! листа сохраняются, стили, формулы и остальные листы — нет.
+//! Книга `.xlsx` сохраняется: результат — копия исходного пакета, в которой
+//! изменён только выбранный лист (см. [`crate::xlsx`]). Для остальных
+//! источников — текстовых таблиц, `.xlsm`, `.ods` — сохранять нечего или пока
+//! не обещано, и writer создаёт новую минимальную книгу: значения выбранного
+//! листа переносятся, стили и остальные листы — нет. Что именно получилось,
+//! видно в [`ExportSummary::preserved`].
 
 use crate::atomic_write::{same_file, write_atomically};
 use crate::predict::{parse_rows, Predictions};
 use crate::schema::ModelSchema;
 use crate::table::{Delimiter, Table};
+use crate::xlsx::{CellEdit, CellValue};
 use ndarray::Array2;
 use std::collections::HashMap;
 use std::io::{self, Seek, Write};
@@ -37,6 +42,9 @@ impl SheetCell {
 pub struct ExportSummary {
     pub rows: usize,
     pub extrapolated_rows: usize,
+    /// Сохранена ли исходная книга. `false` — результат собран заново, и
+    /// оформление исходного файла в него не попало.
+    pub preserved: bool,
     /// Колонки выходов, которые уже были в таблице и перезаписаны.
     pub replaced: Vec<String>,
     /// Колонки выходов, которых не было и которые добавлены справа.
@@ -139,9 +147,12 @@ where
         }
     }
 
+    // Исходную книгу правим точечно; всё остальное собирается заново, и
+    // тогда нужна полная таблица значений.
+    let preserved = preserves_workbook(input, output);
     let width = headers.len();
-    let mut rows = Vec::with_capacity(table.n_rows());
-    for (r, row) in table.rows().iter().enumerate() {
+    let mut rows = Vec::with_capacity(if preserved { 0 } else { table.n_rows() });
+    for (r, row) in table.rows().iter().enumerate().filter(|_| !preserved) {
         let mut cells: Vec<SheetCell> = (0..width)
             .map(|c| match row.get(c) {
                 // Посторонние колонки переносятся как значения — но числом
@@ -160,13 +171,80 @@ where
         rows.push(cells);
     }
 
-    write_sheet(output, &headers, &rows)?;
+    if preserved {
+        // Заголовки существующих колонок не трогаем: их писал человек, и
+        // «канонизировать» чужой текст — правка, которой никто не просил.
+        let sheet = table
+            .sheet()
+            .ok_or_else(|| format!("{input}: книга без выбранного листа"))?;
+        let edits = sheet_edits(&table, &headers, &output_cols, &predictions)
+            .map_err(|e| format!("{input}: {e}"))?;
+        crate::xlsx::patch_sheet(Path::new(input), Path::new(output), sheet, &edits)?;
+    } else {
+        write_sheet(output, &headers, &rows)?;
+    }
     Ok(ExportSummary {
         rows: predictions.rows(),
         extrapolated_rows: predictions.extrapolated_rows(),
+        preserved,
         replaced,
         added,
     })
+}
+
+/// Сохраняется ли исходная книга при таком экспорте.
+///
+/// Пока только `.xlsx` → `.xlsx`: у текстовой таблицы сохранять нечего, а
+/// `.xlsm` и `.ods` — отдельная работа со своими проверками. Решение принимается
+/// по путям, до чтения: отчёт обязан сказать, что именно получится.
+fn preserves_workbook(input: &str, output: &str) -> bool {
+    let is_xlsx = |path: &str| {
+        Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("xlsx"))
+    };
+    is_xlsx(input) && is_xlsx(output)
+}
+
+/// Какие ячейки листа изменит экспорт.
+///
+/// Колонки выходов пишутся по физическим координатам исходного листа: строка
+/// берётся у самой таблицы, колонка — от её начала. Новая колонка получает и
+/// заголовок: без него книга откроется с безымянным столбцом чисел.
+fn sheet_edits(
+    table: &Table,
+    headers: &[String],
+    output_cols: &[usize],
+    predictions: &Predictions,
+) -> Result<Vec<CellEdit>, String> {
+    let anchor = table
+        .anchor()
+        .ok_or_else(|| "у источника нет координат листа".to_string())?;
+    let header_row = anchor
+        .header_row
+        .ok_or_else(|| "лист прочитан без строки заголовков".to_string())?;
+    let existing = table.n_columns();
+
+    let mut edits = Vec::with_capacity(output_cols.len() * (table.n_rows() + 1));
+    for (slot, &col) in output_cols.iter().enumerate() {
+        let column = anchor.first_column + col;
+        if col >= existing {
+            edits.push(CellEdit {
+                row: header_row,
+                column,
+                value: CellValue::Text(headers[col].clone()),
+            });
+        }
+        for r in 0..table.n_rows() {
+            edits.push(CellEdit {
+                row: table.file_row(r),
+                column,
+                value: CellValue::Number(predictions.outputs[[r, slot]] as f64),
+            });
+        }
+    }
+    Ok(edits)
 }
 
 fn header_index(headers: &[String]) -> Result<HashMap<&str, usize>, String> {
@@ -416,9 +494,99 @@ mod tests {
         )
         .unwrap();
         assert_eq!(summary.rows, 1);
+        assert!(summary.preserved, "книга .xlsx сохраняется");
+
+        // Прогноз лёг в выбранный лист, а титульный остался на месте.
+        let table = Table::read_sheet(&output, Some("Опыты"), Delimiter::Auto, true).unwrap();
+        assert!(table.header().unwrap().contains(&"влажность".to_string()));
+        assert_eq!(table.rows().len(), 1);
+        let title = Table::read_sheet(&output, Some("Титульный"), Delimiter::Auto, false).unwrap();
+        assert_eq!(title.rows()[0], ["отчёт"]);
+
+        std::fs::remove_file(&input).ok();
+        std::fs::remove_file(&output).ok();
+    }
+
+    /// Экспорт в .xlsx сохраняет исходную книгу: меняется выбранный лист, всё
+    /// остальное остаётся тем же файлом.
+    #[test]
+    fn export_into_xlsx_preserves_the_source_workbook() {
+        let input = tmp_path("preserve_in.xlsx");
+        let output = tmp_path("preserve_out.xlsx");
+        crate::table::write_test_workbook(
+            &input,
+            &[(
+                "Опыты",
+                &[
+                    &["заметка", "материал", "температура", "влажность"],
+                    &["хорошо", "глина", "70", "0"],
+                    &["плохо", "песок", "60", "0"],
+                ],
+            )],
+        );
+
+        let summary = export_predictions(
+            input.to_str().unwrap(),
+            None,
+            output.to_str().unwrap(),
+            &schema(),
+            double,
+        )
+        .unwrap();
+        assert!(summary.preserved);
+        assert_eq!(summary.replaced, vec!["влажность".to_string()]);
+        assert_eq!(summary.added, vec!["плотность".to_string()]);
+
+        let table = Table::read_path(&output, Delimiter::Auto, true).unwrap();
+        // Недостающий выход добавлен справа вместе с заголовком.
+        assert_eq!(
+            table.header().unwrap(),
+            [
+                "заметка",
+                "материал",
+                "температура",
+                "влажность",
+                "плотность"
+            ]
+        );
+        // Посторонние колонки остались собой, выход перезаписан прогнозом:
+        // 70 + 1 (глина) = 71 и 70 - 1 = 69.
+        assert_eq!(table.rows()[0], ["хорошо", "глина", "70", "71", "69"]);
+        assert_eq!(table.rows()[1], ["плохо", "песок", "60", "60", "60"]);
+
+        std::fs::remove_file(&input).ok();
+        std::fs::remove_file(&output).ok();
+    }
+
+    /// У текстовой таблицы сохранять нечего: получается новая книга, и отчёт
+    /// говорит об этом прямо.
+    #[test]
+    fn export_from_a_text_table_builds_a_new_workbook() {
+        let input = tmp_path("plain_in.csv");
+        let output = tmp_path("plain_out.xlsx");
+        std::fs::write(
+            &input,
+            "материал,температура,влажность
+глина,70,0
+",
+        )
+        .unwrap();
+
+        let summary = export_predictions(
+            input.to_str().unwrap(),
+            None,
+            output.to_str().unwrap(),
+            &schema(),
+            double,
+        )
+        .unwrap();
+        assert!(!summary.preserved, "исходной книги не было");
         let (header, rows) = read_back(&output);
-        assert!(header.contains(&"влажность".to_string()));
-        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            header,
+            ["материал", "температура", "влажность", "плотность"]
+        );
+        assert_eq!(rows[0], ["глина", "70", "71", "69"]);
 
         std::fs::remove_file(&input).ok();
         std::fs::remove_file(&output).ok();

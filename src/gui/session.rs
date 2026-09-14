@@ -664,6 +664,11 @@ impl App {
                     if !summary.added.is_empty() {
                         text.push_str(&format!("; добавлены: {}", summary.added.join(", ")));
                     }
+                    text.push_str(if summary.preserved {
+                        "; исходная книга сохранена"
+                    } else {
+                        "; собрана новая книга без оформления"
+                    });
                     text.push(')');
                     self.status = text;
                 }
